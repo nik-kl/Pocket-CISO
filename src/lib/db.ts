@@ -171,6 +171,23 @@ function seedDb(): Db {
   return db;
 }
 
+function emptyDb(): Db {
+  const db: Db = {
+    meta: { liveVersion: 1, nextTicket: 4712, nextAudit: 1, seededAt: nowIso(), ingestedFiles: {} },
+    users: [
+      { email: "employee@company.at", role: "L1", clearance: "Employee", requiresPassword: false, passwordHash: null },
+      { email: "admin@company.at", role: "L2", clearance: "IT-Admin", requiresPassword: true, passwordHash: configuredPasswordHash("L2") },
+      { email: "ciso@company.at", role: "L3", clearance: "CISO", requiresPassword: true, passwordHash: configuredPasswordHash("L3") },
+    ],
+    live_chunks: [],
+    staged_diffs: [],
+    audit_logs: [],
+    tickets: [],
+  };
+  appendAudit(db, { actor: "system@pocket-ciso", role: "SYSTEM", action: "DB_INITIALIZED", target: COLLECTION, status: "INFO", detail: "Leere Produktionsdatenbank initialisiert" });
+  return db;
+}
+
 /* ───────────────────────── Persistence ───────────────────────── */
 
 const g = globalThis as unknown as { __pcQueue?: Promise<unknown>; __pcFails?: Record<string, number[]> };
@@ -250,7 +267,7 @@ async function load(): Promise<Db> {
     return db;
   } catch (e) {
     if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
-    const db = seedDb();
+    const db = DEMO_MODE ? seedDb() : emptyDb();
     await persist(db);
     return db;
   }
@@ -411,6 +428,18 @@ export function getSnapshot(token: string | null): Promise<Omit<Snapshot, "backe
     const a = actorFor(db, token);
     const user = db.users.find((u) => u.role === a.role)!;
     const priv = ROLE_RANK[a.role] >= ROLE_RANK.L2;
+    const visibleDiffs = priv
+      ? db.staged_diffs
+        .map((d) => {
+          const hunks = d.hunks.filter((h) => ROLE_RANK[h.minRole] <= ROLE_RANK[a.role]);
+          const conflicts = d.conflicts.filter((c) => {
+            const target = db.live_chunks.find((chunk) => chunk.id === c.chunkId);
+            return !target || ROLE_RANK[target.minRole] <= ROLE_RANK[a.role];
+          });
+          return { ...d, hunks, conflicts };
+        })
+        .filter((d) => d.hunks.length > 0)
+      : null;
     return {
       session: { role: a.role, email: a.email, clearance: user.clearance },
       collection: COLLECTION,
@@ -418,11 +447,20 @@ export function getSnapshot(token: string | null): Promise<Omit<Snapshot, "backe
       pendingCount: db.staged_diffs.filter((d) => d.status === "pending").length,
       totalChunks: db.live_chunks.length,
       chunks: db.live_chunks.filter((c) => ROLE_RANK[c.minRole] <= ROLE_RANK[a.role]),
-      diffs: priv ? db.staged_diffs : null,
+      diffs: visibleDiffs,
       audit: priv ? db.audit_logs : null,
       tickets: priv ? db.tickets : null,
       integrity: priv ? verifyChain(db.audit_logs) : null,
     };
+  });
+}
+
+export function checkRole(token: string | null, need: Role): Promise<R<{ authorized: true }>> {
+  return transact((db) => {
+    const a = actorFor(db, token);
+    return ROLE_RANK[a.role] >= ROLE_RANK[need]
+      ? { ok: true as const, authorized: true as const }
+      : fail(403, "FORBIDDEN", `Diese Aktion erfordert Clearance ${need}.`);
   });
 }
 
@@ -599,9 +637,9 @@ export function runQuery(token: string | null, question: string): Promise<R<{ re
       return {
         ok: true as const,
         result: {
-          kind: "denied" as const, requiredRole: need,
-          segments: [{ type: "text" as const, text: `Zu dieser Frage existieren freigegebene Dokumente, die Ihre aktuelle Clearance (${a.role}) nicht einsehen darf.` }],
-          citations: {}, scores: {}, trace: { ...base, nliVerified: false, confidence: 0, latencyMs: lat(0, 0) },
+          kind: "denied" as const, requiredRole: null,
+          segments: [{ type: "text" as const, text: NO_ANSWER }],
+          citations: {}, scores: {}, trace: { ...base, topScore: 0, nliVerified: false, confidence: 0, latencyMs: lat(0, 0) },
         },
       };
     }
@@ -973,6 +1011,7 @@ function stageInTx(db: Db, a: Actor, p: StageInput): R<{ diff: StagedDiff; stats
     });
   });
   if (!hunks.length) return fail(409, "NO_CHANGES", "Keine Änderungen gegenüber der Live-Version erkannt.");
+  const removedChunkIds = series.filter((_, j) => !usedOld.has(j)).map((c) => c.id);
 
   const merged = new Map<string, Conflict>();
   for (const h of hunks)
@@ -986,7 +1025,7 @@ function stageInTx(db: Db, a: Actor, p: StageInput): R<{ diff: StagedDiff; stats
     author: (p.author || `${a.email} (${a.role})`).slice(0, 80), uploadedAt: nowIso(),
     summary: `${hunks.length} geänderte/neue Chunk(s), ${unchanged} unverändert, ${conflicts.length} Konflikt(e) · Engine: ${LOCAL_ENGINE}`,
     sha256: sha256(hunks.map((h) => h.newContent).join("\n")), targetCollection: COLLECTION, status: "pending",
-    decidedAt: null, decidedBy: null, decisionNote: null, hunks, conflicts,
+    decidedAt: null, decidedBy: null,     decisionNote: null, hunks, removedChunkIds, conflicts,
   };
   db.staged_diffs.push(diff);
   appendAudit(db, { actor: a.email, role: a.role, action: "POLICY_STAGED", target: p.docName, status: "SUCCESS", detail: `${hunks.length} Chunk(s), ${conflicts.length} Konflikt(e), SHA-256 ${diff.sha256.slice(0, 12)}…, Engine ${LOCAL_ENGINE}` });
@@ -1096,12 +1135,20 @@ export function exportReport(token: string | null): Promise<R<{ report: AuditRep
     const chain = verifyChain(db.audit_logs);
     const activePolicies = [...db.live_chunks]
       .sort((x, y) => x.docName.localeCompare(y.docName) || x.section.localeCompare(y.section))
-      .map((c) => ({ id: c.id, docName: c.docName, section: c.section, minRole: c.minRole, sha256: c.sha256, approvedAt: c.updatedAt, approvedBy: c.approvedBy ?? "unbekannt" }));
-    const policySetHash = sha256(activePolicies.map((x) => x.sha256).sort().join("\n"));
+      .map((c) => ({
+        id: c.id, docName: c.docName, section: c.section, minRole: c.minRole,
+        sha256: c.sha256, contentHash: sha256(`${c.docName}|${c.section}|${c.content}`),
+        approvedAt: c.updatedAt, approvedBy: c.approvedBy ?? "unbekannt",
+      }));
+    const canonical = (value: unknown) => JSON.stringify(value);
+    const policySetHash = sha256(canonical(activePolicies));
     const headHash = db.audit_logs.at(-1)?.hash ?? GENESIS;
     const schema = "pocket-ciso/nis2-audit-report/v1";
     const generatedAt = nowIso();
-    const reportHash = sha256([schema, generatedAt, COLLECTION, db.meta.liveVersion, policySetHash, headHash, db.audit_logs.length].join("|"));
+    const reportHash = sha256(canonical({
+      schema, generatedAt, collection: COLLECTION, liveVersion: db.meta.liveVersion,
+      chain, policySetHash, activePolicies, auditLogs: db.audit_logs, tickets: db.tickets,
+    }));
     return {
       ok: true as const,
       report: {
@@ -1120,7 +1167,22 @@ export function approveDiff(token: string | null, diffId: string, override: bool
     const idx = db.staged_diffs.findIndex((d) => d.id === diffId && d.status === "pending");
     if (idx < 0) return fail(404, "NOT_FOUND", "Pending-Diff nicht gefunden.");
     const diff = db.staged_diffs[idx];
-    const open = diff.conflicts.filter((c) => c.status === "open");
+    const stale = [
+      ...diff.hunks.filter((h) => h.oldChunkId).map((h) => ({ id: h.oldChunkId!, content: h.oldContent })),
+      ...(diff.removedChunkIds ?? []).map((id) => ({ id, content: null })),
+    ].some(({ id, content }) => {
+      const current = db.live_chunks.find((c) => c.id === id);
+      return !current || (content !== null && current.content !== content);
+    });
+    if (stale) {
+      appendAudit(db, { actor: a.email, role: a.role, action: "MERGE_BLOCKED", target: diff.docName, status: "DENIED", detail: "Staging-Basis ist nicht mehr aktuell" });
+      return fail(409, "STALE_DIFF", "Die Live-Version hat sich seit dem Staging geändert. Bitte erneut diffen.");
+    }
+    const open = diff.conflicts.filter((c) => {
+      if (c.status === "open") return true;
+      const ticket = c.ticketId ? db.tickets.find((t) => t.id === c.ticketId) : null;
+      return !ticket || ticket.status !== "resolved";
+    });
     if (open.length && override !== true) {
       appendAudit(db, { actor: a.email, role: a.role, action: "MERGE_BLOCKED", target: diff.docName, status: "DENIED", detail: `${open.length} ungelöste(r) Konflikt(e)` });
       return fail(409, "CONFLICT_UNRESOLVED", "Ungelöste Konflikte: Sync-Ticket erstellen oder Override bestätigen.");
@@ -1128,6 +1190,7 @@ export function approveDiff(token: string | null, diffId: string, override: bool
 
     let superseded = 0;
     const ts = nowIso();
+    const removed = new Set(diff.removedChunkIds ?? []);
     for (const h of diff.hunks) {
       if (h.oldChunkId) {
         const before = db.live_chunks.length;
@@ -1135,6 +1198,19 @@ export function approveDiff(token: string | null, diffId: string, override: bool
         superseded += before - db.live_chunks.length;
       }
       db.live_chunks.push({ id: uid("chk"), docName: diff.docName, section: h.section, minRole: h.minRole, content: h.newContent, updatedAt: ts, sha256: sha256(`${diff.docName}|${h.section}|${h.newContent}`), approvedBy: a.email });
+    }
+    if (removed.size) {
+      const before = db.live_chunks.length;
+      db.live_chunks = db.live_chunks.filter((c) => !removed.has(c.id));
+      superseded += before - db.live_chunks.length;
+    }
+    if (diff.replacesDoc) {
+      for (const c of db.live_chunks) {
+        if (c.docName === diff.replacesDoc) {
+          c.docName = diff.docName;
+          c.sha256 = sha256(`${c.docName}|${c.section}|${c.content}`);
+        }
+      }
     }
     db.staged_diffs.splice(idx, 1);
     db.meta.liveVersion += 1;

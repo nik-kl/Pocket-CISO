@@ -554,6 +554,13 @@ def authorize(db: dict[str, Any], token: str | None, need: str, action: str, tar
     return a
 
 
+def check_role(token: str | None, need: str) -> None:
+    db = read_db()
+    actor = actor_for(db, token)
+    if ROLE_RANK[actor["role"]] < ROLE_RANK[need]:
+        raise ApiError(403, "FORBIDDEN", f"Diese Aktion erfordert Clearance {need}.")
+
+
 # ───────────────────────── Document parsing + semantic chunking ─────────────────────────
 
 ALLOWED_EXT = {".pdf", ".docx", ".md", ".txt"}
@@ -1026,6 +1033,7 @@ def stage_document(
     lat["diff"] = int((time.perf_counter() - t) * 1000)
     if not hunks:
         raise ApiError(409, "NO_CHANGES", "Keine Änderungen gegenüber der Live-Version erkannt.")
+    removed_chunk_ids = [c["id"] for j, c in enumerate(series) if j not in used_old]
 
     # Cross-document conflict scanner: vector pre-selection (cosine) → LLM verdict (temp 0.0, JSON) → rule fallback.
     t = time.perf_counter()
@@ -1078,7 +1086,7 @@ def stage_document(
         "sha256": sha256("\n".join(h["newContent"] for h in hunks)),
         "targetCollection": COLLECTION,
         "status": "pending", "decidedAt": None, "decidedBy": None, "decisionNote": None,
-        "hunks": hunks, "conflicts": conflict_list,
+        "hunks": hunks, "removedChunkIds": removed_chunk_ids, "conflicts": conflict_list,
     }
     with file_lock():
         db = read_db()
@@ -1221,7 +1229,27 @@ def approve_diff(token: str | None, diff_id: str, override: bool = False) -> dic
         if idx < 0:
             raise ApiError(404, "NOT_FOUND", "Pending-Diff nicht gefunden.")
         diff = db["staged_diffs"][idx]
-        open_conflicts = [c for c in diff["conflicts"] if c["status"] == "open"]
+        stale = False
+        for h in diff["hunks"]:
+            if not h.get("oldChunkId"):
+                continue
+            current = next((c for c in db["live_chunks"] if c["id"] == h["oldChunkId"]), None)
+            if current is None or current["content"] != h.get("oldContent"):
+                stale = True
+                break
+        if not stale:
+            stale = any(not any(c["id"] == old_id for c in db["live_chunks"]) for old_id in diff.get("removedChunkIds", []))
+        if stale:
+            append_audit(db, actor["email"], actor["role"], "MERGE_BLOCKED", diff["docName"], "DENIED", "Staging-Basis ist nicht mehr aktuell")
+            raise ApiError(409, "STALE_DIFF", "Die Live-Version hat sich seit dem Staging geändert. Bitte erneut diffen.")
+        open_conflicts = []
+        for conflict in diff["conflicts"]:
+            if conflict["status"] == "open":
+                open_conflicts.append(conflict)
+                continue
+            ticket = next((t for t in db["tickets"] if t["id"] == conflict.get("ticketId")), None)
+            if ticket is None or ticket["status"] != "resolved":
+                open_conflicts.append(conflict)
         if open_conflicts and not override:
             append_audit(db, actor["email"], actor["role"], "MERGE_BLOCKED", diff["docName"], "DENIED", f"{len(open_conflicts)} ungelöste(r) Konflikt(e)")
             raise ApiError(409, "CONFLICT_UNRESOLVED", "Ungelöste Konflikte: Sync-Ticket erstellen oder Override bestätigen.")
@@ -1230,6 +1258,7 @@ def approve_diff(token: str | None, diff_id: str, override: bool = False) -> dic
         ts = now_iso()
         with VECTORS.lock:
             VECTORS.reload()
+            removed_ids = set(diff.get("removedChunkIds", []))
             for h in diff["hunks"]:
                 if h["oldChunkId"]:
                     before = len(db["live_chunks"])
@@ -1245,6 +1274,17 @@ def approve_diff(token: str | None, diff_id: str, override: bool = False) -> dic
                 if vec is not None:
                     VECTORS.vecs[new_id] = vec
                     moved += 1
+            if removed_ids:
+                before = len(db["live_chunks"])
+                db["live_chunks"] = [c for c in db["live_chunks"] if c["id"] not in removed_ids]
+                superseded += before - len(db["live_chunks"])
+                for old_id in removed_ids:
+                    VECTORS.vecs.pop(old_id, None)
+            if diff.get("replacesDoc"):
+                for chunk in db["live_chunks"]:
+                    if chunk["docName"] == diff["replacesDoc"]:
+                        chunk["docName"] = diff["docName"]
+                        chunk["sha256"] = sha256(f"{chunk['docName']}|{chunk['section']}|{chunk['content']}")
             VECTORS.save()
         db["staged_diffs"].pop(idx)
         db["meta"]["liveVersion"] += 1
@@ -1470,8 +1510,8 @@ def run_query(token: str | None, question: str) -> dict[str, Any]:
     if not ok_acc and ok_res:
         with locked_db() as dbw:
             append_audit(dbw, actor["email"], role, "RBAC_DENIED", ok_res[0][0]["docName"], "DENIED", f"Retrieval erfordert {ok_res[0][0]['minRole']}")
-        trace["topScore"] = round(ok_res[0][1], 3)
-        return done("denied", [{"type": "text", "text": f"Zu dieser Frage existieren freigegebene Dokumente, die Ihre aktuelle Clearance ({role}) nicht einsehen darf."}], {}, {}, ok_res[0][0]["minRole"])
+        trace["topScore"] = 0.0
+        return done("denied", [{"type": "text", "text": NO_ANSWER}], {}, {}, None)
 
     if not ok_acc:
         trace["confidence"] = min(0.84, scale_score(best, thr, 0.85))  # a fallback never displays ≥ 85 %

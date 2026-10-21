@@ -18,6 +18,7 @@ const STAGE_TIMEOUT_MS = 90_000;
 const APPROVE_TIMEOUT_MS = 15_000;
 const SYNC_TIMEOUT_MS = 120_000;
 const MAX_UPLOAD_BYTES = 10 * 1024 * 1024;
+const MAX_REQUEST_BYTES = MAX_UPLOAD_BYTES + 256 * 1024;
 
 type PyRes = { state: "offline" } | { state: "timeout" } | { state: "ok"; status: number; body: unknown };
 type Json = Record<string, unknown>;
@@ -157,6 +158,10 @@ export async function POST(req: NextRequest) {
   const token = bearer(req);
   try {
     if ((req.headers.get("content-type") ?? "").startsWith("multipart/form-data")) {
+      const contentLength = Number(req.headers.get("content-length") ?? 0);
+      if (contentLength > MAX_REQUEST_BYTES) return reply({ ok: false, status: 413, code: "TOO_LARGE", error: "Upload-Anfrage größer als 10 MB." });
+      const access = await db.checkRole(token, "L2");
+      if (!access.ok) return reply(access);
       const form = await req.formData();
       if (form.get("action") !== "stage_file") return reply({ ok: false, status: 400, code: "UNKNOWN_ACTION", error: "Unbekannte Aktion." });
       return await stageFile(form, token);

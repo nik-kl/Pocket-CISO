@@ -82,6 +82,9 @@ class ApproveBody(BaseModel):
     override: bool = False
 
 
+MAX_REQUEST_BYTES = rag.MAX_UPLOAD_BYTES + 256 * 1024
+
+
 @app.get("/health")
 def health() -> dict:
     return rag.health()
@@ -97,6 +100,10 @@ def query(body: QueryBody, authorization: str | None = Header(default=None)) -> 
 async def stage_file(request: Request, authorization: str | None = Header(default=None)) -> dict:
     """Pipeline A — multipart (file + author + minRole [+ replaces, title]) OR JSON text."""
     token = bearer(authorization)
+    content_length = int(request.headers.get("content-length", "0") or 0)
+    if content_length > MAX_REQUEST_BYTES:
+        return err(413, "TOO_LARGE", "Upload-Anfrage größer als 10 MB.")
+    rag.check_role(token, "L2")
     if request.headers.get("content-type", "").startswith("multipart/form-data"):
         form = await request.form()
         upload = form.get("file")

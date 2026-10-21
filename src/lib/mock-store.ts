@@ -78,6 +78,7 @@ export interface StagedDiff {
   decidedBy: string | null;
   decisionNote: string | null;
   hunks: DiffHunk[];
+  removedChunkIds?: string[];
   conflicts: Conflict[];
 }
 
@@ -203,7 +204,7 @@ export interface AuditReport {
   liveVersion: number;
   chain: { valid: boolean; entries: number; headHash: string; algorithm: string };
   policySetHash: string;
-  activePolicies: { id: string; docName: string; section: string; minRole: Role; sha256: string; approvedAt: string; approvedBy: string }[];
+  activePolicies: { id: string; docName: string; section: string; minRole: Role; sha256: string; approvedAt: string; approvedBy: string; contentHash: string }[];
   auditLogs: AuditLog[];
   tickets: Ticket[];
   reportHash: string;
