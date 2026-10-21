@@ -45,9 +45,14 @@ MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_MB", "10")) * 1024 * 1024
 MAX_CHUNK_CHARS = 600
 LEX_MIN = float(os.getenv("LEX_MIN", "0.34"))  # min. share of question terms (incl. synonyms) a chunk must contain
 COLLECTION = "policies_live_v1"
+INBOX_DIR = Path(os.getenv("WATCHED_INBOX_DIR", Path(__file__).resolve().parent / "watched_inbox"))
+AUTO_SYNC = os.getenv("AUTO_SYNC", "0") == "1"
+AUTO_SYNC_SECONDS = max(5.0, float(os.getenv("AUTO_SYNC_SECONDS", "30")))
+CONNECTOR_ACTOR = {"email": "auto-connector@watched_inbox", "role": "L2"}  # clearance used for connector staging + conflict scan
+CONNECTOR_AUTHOR = "Auto-Connector (watched_inbox)"
 ROLE_RANK = {"L1": 1, "L2": 2, "L3": 3}
 GENESIS = "0" * 64
-VERSION = "0.5.0"
+VERSION = "0.6.0"
 
 HASH_ID = "hash-ngram-v1"
 NO_ANSWER = "Keine eindeutige Richtlinie gefunden — Halluzinationsschutz aktiv (Konfidenz < 85%)."
@@ -521,30 +526,60 @@ def parse_document(filename: str, data: bytes) -> str:
         except Exception as e:  # noqa: BLE001
             raise ApiError(422, "PDF_UNREADABLE", f"PDF konnte nicht gelesen werden: {type(e).__name__}")
     try:
-        from docx import Document
-
-        doc = Document(io.BytesIO(data))
-        lines: list[str] = []
-        for p in doc.paragraphs:
-            txt = p.text.strip()
-            if not txt:
-                lines.append("")
-                continue
-            style = (p.style.name if p.style is not None else "") or ""
-            if style == "Title":
-                lines.append(f"# {txt}")
-            elif style.startswith("Heading"):
-                lines.append(f"## {txt}")
-            elif "List" in style:
-                lines.append(f"- {txt}")
-            else:
-                lines.append(txt)
-        for table in doc.tables:
-            for row in table.rows:
-                lines.append(" | ".join(c.text.strip() for c in row.cells))
-        return "\n".join(lines)
+        return _docx_to_text(data)
     except Exception as e:  # noqa: BLE001
         raise ApiError(422, "DOCX_UNREADABLE", f"DOCX konnte nicht gelesen werden: {type(e).__name__}")
+
+
+def _docx_paragraph_line(p: Any) -> str:
+    txt = p.text.strip()
+    if not txt:
+        return ""
+    style = (p.style.name if p.style is not None else "") or ""
+    if style == "Title":
+        return f"# {txt}"
+    if style.startswith("Heading"):
+        return f"## {txt}"
+    if "List" in style:
+        return f"- {txt}"
+    return txt
+
+
+def _docx_table_lines(table: Any) -> list[str]:
+    """DOCX table → Markdown table (first row = header) so the chunker can turn rows into self-contained statements."""
+    rows: list[list[str]] = []
+    for row in table.rows:
+        seen: set[int] = set()
+        cells: list[str] = []
+        for cell in row.cells:
+            if id(cell._tc) in seen:  # merged cells repeat the same underlying element
+                continue
+            seen.add(id(cell._tc))
+            cells.append(re.sub(r"\s+", " ", cell.text).replace("|", "\\|").strip())
+        rows.append(cells)
+    if not rows:
+        return []
+    lines = ["", "| " + " | ".join(rows[0]) + " |"]
+    if len(rows) > 1:
+        lines.append("|" + "---|" * len(rows[0]))
+    lines += ["| " + " | ".join(r) + " |" for r in rows[1:]]
+    return lines + [""]
+
+
+def _docx_to_text(data: bytes) -> str:
+    """Paragraphs and tables in document order, so a table stays under the heading it belongs to."""
+    from docx import Document
+    from docx.table import Table
+    from docx.text.paragraph import Paragraph
+
+    doc = Document(io.BytesIO(data))
+    lines: list[str] = []
+    for child in doc.element.body.iterchildren():
+        if child.tag.endswith("}p"):
+            lines.append(_docx_paragraph_line(Paragraph(child, doc)))
+        elif child.tag.endswith("}tbl"):
+            lines.extend(_docx_table_lines(Table(child, doc)))
+    return "\n".join(lines)
 
 
 HEAD_MD = re.compile(r"^\s{0,3}(#{1,6})\s+(.+?)\s*#*\s*$")
@@ -607,6 +642,62 @@ def _body_paragraphs(lines: list[str]) -> list[str]:
     return [re.sub(r"\s+", " ", p).strip() for p in paras if p.strip()]
 
 
+TABLE_ROW = re.compile(r"^\s*\|.*\|\s*$")
+TABLE_SEP = re.compile(r"^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?\s*$")
+
+
+def _split_cells(row: str) -> list[str]:
+    cells = re.split(r"(?<!\\)\|", row.strip().strip("|"))
+    return [c.replace("\\|", "|").replace("**", "").replace("`", "").strip() for c in cells]
+
+
+def _cell_pair(header: list[str], i: int, cell: str) -> str:
+    if i < len(header) and header[i]:
+        return f"{header[i]}: {cell}"
+    return cell
+
+
+def _table_statements(rows: list[str], label: str) -> list[str]:
+    """Markdown table → one self-contained statement per data row: 'Tabelle [§2 Titel]: Spalte: Wert | Spalte: Wert.'"""
+    has_header = len(rows) >= 2 and bool(TABLE_SEP.match(rows[1]))
+    header = _split_cells(rows[0]) if has_header else []
+    body = rows[2:] if has_header else rows
+    out: list[str] = []
+    for row in body:
+        if TABLE_SEP.match(row):
+            continue
+        pairs = [_cell_pair(header, i, cell) for i, cell in enumerate(_split_cells(row)) if cell]
+        if pairs:
+            out.append(f"Tabelle [{label}]: {' | '.join(pairs).rstrip('.;')}.")
+    return out
+
+
+def _section_paragraphs(lines: list[str], label: str) -> list[str]:
+    """Body lines of one section → paragraphs; table blocks become row statements, in document order."""
+    paras: list[str] = []
+    text: list[str] = []
+    table: list[str] = []
+
+    def flush_text() -> None:
+        paras.extend(_body_paragraphs(text))
+        text.clear()
+
+    def flush_table() -> None:
+        paras.extend(_table_statements(table, label))
+        table.clear()
+
+    for ln in lines:
+        if TABLE_ROW.match(ln):
+            flush_text()
+            table.append(ln)
+            continue
+        flush_table()
+        text.append(ln)
+    flush_text()
+    flush_table()
+    return paras
+
+
 def chunk_document(text: str) -> tuple[str | None, list[dict[str, str]]]:
     """Split by headings (## / §N / 1.2 Title) into atomic policy chunks of ≤ ~600 chars. Returns (title, chunks)."""
     text = text.replace("\r\n", "\n").replace("\r", "\n").replace("\x00", "")
@@ -647,7 +738,7 @@ def chunk_document(text: str) -> tuple[str | None, list[dict[str, str]]]:
 
     chunks: list[dict[str, str]] = []
     for sec in sections:
-        parts = [p for p in _pack(_body_paragraphs(sec["lines"])) if len(p) >= 15]
+        parts = [p for p in _pack(_section_paragraphs(sec["lines"], f"§{sec['number']} {sec['title']}")) if len(p) >= 15]
         for k, content in enumerate(parts, start=1):
             suffix = f" (Teil {k})" if k > 1 else ""
             chunks.append({"section": f"§{sec['number']} {sec['title']}{suffix}", "number": sec["number"], "content": content})
@@ -765,6 +856,12 @@ def check_conflict(a: dict[str, str], b: dict[str, str]) -> tuple[dict[str, Any]
     return {"has_conflict": False, "severity": "Medium", "explanation": "", "conflicting_quote": ""}, "llm" if llm else "rules"
 
 
+def _record_connector_ingest(db: dict[str, Any], c: dict[str, str], doc_name: str, diff: dict[str, Any]) -> None:
+    db["meta"].setdefault("ingestedFiles", {})[c["file"]] = c["sha256"]
+    append_audit(db, CONNECTOR_ACTOR["email"], "SYSTEM", "AUTO_CONNECTOR_SYNC", doc_name, "SUCCESS",
+                 f"{c['file']} → {diff['id']} (SHA-256 {c['sha256'][:12]}…, {len(diff['hunks'])} Chunk(s), {len(diff['conflicts'])} Konflikt(e)) · Trigger: {c['trigger']}")
+
+
 def stage_document(
     token: str | None,
     *,
@@ -774,12 +871,18 @@ def stage_document(
     min_role: str = "L1",
     author: str | None = None,
     replaces: str | None = None,
+    as_actor: dict[str, str] | None = None,
+    connector: dict[str, str] | None = None,
 ) -> dict[str, Any]:
+    """`as_actor` (watched-inbox connector) skips token authorization; `connector` {file, sha256, trigger} makes the
+    final write also remember the file hash and append AUTO_CONNECTOR_SYNC — all in one atomic DB update."""
     t_all = time.perf_counter()
     lat: dict[str, int] = {}
 
-    with locked_db() as db:  # cheap authorization (+ persisted ACCESS_DENIED audit)
-        actor = authorize(db, token, "L2", "stage_file", doc_name)
+    actor = as_actor
+    if actor is None:
+        with locked_db() as db:  # cheap authorization (+ persisted ACCESS_DENIED audit)
+            actor = authorize(db, token, "L2", "stage_file", doc_name)
     if min_role not in ROLE_RANK:
         raise ApiError(400, "BAD_ROLE", "Ungültige Min-Role.")
     if ROLE_RANK[min_role] > ROLE_RANK[actor["role"]]:
@@ -915,6 +1018,8 @@ def stage_document(
         db["staged_diffs"].append(diff)
         append_audit(db, actor["email"], actor["role"], "POLICY_STAGED", doc_name, "SUCCESS",
                      f"{len(hunks)} Chunk(s), {len(conflict_list)} Konflikt(e), SHA-256 {diff['sha256'][:12]}…, Engine {label}")
+        if connector:
+            _record_connector_ingest(db, connector, doc_name, diff)
         with VECTORS.lock:
             VECTORS.reload()
             if VECTORS.engine == eid:
@@ -938,6 +1043,108 @@ def stage_text(token: str | None, *, title: str, target_doc: str, new_text: str,
         return stage_document(token, doc_name=bump_version(existing["docName"]), text=new_text, title=title, min_role=min_role, author=author, replaces=existing["docName"])
     name = target if re.search(r"\.[A-Za-z0-9]{1,5}$", target) else f"{target}.md"
     return stage_document(token, doc_name=name, text=new_text, title=title, min_role=min_role, author=author)
+
+
+# ───────────────────────── Zero-touch connector: watched_inbox → staging queue ─────────────────────────
+
+INBOX_LOCK = threading.Lock()  # manual trigger and background thread must never stage the same file twice
+
+
+def _inbox_files() -> list[Path]:
+    if not INBOX_DIR.is_dir():
+        return []
+    return sorted(
+        p for p in INBOX_DIR.iterdir()
+        if p.is_file() and not p.is_symlink() and not p.name.startswith(".") and p.suffix.lower() in ALLOWED_EXT
+    )
+
+
+def _remember_ingested(file: str, digest: str) -> None:
+    with locked_db() as db:
+        db["meta"].setdefault("ingestedFiles", {})[file] = digest
+
+
+def _ingest_file(path: Path, trigger: str) -> tuple[str, Any]:
+    """Dedupe by hash / pending diff, then stage. Returns ("staged", diff) | ("skipped", reason) | ("failed", error)."""
+    name = path.name
+    doc_name = safe_doc_name(name)
+    if path.stat().st_size > MAX_UPLOAD_BYTES:
+        return "failed", f"Datei größer als {MAX_UPLOAD_BYTES // 1024 // 1024} MB."
+    data = path.read_bytes()
+    digest = hashlib.sha256(data).hexdigest()
+
+    db = read_db()
+    if db["meta"].get("ingestedFiles", {}).get(name) == digest:
+        return "skipped", "unverändert seit dem letzten Sync"
+    if any(d["status"] == "pending" and d["docName"] == doc_name for d in db["staged_diffs"]):
+        return "skipped", "bereits in der Staging-Queue"
+
+    try:
+        text = parse_document(name, data)
+        result = stage_document(
+            None, doc_name=doc_name, text=text, min_role="L2", author=CONNECTOR_AUTHOR,
+            as_actor=CONNECTOR_ACTOR, connector={"file": name, "sha256": digest, "trigger": trigger},
+        )
+    except ApiError as e:
+        if e.code != "NO_CHANGES":
+            return "failed", e.error
+        _remember_ingested(name, digest)
+        return "skipped", "identisch mit der Live-Version"
+    return "staged", result["diff"]
+
+
+def sync_watched_inbox(token: str | None, *, system: bool = False) -> dict[str, Any]:
+    """Scan backend/watched_inbox/ (.pdf .docx .md .txt) and stage new/modified files for CISO approval.
+    `system=True` is used by the background watcher (no user token); manual triggers require L2+."""
+    if system:
+        trigger = "Auto-Sync (Hintergrund-Thread)"
+    else:
+        with locked_db() as db:
+            who = authorize(db, token, "L2", "sync_inbox", "watched_inbox")
+        trigger = f"{who['email']} ({who['role']})"
+
+    read_db()  # DB_NOT_READY / DB_CORRUPT surface as one clear error instead of one failure per file
+    report: dict[str, Any] = {"inbox": "backend/watched_inbox", "scanned": 0, "staged": [], "skipped": [], "failed": [], "engineMode": engine_label()}
+    with INBOX_LOCK:
+        files = _inbox_files()
+        report["scanned"] = len(files)
+        for path in files:
+            try:
+                kind, detail = _ingest_file(path, trigger)
+            except Exception as e:  # noqa: BLE001 — one broken file must not stop the cycle
+                print(f"[pocket-ciso] watched_inbox {path.name}: {type(e).__name__}: {e}")
+                kind, detail = "failed", "Datei konnte nicht verarbeitet werden."
+            if kind == "staged":
+                report["staged"].append({"file": path.name, "diffId": detail["id"], "conflicts": len(detail["conflicts"])})
+            elif kind == "skipped":
+                report["skipped"].append({"file": path.name, "reason": detail})
+            else:
+                report["failed"].append({"file": path.name, "error": detail})
+    return {"ok": True, "report": report}
+
+
+def start_inbox_watcher() -> threading.Event | None:
+    """AUTO_SYNC=1 → daemon thread that runs sync_watched_inbox every AUTO_SYNC_SECONDS (default 30). Returns the stop event."""
+    if not AUTO_SYNC:
+        return None
+    stop = threading.Event()
+
+    def loop() -> None:
+        last_error = ""
+        while not stop.wait(AUTO_SYNC_SECONDS):
+            try:
+                out = sync_watched_inbox(None, system=True)
+                last_error = ""
+                if out["report"]["staged"]:
+                    print(f"[pocket-ciso] auto-sync staged: {', '.join(x['file'] for x in out['report']['staged'])}")
+            except Exception as e:  # noqa: BLE001 — e.g. DB not initialised yet; log each distinct problem once
+                msg = f"{type(e).__name__}: {getattr(e, 'error', e)}"
+                if msg != last_error:
+                    print(f"[pocket-ciso] auto-sync waiting: {msg}")
+                last_error = msg
+
+    threading.Thread(target=loop, name="inbox-watcher", daemon=True).start()
+    return stop
 
 
 def approve_diff(token: str | None, diff_id: str, override: bool = False) -> dict[str, Any]:
@@ -1215,5 +1422,6 @@ def health() -> dict[str, Any]:
         "dbReady": db is not None,
         "ollama": {"connected": names is not None, "baseUrl": OLLAMA_BASE_URL, "llmModel": OLLAMA.llm_model(), "embedModel": OLLAMA.embed_model(), "models": names or []},
         "engineMode": engine_label(), "vectorCount": VECTORS.count(), "vectorEngine": VECTORS.engine,
+        "autoSync": AUTO_SYNC, "autoSyncSeconds": AUTO_SYNC_SECONDS if AUTO_SYNC else None,
         "liveChunks": len(db["live_chunks"]) if db else 0, "pendingDiffs": sum(1 for d in db["staged_diffs"] if d["status"] == "pending") if db else 0,
     }

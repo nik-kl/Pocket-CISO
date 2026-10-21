@@ -1,10 +1,10 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { AlertTriangle, Check, FileDiff, FileText, GitMerge, Loader2, Lock, Plus, TicketPlus, UploadCloud, X } from "lucide-react";
+import { AlertTriangle, Check, FileDiff, FileText, GitMerge, Loader2, Lock, Plus, RefreshCw, TicketPlus, UploadCloud, X } from "lucide-react";
 import {
   ROLE_RANK, callApi, callApiForm, formatTime, shortHash,
-  type Conflict, type DiffHunk, type Role, type Session, type Snapshot, type StageStats, type StagedDiff, type Ticket,
+  type Conflict, type DiffHunk, type Role, type Session, type Snapshot, type StageStats, type StagedDiff, type SyncReport, type Ticket,
 } from "@/lib/mock-store";
 import { Badge, Button, Modal, inputCls } from "./ui-primitives";
 
@@ -13,6 +13,17 @@ interface Props {
   snap: Snapshot | null;
   refresh: () => Promise<void>;
   notify: (text: string, tone?: "ok" | "bad" | "info") => void;
+}
+
+// Toast text for a watched-inbox scan.
+function syncMessage(r: SyncReport): string {
+  const parts: string[] = [];
+  if (r.staged.length) {
+    const conflicts = r.staged.reduce((n, x) => n + x.conflicts, 0);
+    parts.push(`${r.staged.length} Dokument${r.staged.length === 1 ? "" : "e"} automatisch gestaged: ${r.staged.map((x) => x.file).join(", ")} (${conflicts} Konflikt${conflicts === 1 ? "" : "e"})`);
+  }
+  if (r.failed.length) parts.push(`${r.failed.length} fehlgeschlagen — ${r.failed[0].file}: ${r.failed[0].error}`);
+  return parts.length ? parts.join(" · ") : "Inbox synchron — keine neuen Dateiänderungen";
 }
 
 // Pipeline A UI: staging queue → semantic diff → mandatory conflict resolution → CISO sign-off (real merge via /api/v1).
@@ -71,6 +82,20 @@ export default function CisoDiffDashboard({ session, snap, refresh, notify }: Pr
     await refresh();
   };
 
+  const syncInbox = async () => {
+    setBusy("sync");
+    const r = await callApi<{ report: SyncReport }>("sync_inbox", {}, session.token);
+    setBusy(null);
+    if (!r.ok) {
+      notify(r.error, "bad");
+      return;
+    }
+    const tone = r.report.failed.length ? "bad" : r.report.staged.length ? "ok" : "info";
+    notify(syncMessage(r.report), tone);
+    await refresh(); // select only after the new diff is part of the snapshot
+    if (r.report.staged[0]) setSelectedId(r.report.staged[0].diffId);
+  };
+
   const reject = async () => {
     if (!selected) return;
     setBusy("reject");
@@ -94,6 +119,16 @@ export default function CisoDiffDashboard({ session, snap, refresh, notify }: Pr
           </div>
           <Button variant="outline" className="w-full !justify-start" onClick={() => setStageOpen(true)}>
             <Plus size={14} /> Stage Policy Update
+          </Button>
+          <Button
+            variant="outline"
+            className="w-full !justify-start"
+            onClick={() => void syncInbox()}
+            disabled={busy === "sync"}
+            title="Scannt backend/watched_inbox/ auf neue/geänderte Richtlinien (SharePoint/SMB Connector)"
+          >
+            <RefreshCw size={14} className={busy === "sync" ? "animate-spin" : ""} /> Sync Inbox
+            <span className="ml-auto font-mono text-[10px] font-normal text-faint">watched_inbox/</span>
           </Button>
           {pending.length === 0 && <div className="rounded-lg border border-dashed border-line-strong p-4 text-center text-xs text-faint">Keine ausstehenden Policy-Diffs.</div>}
           {pending.map((d) => (
@@ -540,7 +575,7 @@ function ConflictCallout({
         <span className="text-sm font-semibold text-fg">Cross-Document Conflict</span>
         <Badge tone={c.severity === "high" ? "bad" : "warn"}>{c.severity === "high" ? "High priority" : "Medium priority"}</Badge>
         {c.verifiedBy && <Badge tone="brand">{c.verifiedBy === "llm+rules" ? "LLM + Regeln verifiziert" : c.verifiedBy === "llm" ? "LLM-verifiziert" : "Regelbasiert"}</Badge>}
-        {addressed && <Badge tone="ok"><Check size={10} /> Sync-Ticket {c.ticketId}</Badge>}
+        {addressed && <Badge tone="ok"><Check size={10} /> Sync-Ticket {c.ticketId}{c.ticketResolved ? " · erledigt" : ""}</Badge>}
         <Badge className="ml-auto font-mono">similarity {c.similarity.toFixed(2)}</Badge>
       </div>
       <p className="px-4 pb-3 text-[13px] leading-6 text-muted">⚠️ {c.message}</p>

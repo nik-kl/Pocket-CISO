@@ -8,10 +8,11 @@ export type Role = "L1" | "L2" | "L3";
 export const ROLE_RANK: Record<Role, number> = { L1: 1, L2: 2, L3: 3 };
 export const hasRole = (have: Role, need: Role) => ROLE_RANK[have] >= ROLE_RANK[need];
 
-export const ROLE_META: Record<Role, { id: string; sub: string; label: string; needsPassword: boolean }> = {
-  L1: { id: "L1: Employee", sub: "Marketing", label: "Employee", needsPassword: false },
-  L2: { id: "L2: IT-Admin", sub: "Infrastructure", label: "IT-Admin", needsPassword: true },
-  L3: { id: "L3: CISO", sub: "Admin & Approval", label: "CISO", needsPassword: true },
+// `group` = Enterprise Directory group (Entra ID / OIDC) that maps to the RBAC level in a production SSO setup.
+export const ROLE_META: Record<Role, { id: string; sub: string; label: string; needsPassword: boolean; group: string }> = {
+  L1: { id: "L1: Employee", sub: "Marketing", label: "Employee", needsPassword: false, group: "oidc:SG-All-Staff" },
+  L2: { id: "L2: IT-Admin", sub: "Infrastructure", label: "IT-Admin", needsPassword: true, group: "oidc:SG-IT-Infrastructure" },
+  L3: { id: "L3: CISO", sub: "Admin & Approval", label: "CISO", needsPassword: true, group: "oidc:SG-CISO-Governance" },
 };
 
 export interface Session {
@@ -47,6 +48,7 @@ export interface Conflict {
   severity: "high" | "medium";
   status: "open" | "ticket";
   ticketId: string | null;
+  ticketResolved?: boolean;
   verifiedBy?: "llm" | "rules" | "llm+rules";
 }
 
@@ -105,7 +107,12 @@ export interface Ticket {
   ref: string | null;
   createdBy: string;
   createdAt: string;
-  status: "OPEN" | "CLOSED";
+  status: "open" | "resolved";
+  sha256?: string;
+  slaDue?: string;
+  resolvedAt?: string | null;
+  resolvedBy?: string | null;
+  resolutionNote?: string | null;
 }
 
 /* ───────────────────────── API payloads ───────────────────────── */
@@ -178,6 +185,16 @@ export interface StageStats {
   latencyMs: Record<string, number>;
 }
 
+// Result of a watched-inbox scan (Zero-Touch connector, Pipeline A).
+export interface SyncReport {
+  inbox: string;
+  scanned: number;
+  staged: { file: string; diffId: string; conflicts: number }[];
+  skipped: { file: string; reason: string }[];
+  failed: { file: string; error: string }[];
+  engineMode: string;
+}
+
 export interface AuditReport {
   schema: string;
   generatedAt: string;
@@ -206,6 +223,27 @@ export const citationLabel = (c: Pick<LiveChunk, "docName" | "section">) => `${c
 
 export const formatTime = (iso: string) =>
   new Date(iso).toLocaleString("de-DE", { dateStyle: "short", timeStyle: "short" });
+
+// Enterprise webhook body that the Jira / ServiceNow connector would send for a ticket (shown in the Knowledge & Audit view).
+export function buildTicketPayload(t: Ticket): Record<string, unknown> {
+  const sla = t.slaDue ?? new Date(new Date(t.createdAt).getTime() + (t.type === "POLICY_SYNC" ? 5 : 2) * 86_400_000).toISOString();
+  return {
+    endpoint: t.system === "Jira" ? "POST /rest/api/3/issue" : "POST /api/now/table/incident",
+    system: t.system,
+    projectKey: "SEC",
+    issueType: t.type === "POLICY_SYNC" ? "Policy-Conflict" : "Knowledge-Gap",
+    summary: t.title,
+    description: t.description,
+    queue: t.queue,
+    reporter: t.createdBy,
+    sha256: t.sha256 ?? null,
+    conflictingDoc: t.targetDoc,
+    stagingRef: t.ref,
+    priority: t.type === "POLICY_SYNC" ? "High" : "Medium",
+    slaDue: sla,
+    status: t.status,
+  };
+}
 
 export const shortHash = (h: string) => `${h.slice(0, 8)}…${h.slice(-6)}`;
 

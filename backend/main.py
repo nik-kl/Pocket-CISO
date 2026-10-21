@@ -1,11 +1,14 @@
 """Pocket CISO — FastAPI service (port 8000). Thin HTTP layer over rag_engine.py.
 
 Run:  python main.py        (or: uvicorn main:app --host 127.0.0.1 --port 8000)
-Env:  OLLAMA_BASE_URL, LLM_MODEL, EMBED_MODEL, MIN_SCORE, CORS_ORIGINS, POCKET_CISO_DATA_DIR
+Env:  OLLAMA_BASE_URL, LLM_MODEL, EMBED_MODEL, MIN_SCORE, CORS_ORIGINS, POCKET_CISO_DATA_DIR,
+      AUTO_SYNC=1 (watch backend/watched_inbox/ every AUTO_SYNC_SECONDS=30), WATCHED_INBOX_DIR
 """
 from __future__ import annotations
 
 import os
+from contextlib import asynccontextmanager
+from typing import AsyncIterator
 
 import uvicorn
 from fastapi import FastAPI, Header, Request
@@ -17,7 +20,16 @@ from pydantic import BaseModel, Field
 
 import rag_engine as rag
 
-app = FastAPI(title="Pocket CISO RAG Engine", version=rag.VERSION)
+
+@asynccontextmanager
+async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+    stop = rag.start_inbox_watcher()  # only runs with AUTO_SYNC=1
+    yield
+    if stop:
+        stop.set()
+
+
+app = FastAPI(title="Pocket CISO RAG Engine", version=rag.VERSION, lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -110,6 +122,12 @@ async def stage_file(request: Request, authorization: str | None = Header(defaul
     if body.text.strip() and body.docName.strip():
         return await run_in_threadpool(lambda: rag.stage_document(token, doc_name=rag.safe_doc_name(body.docName), text=body.text, title=body.title or None, min_role=body.minRole, author=body.author, replaces=body.replaces))
     return err(400, "NO_INPUT", "newText bzw. text + docName erforderlich.")
+
+
+@app.post("/sync-inbox")
+def sync_inbox(authorization: str | None = Header(default=None)) -> dict:
+    """Zero-touch connector: scan backend/watched_inbox/ and stage new/modified files for CISO approval (L2+)."""
+    return rag.sync_watched_inbox(bearer(authorization))
 
 
 @app.post("/approve/{diff_id}")

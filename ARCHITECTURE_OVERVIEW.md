@@ -1,4 +1,4 @@
-# Pocket CISO — Architecture Overview (95 % MVP)
+# Pocket CISO — Architecture Overview (Stage 4: zero-touch ingestion & closed-loop remediation)
 
 On-premise Compliance & Policy RAG middleware for the DACH market. A Next.js app with a real local AI backend: **Python FastAPI + Ollama** (LLM + embeddings), a **JSON-file database** shared by both runtimes, and an **automatic fallback to a pure-TypeScript engine** when Python/Ollama are not running — so the product (and a live pitch) never breaks.
 
@@ -15,7 +15,7 @@ cd backend && python3 -m venv .venv && source .venv/bin/activate && pip install 
 ollama pull llama3.2:3b && ollama pull nomic-embed-text                                                # optional, enables the real LLM path
 npm install
 ```
-Everything also works with **only** `npm run dev` (local fallback engine). Demo logins: `admin2026` (L2 IT-Admin), `ciso2026` (L3 CISO); L1 needs no password. Sample uploads: `backend/seed_policies/*.md`.
+Optional: `AUTO_SYNC=1 python main.py` additionally scans `backend/watched_inbox/` every 30 s (`AUTO_SYNC_SECONDS`). Everything also works with **only** `npm run dev` (local fallback engine). Demo logins: `admin2026` (L2 IT-Admin), `ciso2026` (L3 CISO); L1 needs no password. Sample uploads: `backend/seed_policies/*.md`.
 
 ## Engine modes (sidebar shows the live state, polled every 8 s)
 | Sidebar | What runs | Retrieval | Answer / diff / conflicts |
@@ -30,9 +30,9 @@ All three read/write the **same** `data/pocket-ciso-db.json` (atomic `mkdir` loc
 ```
 Browser (React)
   └─► /api/v1  (src/app/api/v1/route.ts — hybrid gateway)
-        ├─ query · stage_policy · stage_file · approve ──► Python FastAPI :8000 ──► Ollama :11434
+        ├─ query · stage_policy · stage_file · sync_inbox · approve ──► Python FastAPI :8000 ──► Ollama :11434
         │       (offline → same action on the local engine; mutation timeouts are NOT retried locally)
-        └─ authenticate · tickets · reject · export_report · snapshot ──► src/lib/db.ts
+        └─ authenticate · tickets (create/resolve) · reject · export_report · snapshot ──► src/lib/db.ts
                               both engines ──► data/pocket-ciso-db.json (+ data/vectors.json)
 ```
 Auth is a stateless HMAC token (`ROLE.expiry.signature`, key in the DB). Python verifies the same token and enforces RBAC on its own.
@@ -45,10 +45,21 @@ Four timed stages (milliseconds shown in the telemetry bar):
 4. **Grounded generation + NLI verification** — LLM (temp 0.0) answers the *original* question with `[C1]` citations. A lexical NLI check requires every number to occur in the cited chunks and ≥ 60 % of content words to be supported; otherwise the answer is replaced by an extractive, guaranteed-grounded one. Citations open the Source Chunk Inspector (raw text, SHA-256, approval time, approver, similarity).
 
 ## Pipeline A — ingestion, diff, conflict detection (`POST /stage-file`)
-Parse (`pypdf`, `python-docx`, text) → semantic chunking by headings (`##`, `§n`, `1.2 Titel`, ≤ 600 chars, SHA-256 per chunk) → embeddings → alignment with the existing **document series** (name-token similarity or explicit "replaces") → red/green diff (unchanged chunks skipped) → **cross-document conflict scanner**: cosine ≥ 0.72 and shared vocabulary, then a verdict cascade: *rules* (same unit, different value: "12 Stunden ↔ 24 Stunden") ± *LLM JSON* (temp 0.0, validated quote). A 3B model flags far too many false positives on its own (measured: 5 "conflicts" for one password policy, 1 real), so LLM-only verdicts are accepted only with numeric context or very strong topical overlap. Each conflict shows `verifiedBy`. The CISO must create a **Sync-Ticket** per conflict or tick the explicit override before `Approve & Merge` (enforced server-side, 409 otherwise). Approval writes chunks + vectors to the live collection, removes superseded chunks and appends `APPROVED_AND_MERGED` to the audit chain.
+Parse (`pypdf`, `python-docx` incl. tables in body order, text) → semantic, **table-aware** chunking by headings (`##`, `§n`, `1.2 Titel`, ≤ 600 chars, SHA-256 per chunk) → embeddings → alignment with the existing **document series** (name-token similarity or explicit "replaces") → red/green diff (unchanged chunks skipped) → **cross-document conflict scanner**: cosine ≥ 0.72 and shared vocabulary, then a verdict cascade: *rules* (same unit, different value: "12 Stunden ↔ 24 Stunden") ± *LLM JSON* (temp 0.0, validated quote). A 3B model flags far too many false positives on its own (measured: 5 "conflicts" for one password policy, 1 real), so LLM-only verdicts are accepted only with numeric context or very strong topical overlap. Each conflict shows `verifiedBy`. The CISO must create a **Sync-Ticket** per conflict or tick the explicit override before `Approve & Merge` (enforced server-side, 409 otherwise). Approval writes chunks + vectors to the live collection, removes superseded chunks and appends `APPROVED_AND_MERGED` to the audit chain.
+
+## Zero-touch connector — `backend/watched_inbox/` (Stage 4)
+*"Pocket CISO syncs documents in defined cycles and stages changes for CISO approval."* Drop a `.pdf/.docx/.md/.txt` into `backend/watched_inbox/` (stand-in for a SharePoint/SMB share) and press **Sync Inbox** in the Policy Diff view — or run the backend with `AUTO_SYNC=1` for a 30 s cycle. For every file the connector computes the SHA-256, skips it when `meta.ingestedFiles[file]` already has that hash or a diff of the same name is still pending, and otherwise stages it as *Auto-Connector (watched_inbox)* with `minRole L2`. Staging, hash bookkeeping and the `AUTO_CONNECTOR_SYNC` audit entry are written in **one atomic DB update**, so a crash can never stage a file twice. The CISO still approves every change — the connector only fills the queue. The shipped `BCM_Wiederanlauf_Matrix_2026.md` states *Tier 1 RTO = 2 Stunden*, which the conflict scanner flags against the live 24 h rules. Python handles all four formats; the Node fallback handles `.md/.txt` and reports PDF/DOCX as "needs Python".
+
+**Tables:** a Markdown (or DOCX) table is no longer flattened into paragraphs. Each data row becomes a self-contained sentence — `Tabelle [§2 Wiederanlaufzeiten (RTO/RPO)]: System-Tier: Tier 1 (Kritisch) | RTO: 2 Stunden | RPO: 15 Minuten.` — so embeddings, retrieval and the "same unit, different value" conflict rule work on BCM/risk matrices. Rows are packed into atomic ≤ 600-char chunks under their section heading.
+
+## Closed-loop tickets
+Tickets are actionable: in *Knowledge DB & Audit Log* a ticket row expands to the **Enterprise Webhook Payload** (what the Jira/ServiceNow connector would POST: `projectKey "SEC"`, `issueType "Policy-Conflict"`, `sha256`, `conflictingDoc`, `slaDue`) and, for L2/L3, **Als erledigt markieren (Resolve)** → `resolve_ticket` sets `status: resolved`, audits `TICKET_RESOLVED` and marks the linked staging conflict as addressed (shown as "Sync-Ticket CISO-… · erledigt"). *Print / PDF Summary* opens the printable **NIS-2 Governance Attestation** (chain integrity, `policySetHash`, active policies with SHA-256, latest CISO approvals) — use *Drucken / Als PDF speichern*.
+
+## Identity mapping
+The RBAC switcher shows the enterprise directory group each level maps to in an SSO rollout: `L1 → oidc:SG-All-Staff`, `L2 → oidc:SG-IT-Infrastructure`, `L3 → oidc:SG-CISO-Governance` (tooltip, active-row subtitle, clearance pill). Today roles are password-elevated demo identities; the group names are the contract for the Entra ID / OIDC claim mapping.
 
 ## UI
-Left sidebar (workspaces, live backend status, RBAC identity switcher with password elevation), top bar (breadcrumb, legal pill, Light/Dark/System, clearance). Views: **Ask Pocket CISO** · **Policy Diff & Sign-Off** (drag-and-drop staging modal with live scanner steps) · **Knowledge DB & Audit Log** (chunks, hash-chained audit trail, tickets, **NIS-2 audit report export as JSON/CSV**).
+Left sidebar (workspaces, live backend status, RBAC identity switcher with password elevation), top bar (breadcrumb, legal pill, Light/Dark/System, clearance). Views: **Ask Pocket CISO** · **Policy Diff & Sign-Off** (drag-and-drop staging modal with live scanner steps, **Sync Inbox**) · **Knowledge DB & Audit Log** (chunks, hash-chained audit trail, tickets with webhook inspector & resolve, **NIS-2 audit report export as JSON/CSV + printable attestation**).
 
 ## Audit & compliance artifact
 Append-only audit log, each entry hash-chained (`sha256(prevHash|id|timestamp|actor|role|action|target|status|detail)`), re-verified on every snapshot — Node and Python write the same format. *Export NIS-2 Audit Report* (L2+) downloads: active policy chunks with SHA-256 / approval time / approver, the complete audit log, tickets, chain head hash, `policySetHash` and a `reportHash`; an auditor can recompute all of them independently (the export itself is audited as `AUDIT_EXPORT`). CSV cells starting with `= + - @` are neutralised against spreadsheet formula injection.
@@ -58,6 +69,9 @@ Role passwords: SHA-256 + `timingSafeEqual`, 5 failures/min → 429. Python list
 
 ## Verified behaviour (E2E)
 Scripted browser run (Playwright, 26 checks) against live Ollama: Python connected → real `.md` upload → LLM+rules conflict → Sync-Ticket → merge → same question now answers "15 Zeichen"; previously-unknown KI question becomes answerable after approving the KI policy; JSON export re-verifies (chain, policy-set hash, report hash); Python stopped → sidebar flips to *Local Fallback*, queries and `.md` staging/approval keep working, PDF upload gives a clear "needs Python" message; Python restarted → vectors resync and answer from chunks merged offline. Real `.pdf`/`.docx` uploads were verified over HTTP.
+
+## Verification policy (Stage 4)
+Stage 4 was verified with `npx tsc --noEmit` and `python -m py_compile backend/main.py backend/rag_engine.py` only (no browser/E2E re-run). The 26-check E2E above predates the connector, table chunking and ticket resolution.
 
 ## Roadmap to 100 %
 Qdrant/pgvector + PostgreSQL instead of JSON files · SSO (OIDC/SAML) · Jira/ServiceNow REST for tickets · re-ranker + larger multilingual embedding model (e.g. `bge-m3`) · OCR for scanned PDFs · multi-tenant collections.

@@ -206,6 +206,7 @@ export default function Page() {
                     role="radio"
                     aria-checked={active}
                     aria-label={`${ROLE_META[r].id} (${ROLE_META[r].sub})`}
+                    title={`${r} → ${ROLE_META[r].group} (Entra ID / OIDC Gruppe)`}
                     onClick={() => pickRole(r)}
                     className={`flex w-full items-center gap-2.5 rounded-lg border px-2.5 py-2 text-left transition-colors ${
                       active ? "border-line-strong bg-raised text-fg" : "border-transparent text-muted hover:bg-raised/60 hover:text-fg"
@@ -215,6 +216,7 @@ export default function Page() {
                     <span className="min-w-0 flex-1">
                       <span className="block text-[13px] font-medium leading-4">{ROLE_META[r].id}</span>
                       <span className="block text-[11px] leading-4 text-faint">{ROLE_META[r].sub}</span>
+                      {active && <span className="block truncate font-mono text-[10px] leading-4 text-brand-fg">{ROLE_META[r].group}</span>}
                     </span>
                     {!active && ROLE_META[r].needsPassword && <Lock size={12} className="text-faint" />}
                     {active && r !== "L1" && <span className="w-5" aria-hidden />}
@@ -252,9 +254,12 @@ export default function Page() {
               Assistenzsystem — Keine rechtsverbindliche Freigabe
             </span>
             <ThemeSwitcher />
-            <Badge tone={roleTone(session.role)} className="!px-2 !py-1">
-              <span className="font-mono">{session.role}</span> Clearance · {session.clearance}
-            </Badge>
+            <span title={`${session.role} → ${ROLE_META[session.role].group} (Entra ID / OIDC Gruppe)`}>
+              <Badge tone={roleTone(session.role)} className="!px-2 !py-1">
+                <span className="font-mono">{session.role}</span> Clearance · {session.clearance}
+                <span className="hidden border-l border-current/20 pl-1.5 font-mono text-[10px] opacity-80 2xl:inline">{ROLE_META[session.role].group}</span>
+              </Badge>
+            </span>
           </div>
         </header>
 
