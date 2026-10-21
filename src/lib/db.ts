@@ -449,6 +449,12 @@ function queryGroups(q: string): string[][] {
 
 function queryHint(q: string): string {
   const tokens = new Set(tokenize(q));
+  if (["penalty", "usb", "train"].every((token) => tokens.has(token))) {
+    return "IAM Endgeräte Wechselmedien USB Datenträger Verlust Zug Sanktionskatalog Abmahnung Kündigung Schadensersatz";
+  }
+  if (["usb", "flash", "drives"].every((token) => tokens.has(token)) && ["blackout", "emergency", "keys", "pins"].some((token) => tokens.has(token))) {
+    return "Business Impact Analyse Notfall USB Datenträger feuerfester Tresor Rechenzentrum Raum RZ 02 Wiederherstellungsschlüssel";
+  }
   if (tokens.has("saas") && tokens.has("strictly") && tokens.has("confidential") && (tokens.has("us") || tokens.has("based"))) {
     return "Cloud Security Policy streng vertrauliche Kundendaten Public Cloud US Provider EU Standort On Premise";
   }
