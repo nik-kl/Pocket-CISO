@@ -72,6 +72,12 @@ const reply = (out: { ok: boolean; status?: number; code?: string; error?: strin
     ? NextResponse.json({ ...out, status: undefined, served }, { headers: NO_STORE })
     : NextResponse.json({ ok: false, code: out.code, error: out.error, served }, { status: out.status ?? 400, headers: NO_STORE });
 
+const configurationReply = (error: unknown): NextResponse | null => {
+  if (!(error instanceof Error)) return null;
+  if (!/POCKET_CISO|Auth-Secret|Nicht-Demo-Modus/.test(error.message)) return null;
+  return reply({ ok: false, status: 503, code: "AUTH_CONFIG_MISSING", error: error.message });
+};
+
 /**
  * Try the Python backend. Returns a response when Python handled the request (success or authoritative error),
  * or null when the caller should use the local engine.
@@ -107,7 +113,7 @@ export async function GET(req: NextRequest) {
     return NextResponse.json({ ...snap, backend }, { headers: NO_STORE });
   } catch (e) {
     console.error("[api/v1 GET]", e);
-    return NextResponse.json({ ok: false, code: "INTERNAL", error: "Interner Fehler." }, { status: 500 });
+    return configurationReply(e) ?? NextResponse.json({ ok: false, code: "INTERNAL", error: "Interner Fehler." }, { status: 500 });
   }
 }
 
@@ -196,6 +202,6 @@ export async function POST(req: NextRequest) {
     }
   } catch (e) {
     console.error("[api/v1 POST]", e);
-    return reply({ ok: false, status: 500, code: "INTERNAL", error: "Interner Fehler." });
+    return configurationReply(e) ?? reply({ ok: false, status: 500, code: "INTERNAL", error: "Interner Fehler." });
   }
 }

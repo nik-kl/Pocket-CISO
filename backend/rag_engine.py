@@ -14,6 +14,7 @@ import json
 import math
 import os
 import re
+import secrets
 import threading
 import time
 import uuid
@@ -33,6 +34,9 @@ DATA_DIR = Path(os.getenv("POCKET_CISO_DATA_DIR", Path(__file__).resolve().paren
 DB_PATH = DATA_DIR / "pocket-ciso-db.json"
 VEC_PATH = DATA_DIR / "vectors.json"
 LOCK_DIR = DATA_DIR / ".db.lock"  # cross-process mutex shared with the Node app (atomic mkdir)
+AUTH_SECRET_PATH = DATA_DIR / ".auth-secret"
+IS_PRODUCTION = os.getenv("NODE_ENV") == "production" or os.getenv("POCKET_CISO_ENV") == "production"
+DEMO_MODE = not IS_PRODUCTION and (os.getenv("POCKET_CISO_DEMO") == "1" or os.getenv("POCKET_CISO_DEMO_MODE") == "1")
 
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/")
 LLM_MODEL = os.getenv("LLM_MODEL", "qwen2.5:7b")
@@ -375,7 +379,37 @@ def read_db() -> dict[str, Any]:
         raise ApiError(500, "DB_CORRUPT", "pocket-ciso-db.json ist beschädigt.")
     if "meta" not in db or "live_chunks" not in db:
         raise ApiError(500, "DB_CORRUPT", "Datenbank-Schema ungültig.")
+    db["meta"].pop("secret", None)
     return db
+
+
+def auth_secret() -> str:
+    configured = os.getenv("POCKET_CISO_SECRET", "").strip()
+    if configured:
+        if len(configured) < 32:
+            raise ApiError(500, "AUTH_CONFIG_INVALID", "POCKET_CISO_SECRET muss mindestens 32 Zeichen lang sein.")
+        return configured
+    if not DEMO_MODE:
+        raise ApiError(500, "AUTH_CONFIG_MISSING", "POCKET_CISO_SECRET muss außerhalb des Demo-Modus gesetzt sein.")
+    try:
+        existing = AUTH_SECRET_PATH.read_text(encoding="utf-8").strip()
+        if len(existing) >= 32:
+            return existing
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        raise ApiError(500, "AUTH_SECRET_UNREADABLE", f"Auth-Secret konnte nicht gelesen werden: {type(e).__name__}") from e
+    AUTH_SECRET_PATH.parent.mkdir(parents=True, exist_ok=True)
+    generated = secrets.token_hex(32)
+    try:
+        fd = os.open(AUTH_SECRET_PATH, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        return AUTH_SECRET_PATH.read_text(encoding="utf-8").strip()
+    try:
+        os.write(fd, generated.encode("utf-8"))
+    finally:
+        os.close(fd)
+    return generated
 
 
 def _atomic_write(path: Path, payload: str) -> None:
@@ -507,7 +541,7 @@ def verify_token(secret: str, token: str | None) -> str | None:
 
 
 def actor_for(db: dict[str, Any], token: str | None) -> dict[str, str]:
-    role = verify_token(db["meta"]["secret"], token) or "L1"
+    role = verify_token(auth_secret(), token) or "L1"
     user = next(u for u in db["users"] if u["role"] == role)
     return {"email": user["email"], "role": role}
 

@@ -4,10 +4,10 @@ On-premise Compliance & Policy RAG middleware for the DACH market. A Next.js app
 
 ## Run it (2 terminals)
 ```bash
-# Terminal 1 — AI backend (Python FastAPI + Ollama)
-cd backend && source .venv/bin/activate && python main.py          # http://127.0.0.1:8000
+# Terminal 1 — AI backend (Python FastAPI + Ollama; explicit demo mode)
+cd backend && export POCKET_CISO_DEMO=1 && source .venv/bin/activate && python main.py          # http://127.0.0.1:8000
 # Terminal 2 — web app
-npm run dev                                                        # http://localhost:3000
+POCKET_CISO_DEMO=1 npm run dev                                    # http://localhost:3000
 ```
 First-time setup:
 ```bash
@@ -15,7 +15,9 @@ cd backend && python3 -m venv .venv && source .venv/bin/activate && pip install 
 ollama pull qwen2.5:7b && ollama pull bge-m3                                                           # optional, enables the real LLM path
 npm install
 ```
-Optional: `AUTO_SYNC=1 python main.py` additionally scans `backend/watched_inbox/` every 30 s (`AUTO_SYNC_SECONDS`). Everything also works with **only** `npm run dev` (local fallback engine). Demo logins: `admin2026` (L2 IT-Admin), `ciso2026` (L3 CISO); L1 needs no password. Sample uploads: `backend/seed_policies/*.md`.
+Optional: `AUTO_SYNC=1 python main.py` additionally scans `backend/watched_inbox/` every 30 s (`AUTO_SYNC_SECONDS`). Everything also works with **only** `POCKET_CISO_DEMO=1 npm run dev` (local fallback engine). In explicit demo mode, demo logins are `admin2026` (L2 IT-Admin) and `ciso2026` (L3 CISO); L1 needs no password. Sample uploads: `backend/seed_policies/*.md`.
+
+For a non-demo deployment, set `POCKET_CISO_SECRET` (at least 32 characters), `POCKET_CISO_L2_PASSWORD`, and `POCKET_CISO_L3_PASSWORD` in both processes before startup. The HMAC secret is never written to `data/pocket-ciso-db.json`; demo mode generates a local `data/.auth-secret` with restrictive permissions for the two local processes. Reset Demo is disabled unless `POCKET_CISO_DEMO=1` is explicitly set.
 
 ## Engine modes (sidebar shows the live state, polled every 8 s)
 | Sidebar | What runs | Retrieval | Answer / diff / conflicts |
@@ -35,7 +37,7 @@ Browser (React)
         └─ authenticate · tickets (create/resolve) · reject · export_report · snapshot ──► src/lib/db.ts
                               both engines ──► data/pocket-ciso-db.json (+ data/vectors.json)
 ```
-Auth is a stateless HMAC token (`ROLE.expiry.signature`, key in the DB). Python verifies the same token and enforces RBAC on its own.
+Auth is a stateless HMAC token (`ROLE.expiry.signature`, secret supplied through `POCKET_CISO_SECRET` or the explicit-demo local secret file). Python verifies the same token and enforces RBAC on its own. Legacy `meta.secret` values are ignored and removed on the next Node persistence cycle.
 
 ## Pipeline B — stateless compliance chat (`POST /query`)
 Four timed stages (milliseconds shown in the telemetry bar):
@@ -68,7 +70,7 @@ Left sidebar (workspaces, live backend status, RBAC identity switcher with passw
 Append-only audit log, each entry hash-chained (`sha256(prevHash|id|timestamp|actor|role|action|target|status|detail)`), re-verified on every snapshot — Node and Python write the same format. *Export NIS-2 Audit Report* (L2+) downloads: active policy chunks with SHA-256 / approval time / approver, the complete audit log, tickets, chain head hash, `policySetHash` and a `reportHash`; an auditor can recompute all of them independently (the export itself is audited as `AUDIT_EXPORT`). CSV cells starting with `= + - @` are neutralised against spreadsheet formula injection.
 
 ## Security notes
-Role passwords: SHA-256 + `timingSafeEqual`, 5 failures/min → 429. Python listens on `127.0.0.1` only, CORS limited to the web origin, uploads ≤ 10 MB with an extension allow-list, file names sanitised, PDF page cap, chunk cap. Uploaded policy text is untrusted input to the LLM: outputs are constrained (JSON-only conflict verdict with quote validation, NLI-checked answers). Queries are not persisted (zero retention; only explicit tickets keep the question). `data/` holds the HMAC secret → gitignored. For production: Argon2id + SSO, secret outside the data file, PostgreSQL (append-only audit table), Qdrant, TLS, a reverse proxy.
+Role passwords: SHA-256 + `timingSafeEqual`, 5 failures/min → 429. Known demo credentials are available only when `POCKET_CISO_DEMO=1`; non-demo startup fails unless L2/L3 passwords are configured. Python listens on `127.0.0.1` only, CORS limited to the web origin, uploads ≤ 10 MB with an extension allow-list, file names sanitised, PDF page cap, chunk cap. Uploaded policy text is untrusted input to the LLM: outputs are constrained (JSON-only conflict verdict with quote validation, NLI-checked answers). Queries are not persisted (zero retention; only explicit tickets keep the question). The HMAC secret is external to the JSON DB (`POCKET_CISO_SECRET` in deployments, permissions-restricted `data/.auth-secret` only for explicit demo mode). For production: Argon2id + SSO, PostgreSQL (append-only audit table), Qdrant, TLS, a reverse proxy.
 
 ## Verified behaviour (E2E)
 Scripted browser run (Playwright, 26 checks) against live Ollama: Python connected → real `.md` upload → LLM+rules conflict → Sync-Ticket → merge → same question now answers "15 Zeichen"; previously-unknown KI question becomes answerable after approving the KI policy; JSON export re-verifies (chain, policy-set hash, report hash); Python stopped → sidebar flips to *Local Fallback*, queries and `.md` staging/approval keep working, PDF upload gives a clear "needs Python" message; Python restarted → vectors resync and answer from chunks merged offline. Real `.pdf`/`.docx` uploads were verified over HTTP.

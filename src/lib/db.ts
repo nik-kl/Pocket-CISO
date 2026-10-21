@@ -34,7 +34,6 @@ interface DbUser {
 }
 
 interface Meta {
-  secret: string;
   liveVersion: number;
   nextTicket: number;
   nextAudit: number;
@@ -65,6 +64,11 @@ const COLLECTION = "policies_live_v1";
 const GENESIS = "0".repeat(64);
 const TOKEN_TTL_MS = 8 * 3600 * 1000;
 const DB_PATH = path.join(process.cwd(), "data", "pocket-ciso-db.json");
+const DATA_DIR = path.dirname(DB_PATH);
+const AUTH_SECRET_PATH = path.join(DATA_DIR, ".auth-secret");
+const IS_PRODUCTION = process.env.NODE_ENV === "production" || process.env.POCKET_CISO_ENV === "production";
+const DEMO_MODE = !IS_PRODUCTION && (process.env.POCKET_CISO_DEMO === "1" || process.env.POCKET_CISO_DEMO_MODE === "1");
+let authSecretCache: string | null = null;
 
 export const sha256 = (s: string) => crypto.createHash("sha256").update(s, "utf8").digest("hex");
 const uid = (prefix: string) => `${prefix}-${crypto.randomBytes(4).toString("hex")}`;
@@ -150,11 +154,11 @@ function seedDb(): Db {
   ];
 
   const db: Db = {
-    meta: { secret: crypto.randomBytes(32).toString("hex"), liveVersion: 1, nextTicket: 4712, nextAudit: 1, seededAt: nowIso(), ingestedFiles: {} },
+    meta: { liveVersion: 1, nextTicket: 4712, nextAudit: 1, seededAt: nowIso(), ingestedFiles: {} },
     users: [
       { email: "employee@company.at", role: "L1", clearance: "Employee", requiresPassword: false, passwordHash: null },
-      { email: "admin@company.at", role: "L2", clearance: "IT-Admin", requiresPassword: true, passwordHash: sha256("admin2026") },
-      { email: "ciso@company.at", role: "L3", clearance: "CISO", requiresPassword: true, passwordHash: sha256("ciso2026") },
+      { email: "admin@company.at", role: "L2", clearance: "IT-Admin", requiresPassword: true, passwordHash: configuredPasswordHash("L2") },
+      { email: "ciso@company.at", role: "L3", clearance: "CISO", requiresPassword: true, passwordHash: configuredPasswordHash("L3") },
     ],
     live_chunks: live,
     staged_diffs: diffs,
@@ -173,6 +177,7 @@ const g = globalThis as unknown as { __pcQueue?: Promise<unknown>; __pcFails?: R
 
 // Older DB files: ticket status was "OPEN"/"CLOSED", meta.ingestedFiles did not exist.
 function migrate(db: Db): Db {
+  delete (db.meta as Meta & { secret?: string }).secret;
   db.meta.ingestedFiles ??= {};
   for (const t of db.tickets) {
     const legacy = t.status as string;
@@ -182,12 +187,67 @@ function migrate(db: Db): Db {
   return db;
 }
 
+function configuredPasswordHash(role: "L2" | "L3"): string {
+  const envName = role === "L2" ? "POCKET_CISO_L2_PASSWORD" : "POCKET_CISO_L3_PASSWORD";
+  const configured = process.env[envName]?.trim();
+  if (configured) return sha256(configured);
+  if (!DEMO_MODE) throw new Error(`${envName} muss im Nicht-Demo-Modus gesetzt sein.`);
+  return sha256(role === "L2" ? "admin2026" : "ciso2026");
+}
+
+async function ensureAuthSecret(): Promise<string> {
+  if (authSecretCache) return authSecretCache;
+  const configured = process.env.POCKET_CISO_SECRET?.trim();
+  if (configured) {
+    if (configured.length < 32) throw new Error("POCKET_CISO_SECRET muss mindestens 32 Zeichen lang sein.");
+    authSecretCache = configured;
+    return configured;
+  }
+  if (!DEMO_MODE) {
+    throw new Error("POCKET_CISO_SECRET muss außerhalb des Demo-Modus gesetzt sein.");
+  }
+  try {
+    const existing = (await fs.readFile(AUTH_SECRET_PATH, "utf8")).trim();
+    if (existing.length >= 32) {
+      authSecretCache = existing;
+      return existing;
+    }
+  } catch (e) {
+    if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
+  }
+  const generated = crypto.randomBytes(32).toString("hex");
+  await fs.mkdir(DATA_DIR, { recursive: true });
+  await fs.writeFile(AUTH_SECRET_PATH, `${generated}\n`, { encoding: "utf8", mode: 0o600 });
+  authSecretCache = generated;
+  return generated;
+}
+
+function authSecret(): string {
+  if (authSecretCache) return authSecretCache;
+  const configured = process.env.POCKET_CISO_SECRET?.trim();
+  if (configured && configured.length >= 32) return configured;
+  throw new Error("Auth-Secret ist noch nicht initialisiert.");
+}
+
+function applyCredentialPolicy(db: Db): void {
+  for (const role of ["L2", "L3"] as const) {
+    const configured = process.env[role === "L2" ? "POCKET_CISO_L2_PASSWORD" : "POCKET_CISO_L3_PASSWORD"]?.trim();
+    if (configured) db.users.find((u) => u.role === role)!.passwordHash = sha256(configured);
+    else if (!DEMO_MODE) throw new Error(`Passwort für ${role} muss im Nicht-Demo-Modus konfiguriert sein.`);
+  }
+}
+
 async function load(): Promise<Db> {
+  await ensureAuthSecret();
   try {
     const raw = await fs.readFile(DB_PATH, "utf8");
     const parsed = JSON.parse(raw) as Db;
     if (!parsed.meta || !Array.isArray(parsed.live_chunks)) throw new Error("Datenbank-Schema ungültig: " + DB_PATH);
-    return migrate(parsed);
+    const beforeMigration = JSON.stringify(parsed);
+    const db = migrate(parsed);
+    applyCredentialPolicy(db);
+    if (beforeMigration !== JSON.stringify(db)) await persist(db);
+    return db;
   } catch (e) {
     if ((e as NodeJS.ErrnoException).code !== "ENOENT") throw e;
     const db = seedDb();
@@ -300,7 +360,7 @@ function verifyToken(secret: string, token: string | null): Role | null {
 }
 
 function actorFor(db: Db, token: string | null): Actor {
-  const role = verifyToken(db.meta.secret, token) ?? "L1";
+  const role = verifyToken(authSecret(), token) ?? "L1";
   return { email: db.users.find((u) => u.role === role)!.email, role };
 }
 
@@ -332,7 +392,7 @@ export function authenticate(token: string | null, role: string, password: strin
     }
     fails[user.role] = [];
     appendAudit(db, { actor: user.email, role: user.role, action: "AUTH_ELEVATION_SUCCESS", target: `→ ${user.role} (${user.clearance})`, status: "SUCCESS", detail: `Sitzung ${TOKEN_TTL_MS / 3600000} h gültig` });
-    return { ok: true as const, token: signToken(db.meta.secret, user.role), session: { role: user.role, email: user.email, clearance: user.clearance } };
+    return { ok: true as const, token: signToken(authSecret(), user.role), session: { role: user.role, email: user.email, clearance: user.clearance } };
   });
 }
 
@@ -1104,10 +1164,12 @@ export function rejectDiff(token: string | null, diffId: string, reason: string)
 // Demo helper (L3): wipes the DB back to the seed so the "v2 → v3" proof can be replayed. Resets the audit chain.
 export function resetDemo(token: string | null): Promise<R<object>> {
   return transact((db) => {
+    if (!DEMO_MODE) {
+      return fail(403, "DISABLED_IN_PRODUCTION", "Demo-Reset ist außerhalb eines explizit aktivierten Demo-Modus deaktiviert.");
+    }
     const a = authorize(db, token, "L3", "reset_demo", COLLECTION);
     if (isFail(a)) return a;
     const fresh = seedDb();
-    fresh.meta.secret = db.meta.secret;
     appendAudit(fresh, { actor: a.email, role: a.role, action: "DEMO_RESET", target: COLLECTION, status: "INFO", detail: "Datenbank auf Seed-Zustand zurückgesetzt" });
     Object.assign(db, fresh);
     return { ok: true as const };
