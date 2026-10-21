@@ -1,0 +1,93 @@
+@import "tailwindcss";
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+/* Semantic design tokens. Light = default, `.dark` on <html> switches the whole app. */
+:root {
+  color-scheme: light;
+  --canvas: #ffffff;
+  --surface: #fafafa;
+  --raised: #f4f4f5;
+  --sunken: #f4f4f5;
+  --line: #e4e4e7;
+  --line-strong: #d4d4d8;
+  --fg: #09090b;
+  --muted: #52525b;
+  --faint: #71717a;
+  --brand: #4f46e5;
+  --brand-fg: #4338ca;
+  --ok: #059669;
+  --ok-fg: #047857;
+  --warn: #d97706;
+  --warn-fg: #b45309;
+  --bad: #e11d48;
+  --bad-fg: #be123c;
+  --shadow-color: rgb(24 24 27 / 0.08);
+}
+
+.dark {
+  color-scheme: dark;
+  --canvas: #09090b;
+  --surface: #121214;
+  --raised: #27272a;
+  --sunken: #0c0c0e;
+  --line: #27272a;
+  --line-strong: #3f3f46;
+  --fg: #f4f4f5;
+  --muted: #a1a1aa;
+  --faint: #71717a;
+  --brand: #6366f1;
+  --brand-fg: #a5b4fc;
+  --ok: #10b981;
+  --ok-fg: #6ee7b7;
+  --warn: #f59e0b;
+  --warn-fg: #fcd34d;
+  --bad: #f43f5e;
+  --bad-fg: #fda4af;
+  --shadow-color: rgb(0 0 0 / 0.5);
+}
+
+@theme inline {
+  --color-canvas: var(--canvas);
+  --color-surface: var(--surface);
+  --color-raised: var(--raised);
+  --color-sunken: var(--sunken);
+  --color-line: var(--line);
+  --color-line-strong: var(--line-strong);
+  --color-fg: var(--fg);
+  --color-muted: var(--muted);
+  --color-faint: var(--faint);
+  --color-brand: var(--brand);
+  --color-brand-fg: var(--brand-fg);
+  --color-ok: var(--ok);
+  --color-ok-fg: var(--ok-fg);
+  --color-warn: var(--warn);
+  --color-warn-fg: var(--warn-fg);
+  --color-bad: var(--bad);
+  --color-bad-fg: var(--bad-fg);
+  --shadow-pop: 0 20px 50px -12px var(--shadow-color);
+  --shadow-card: 0 1px 2px var(--shadow-color), 0 8px 24px -12px var(--shadow-color);
+}
+
+html,
+body {
+  height: 100%;
+  background: var(--canvas);
+  color: var(--fg);
+}
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--line-strong) transparent;
+}
+
+@keyframes slide-in-right {
+  from { transform: translateX(24px); opacity: 0; }
+  to { transform: translateX(0); opacity: 1; }
+}
+@keyframes fade-in {
+  from { opacity: 0; transform: translateY(4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.animate-slide-in { animation: slide-in-right 0.18s ease-out; }
+.animate-fade-in { animation: fade-in 0.2s ease-out; }
