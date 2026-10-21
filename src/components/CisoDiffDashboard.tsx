@@ -31,6 +31,7 @@ export default function CisoDiffDashboard({ session, snap, refresh, notify }: Pr
   const diffs = snap?.diffs ?? [];
   const [selectedId, setSelectedId] = useState("");
   const [overrides, setOverrides] = useState<Record<string, boolean>>({});
+  const [overrideReasons, setOverrideReasons] = useState<Record<string, string>>({});
   const [approveOpen, setApproveOpen] = useState(false);
   const [rejectOpen, setRejectOpen] = useState(false);
   const [stageOpen, setStageOpen] = useState(false);
@@ -57,9 +58,11 @@ export default function CisoDiffDashboard({ session, snap, refresh, notify }: Pr
   const canApprove = session.role === "L3";
   const pending = diffs.filter((d) => d.status === "pending");
   const rejected = diffs.filter((d) => d.status === "rejected");
-  const openConflicts = selected?.conflicts.filter((c) => c.status === "open") ?? [];
+  // A conflict only counts as handled once its Sync-Ticket is resolved (the server enforces the same rule).
+  const openConflicts = selected?.conflicts.filter((c) => c.status === "open" || !c.ticketResolved) ?? [];
   const override = !!(selected && overrides[selected.id]);
-  const mergeBlocked = openConflicts.length > 0 && !override;
+  const overrideReason = (selected && overrideReasons[selected.id]) || "";
+  const mergeBlocked = openConflicts.length > 0 && (!override || overrideReason.trim().length < 10);
 
   const syncTicket = async (c: Conflict) => {
     if (!selected) return;
@@ -74,7 +77,7 @@ export default function CisoDiffDashboard({ session, snap, refresh, notify }: Pr
   const approve = async () => {
     if (!selected) return;
     setBusy("approve");
-    const r = await callApi<{ merged: number; superseded: number; docName: string }>("approve", { diffId: selected.id, override }, session.token);
+    const r = await callApi<{ merged: number; superseded: number; docName: string }>("approve", { diffId: selected.id, override, overrideReason }, session.token);
     setBusy(null);
     setApproveOpen(false);
     if (r.ok) notify(`${r.docName} gemerged: ${r.merged} Chunk(s) live, ${r.superseded} ersetzt.`, "ok");
@@ -186,6 +189,23 @@ export default function CisoDiffDashboard({ session, snap, refresh, notify }: Pr
                   <DiffBlock key={h.id} hunk={h} docName={selected.docName} index={i} />
                 ))}
               </div>
+
+              {(selected.removedChunkIds?.length ?? 0) > 0 && (
+                <div className="space-y-2 rounded-lg border border-bad/30 bg-bad/5 p-4" data-testid="removed-clauses">
+                  <h3 className="text-[10px] font-semibold uppercase tracking-[0.12em] text-bad-fg">
+                    {selected.removedChunkIds!.length} Klausel{selected.removedChunkIds!.length > 1 ? "n" : ""} werden mit dem Merge ENTFERNT
+                  </h3>
+                  {selected.removedChunkIds!.map((id) => {
+                    const old = snap?.chunks.find((c) => c.id === id);
+                    return (
+                      <p key={id} className="text-[13px] text-muted">
+                        <span className="font-mono text-bad-fg">− {old ? `${old.docName} ${old.section}` : id}</span>
+                        {old && <span className="block pl-4 text-faint">{old.content.slice(0, 220)}{old.content.length > 220 ? "…" : ""}</span>}
+                      </p>
+                    );
+                  })}
+                </div>
+              )}
             </div>
           </div>
 
@@ -202,9 +222,19 @@ export default function CisoDiffDashboard({ session, snap, refresh, notify }: Pr
                     />
                     <span>
                       Override: Konflikt bewusst akzeptieren und Merge erzwingen
-                      <span className="block text-[11px] text-faint">Wird als APPROVED_AND_MERGED mit Override-Vermerk im Audit Log festgehalten.</span>
+                      <span className="block text-[11px] text-faint">Wird als APPROVED_AND_MERGED mit Override-Vermerk, Konflikt-IDs und Begründung im Audit Log festgehalten.</span>
                     </span>
                   </label>
+                )}
+                {canApprove && openConflicts.length > 0 && override && (
+                  <textarea
+                    value={overrideReason}
+                    onChange={(e) => setOverrideReasons((r) => ({ ...r, [selected.id]: e.target.value }))}
+                    placeholder="Begründung für den Override (mind. 10 Zeichen, wird auditiert)"
+                    maxLength={500}
+                    rows={2}
+                    className="w-full rounded-lg border border-line bg-canvas px-3 py-2 text-[13px] text-fg outline-none focus:border-brand"
+                  />
                 )}
                 <div className="flex flex-wrap items-center justify-between gap-3">
                   <div className="text-xs">

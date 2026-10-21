@@ -77,25 +77,32 @@ python main.py
 
 Place `.pdf`, `.docx`, `.md`, or `.txt` files in `backend/watched_inbox/`. Files are SHA-256 deduplicated and staged with L2 connector clearance; the CISO must still approve them.
 
-## Non-demo configuration
+## Production configuration
 
-Do not use the seeded demo credentials in a deployment. Configure the same HMAC secret in the Node and Python processes and provide role passwords:
+Never run a deployment with the seeded demo credentials. Start **both** processes with the same values:
 
 ```bash
+export POCKET_CISO_ENV=production
 export POCKET_CISO_SECRET='replace-with-at-least-32-random-characters'
-export POCKET_CISO_L2_PASSWORD='your-l2-password'
-export POCKET_CISO_L3_PASSWORD='your-l3-password'
+export POCKET_CISO_L2_PASSWORD='at-least-14-characters'
+export POCKET_CISO_L3_PASSWORD='at-least-14-characters'
+
+# terminal 1
+cd backend && source .venv/bin/activate && python main.py
+# terminal 2
+npm run build && npm run start
 ```
 
-`POCKET_CISO_SECRET` must contain at least 32 characters. Outside explicit demo mode:
+In production mode:
 
-- L2 and L3 passwords are required.
-- A missing database starts empty with the role accounts and one genuine `DB_INITIALIZED` audit event; demo policies, pending diffs, and backdated audit history are never fabricated in production mode.
-- `reset_demo` is disabled.
-- The gateway returns explicit `AUTH_CONFIG_MISSING` or `AUTH_CONFIG_INVALID` errors instead of silently falling back.
-- The HMAC secret is not stored in `data/pocket-ciso-db.json`.
+- demo flags are ignored; L2/L3 passwords (≥ 14 characters) and the secret (≥ 32 characters) are mandatory;
+- a missing database starts **empty** with the role accounts and one genuine `DB_INITIALIZED` audit event — no demo policies, diffs or backdated history;
+- passwords are checked with scrypt and are never stored in `data/`; the HMAC secret is never written to disk;
+- `reset_demo` is disabled (403);
+- missing configuration returns a generic 503 `AUTH_CONFIG_MISSING` (details only in the server log);
+- put a reverse proxy with TLS in front and set `TRUST_PROXY=1` so rate limits work per client IP. **The proxy must overwrite (not append to) `X-Forwarded-For`** — otherwise a client can forge it and bypass the limits. Without `TRUST_PROXY=1` all users share one rate-limit bucket (widened ×10).
 
-In explicit demo mode, a local `data/.auth-secret` file is generated with restrictive permissions when no `POCKET_CISO_SECRET` is supplied. Legacy `meta.secret` values in old database files are ignored and removed during Node migration.
+In demo mode (`POCKET_CISO_DEMO=1`) a local `data/.auth-secret` is generated with owner-only permissions when no `POCKET_CISO_SECRET` is supplied. Keep data directories out of backups that are readable by untrusted users: they contain the audit log and policy content.
 
 ## Main workflows
 
@@ -103,7 +110,7 @@ In explicit demo mode, a local `data/.auth-secret` file is generated with restri
 
 1. Select an RBAC role in the sidebar.
 2. Ask a question in **Ask Pocket CISO**.
-3. Review the rewrite, RBAC filter, retrieval score, grounding result, engine mode, and latency in **Under the Hood**.
+3. Review the rewrite, RBAC filter, retrieval score, lexical support, verification mode (grounding check or verbatim extract), engine mode, and latency in **Under the Hood**. The retrieval score is a raw similarity, not a probability.
 4. Open a citation to inspect the exact source chunk, SHA-256, approval metadata, and similarity.
 5. Unsupported questions trigger the hallucination-protection fallback and offer a CISO-office ticket.
 
@@ -113,8 +120,8 @@ In explicit demo mode, a local `data/.auth-secret` file is generated with restri
 2. Click **+ Stage Policy Update** to upload a PDF/DOCX/Markdown/TXT file or paste policy text.
 3. Choose the minimum clearance and optional replacement document.
 4. Review semantic red/green hunks and cross-document conflict alerts.
-5. Create a Sync-Ticket for conflicts or use an explicit CISO override.
-6. Approve and merge only after the conflict governance requirement is satisfied.
+5. Create a Sync-Ticket per conflict and resolve it (Knowledge DB & Audit Log), or tick the CISO override and give a reason (≥ 10 characters; audited with the conflict ids).
+6. Approve and merge: changed clauses replace their predecessors, clauses that no longer exist are removed, and the document series is renamed to the new version. A stale base (live data changed since staging) is rejected.
 
 ### Sync the watched inbox
 
@@ -135,9 +142,9 @@ In **Knowledge DB & Audit Log**:
 - export the NIS-2 audit report as JSON or CSV;
 - open **Print / PDF Summary** to print the governance summary.
 
-The report includes active policy hashes, the hash-chain status, recent approvals, a policy-set hash, and a report hash. It is an operational compliance artifact, not a legal certification.
+The report includes active policies with recomputed content hashes, the hash-chain status, recent approvals, a policy-set hash, and a report hash over the whole report (policies, audit log, tickets). The audit log is hash-chained and anchored with an HMAC, which makes tampering detectable — it is not append-only storage and not a legal certification.
 
-The report recomputes policy content hashes and hashes a canonical payload containing policy metadata, tickets, audit entries, chain data, and the policy-set hash. External signing or anchoring is still required when the audit store itself must be treated as independently tamper-evident.
+External signing or anchoring (and individual user identities via SSO) is still required when the audit store itself must be treated as independently tamper-evident.
 
 ## Architecture
 
@@ -205,18 +212,15 @@ rm -f tsconfig.tsbuildinfo && npx tsc --noEmit
 backend/.venv/bin/python -m py_compile backend/main.py backend/rag_engine.py
 ```
 
-No browser automation or background daemon is required for these checks.
+These are the static checks. Behavioural checks (RBAC matrix, dynamic proof, inbox scenarios, hostile uploads, concurrency) were run against live servers during the QA pass; see *Verification performed* in `ARCHITECTURE_OVERVIEW.md`.
 
 ## Current limitations and roadmap
 
-This is a local MVP, not a production certification platform. The main follow-up areas are:
+This is a local MVP, not a production certification platform. See [ARCHITECTURE_OVERVIEW.md](./ARCHITECTURE_OVERVIEW.md) → *Known limitations and RAG proposals* for measured numbers. In short:
 
-- OIDC/Entra ID SSO and individual actor identity;
-- Argon2id or scrypt password hashing;
-- PostgreSQL or another append-only audit store;
-- externally anchored audit signatures;
-- rate limiting and idempotency keys for mutations;
-- external anchoring/signing and append-only storage for audit evidence;
-- production vector storage and retrieval re-ranking;
-- OCR for scanned documents;
-- multi-tenant policy collections and real Jira/ServiceNow connectors.
+- role-level identity only (shared accounts) — OIDC/Entra ID SSO and individual actors are the next step;
+- tamper-evident (hash chain + HMAC anchor), not append-only: PostgreSQL / an external anchor or signing service is needed for stronger guarantees;
+- in-memory, per-process rate limits (per-IP needs a reverse proxy with `TRUST_PROXY=1`);
+- retrieval quality: hard-coded bilingual query hints, a strict lexical gate (see the ranked proposals), contradictions between documents are not surfaced in answers, and the grounding check is heuristic (polarity, modality, number/unit), not a real entailment model;
+- no automated test suite or CI in the repository yet;
+- OCR for scanned PDFs, multi-tenant collections, real Jira/ServiceNow connectors.

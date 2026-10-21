@@ -15,9 +15,12 @@ import math
 import os
 import re
 import secrets
+import shutil
 import threading
 import time
+import unicodedata
 import uuid
+import zipfile
 import zlib
 from collections import Counter
 from contextlib import contextmanager
@@ -44,9 +47,11 @@ EMBED_MODEL = os.getenv("EMBED_MODEL", "bge-m3")
 REWRITE_TIMEOUT = float(os.getenv("REWRITE_TIMEOUT", "8"))
 LLM_TIMEOUT = float(os.getenv("LLM_TIMEOUT", "14"))
 EMBED_TIMEOUT = float(os.getenv("EMBED_TIMEOUT", "20"))
+EMBED_TOTAL_BUDGET = float(os.getenv("EMBED_TOTAL_BUDGET", "100"))  # whole embed() call; staging stays below the gateway timeout (180 s)
 CONFLICT_LLM_TIMEOUT = float(os.getenv("CONFLICT_LLM_TIMEOUT", "20"))
 MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_MB", "10")) * 1024 * 1024
 MAX_CHUNK_CHARS = 600
+DISABLE_HINTS = os.getenv("POCKET_CISO_DISABLE_HINTS") == "1"  # evaluation switch: measure how much the hard-coded query hints contribute
 LEX_MIN = float(os.getenv("LEX_MIN", "0.34"))  # min. share of question terms (incl. synonyms) a chunk must contain
 COLLECTION = "policies_live_v1"
 INBOX_DIR = Path(os.getenv("WATCHED_INBOX_DIR", Path(__file__).resolve().parent / "watched_inbox"))
@@ -88,13 +93,6 @@ def now_iso() -> str:
 
 def params_for(engine_id: str) -> dict[str, float]:
     return PARAMS["ollama" if engine_id.startswith("ollama:") else "hash"]
-
-
-def scale_score(cos: float, thr: float, at_thr: float) -> float:
-    """Map a raw cosine so that `thr` lands exactly on `at_thr` (e.g. 0.65 → 85 % confidence)."""
-    if cos >= thr:
-        return round(at_thr + (0.99 - at_thr) * min(1.0, (cos - thr) / max(1e-6, 1.0 - thr)), 2)
-    return round(max(0.0, at_thr * cos / max(thr, 1e-6)), 2)
 
 
 # ───────────────────────── Text utilities (mirror src/lib/db.ts) ─────────────────────────
@@ -243,7 +241,10 @@ class OllamaClient:
             return None
         try:
             out: list[list[float]] = []
+            budget_end = time.monotonic() + EMBED_TOTAL_BUDGET
             for i in range(0, len(texts), 16):
+                if time.monotonic() > budget_end:
+                    raise TimeoutError("embedding budget exceeded")
                 batch = texts[i : i + 16]
                 r = httpx.post(f"{OLLAMA_BASE_URL}/api/embed", json={"model": model, "input": batch}, timeout=EMBED_TIMEOUT)
                 if r.status_code == 404:  # older Ollama: single-prompt endpoint
@@ -343,31 +344,72 @@ def engine_label(engine_id: str | None = None) -> str:
 
 # ───────────────────────── Persistence (shared JSON DB + vector store) ─────────────────────────
 
+def _lock_owner(lock: Path) -> str | None:
+    try:
+        return (lock / "owner").read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _steal_stale_lock(lock: Path, stale: float) -> None:
+    """Mirror of stealStaleLock in src/lib/db.ts: an atomic rename has exactly one winner; we verify the owner we judged stale."""
+    try:
+        age = time.time() - lock.stat().st_mtime
+    except OSError:
+        return
+    if age <= stale:
+        return
+    seen = _lock_owner(lock)
+    head = seen.split(":")[0] if seen else ""
+    if head.isdigit() and _pid_alive(int(head)) and age <= stale * 10:
+        return  # slow but alive
+    parked = lock.with_name(f"{lock.name}.stale-{secrets.token_hex(4)}")
+    try:
+        os.rename(lock, parked)
+    except OSError:
+        return  # somebody else won the steal
+    if _lock_owner(parked) == seen:
+        shutil.rmtree(parked, ignore_errors=True)
+        return
+    try:  # we moved a fresh lock: put it back
+        os.rename(parked, lock)
+    except OSError:
+        shutil.rmtree(parked, ignore_errors=True)
+
+
 @contextmanager
 def file_lock(timeout: float = 10.0, stale: float = 60.0) -> Iterator[None]:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     deadline = time.monotonic() + timeout
+    token = f"{os.getpid()}:{secrets.token_hex(6)}"
     while True:
         try:
             os.mkdir(LOCK_DIR)
             break
         except FileExistsError:
-            try:
-                if time.time() - os.path.getmtime(LOCK_DIR) > stale:
-                    os.rmdir(LOCK_DIR)
-                    continue
-            except OSError:
-                pass
+            _steal_stale_lock(LOCK_DIR, stale)
             if time.monotonic() > deadline:
                 raise ApiError(503, "DB_LOCKED", "Datenbank ist gesperrt — bitte erneut versuchen.")
             time.sleep(0.02)
     try:
+        (LOCK_DIR / "owner").write_text(token, encoding="utf-8")
+    except OSError:
+        pass
+    try:
         yield
     finally:
-        try:
-            os.rmdir(LOCK_DIR)
-        except OSError:
-            pass
+        if _lock_owner(LOCK_DIR) == token:  # compare before remove: never delete a lock someone else owns now
+            shutil.rmtree(LOCK_DIR, ignore_errors=True)
 
 
 def read_db() -> dict[str, Any]:
@@ -383,7 +425,27 @@ def read_db() -> dict[str, Any]:
     return db
 
 
+_SECRET_CACHE: tuple[int, str] | None = None  # (mtime_ns of data/.auth-secret or 0 for env secrets, secret)
+
+
 def auth_secret() -> str:
+    """Cached; the demo secret file is re-read only when its mtime changes (e.g. data dir wiped while running)."""
+    global _SECRET_CACHE
+    try:
+        mtime = 0 if os.getenv("POCKET_CISO_SECRET", "").strip() else AUTH_SECRET_PATH.stat().st_mtime_ns
+    except OSError:
+        mtime = -1
+    if _SECRET_CACHE is None or _SECRET_CACHE[0] != mtime:
+        secret = _load_auth_secret()
+        try:
+            mtime = 0 if os.getenv("POCKET_CISO_SECRET", "").strip() else AUTH_SECRET_PATH.stat().st_mtime_ns
+        except OSError:
+            mtime = -1
+        _SECRET_CACHE = (mtime, secret)
+    return _SECRET_CACHE[1]
+
+
+def _load_auth_secret() -> str:
     configured = os.getenv("POCKET_CISO_SECRET", "").strip()
     if configured:
         if len(configured) < 32:
@@ -414,7 +476,9 @@ def auth_secret() -> str:
 
 def _atomic_write(path: Path, payload: str) -> None:
     tmp = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
-    tmp.write_text(payload, encoding="utf-8")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)  # audit data: owner-only
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(payload)
     os.replace(tmp, path)
 
 
@@ -443,6 +507,7 @@ class VectorStore:
         self.lock = threading.RLock()
         self.engine: str | None = None
         self.vecs: dict[str, np.ndarray] = {}
+        self.stash: dict[str, dict[str, np.ndarray]] = {}  # expensive Ollama vector set kept while the hash engine is active (Ollama flapping)
         self._mtime: float | None = None
 
     def reload(self) -> None:
@@ -457,6 +522,7 @@ class VectorStore:
             raw = json.loads(VEC_PATH.read_text(encoding="utf-8"))
             self.engine = raw.get("engine")
             self.vecs = {k: np.asarray(v, dtype=np.float32) for k, v in raw.get("vectors", {}).items()}
+            self.stash = {e: {k: np.asarray(v, dtype=np.float32) for k, v in vs.items()} for e, vs in raw.get("stash", {}).items()}
         except Exception:
             self.engine, self.vecs = None, {}
         self._mtime = mt
@@ -468,6 +534,7 @@ class VectorStore:
             "dim": int(next(iter(self.vecs.values())).shape[0]) if self.vecs else 0,
             "updatedAt": now_iso(),
             "vectors": {k: [round(float(x), 6) for x in v] for k, v in self.vecs.items()},
+            "stash": {e: {k: [round(float(x), 6) for x in v] for k, v in vs.items()} for e, vs in self.stash.items()},
         }
         _atomic_write(VEC_PATH, json.dumps(payload))
         self._mtime = VEC_PATH.stat().st_mtime
@@ -494,7 +561,10 @@ def ensure_vectors(db: dict[str, Any], force_hash: bool = False) -> tuple[str, d
             VECTORS.reload()
             changed = False
             if VECTORS.engine != eid:
-                VECTORS.engine, VECTORS.vecs, changed = eid, {}, True
+                if VECTORS.engine and VECTORS.engine.startswith("ollama:") and VECTORS.vecs:
+                    VECTORS.stash = {VECTORS.engine: VECTORS.vecs}  # keep the costly set; restored when Ollama returns
+                restored = VECTORS.stash.pop(eid, {}) if eid.startswith("ollama:") else {}
+                VECTORS.engine, VECTORS.vecs, changed = eid, restored, True
             missing = [i for i in needed if i not in VECTORS.vecs]
             if missing:
                 arr = EMBEDDER.embed([needed[i] for i in missing], "document", eid)
@@ -519,9 +589,28 @@ def append_audit(db: dict[str, Any], actor: str, role: str, action: str, target:
     n = meta["nextAudit"]
     meta["nextAudit"] = n + 1
     prev = db["audit_logs"][-1]["hash"] if db["audit_logs"] else GENESIS
-    e = {"id": f"AUD-{n:04d}", "timestamp": now_iso(), "actor": actor, "role": role, "action": action, "target": target, "status": status, "detail": detail, "prevHash": prev, "hash": ""}
-    e["hash"] = sha256("|".join([prev, e["id"], e["timestamp"], actor, role, action, target, status, detail]))
+    e = {"id": f"AUD-{n:04d}", "timestamp": now_iso(), "actor": actor, "role": role, "action": action, "target": target, "status": status, "detail": detail, "prevHash": prev, "hash": "", "v": 2}
+    # v2: JSON array (unambiguous field boundaries) — byte-identical to JSON.stringify in src/lib/db.ts
+    e["hash"] = sha256(json.dumps([prev, e["id"], e["timestamp"], actor, role, action, target, status, detail], ensure_ascii=False, separators=(",", ":")))
     db["audit_logs"].append(e)
+    meta["auditAnchor"] = hmac.new(auth_secret().encode("utf-8"), f"audit-anchor|{len(db['audit_logs'])}|{e['hash']}".encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+_DENIALS: dict[str, tuple[float, int]] = {}
+DENIAL_WINDOW_S = 60.0
+
+
+def append_denial(db: dict[str, Any], actor: str, role: str, action: str, target: str, detail: str) -> None:
+    """Sampled denial audit (mirrors appendDenial in src/lib/db.ts): ≤ 1 entry per actor/action/target-prefix per minute."""
+    key = f"{actor}|{action}|{target.split(':')[0]}"
+    now = time.time()
+    last, dropped = _DENIALS.get(key, (0.0, 0))
+    if now - last < DENIAL_WINDOW_S:
+        _DENIALS[key] = (last, dropped + 1)
+        return
+    _DENIALS[key] = (now, 0)
+    suffix = f" (+{dropped} gleichartige Ablehnungen unterdrückt)" if dropped else ""
+    append_audit(db, actor, role, action, target, "DENIED", detail + suffix)
 
 
 def verify_token(secret: str, token: str | None) -> str | None:
@@ -532,7 +621,7 @@ def verify_token(secret: str, token: str | None) -> str | None:
         return None
     role, exp, sig = parts
     expected = hmac.new(secret.encode("utf-8"), f"{role}.{exp}".encode("utf-8"), hashlib.sha256).hexdigest()
-    if not hmac.compare_digest(sig, expected):
+    if not hmac.compare_digest(sig.encode("utf-8"), expected.encode("utf-8")):
         return None
     try:
         return role if int(exp) > time.time() * 1000 else None
@@ -549,7 +638,7 @@ def actor_for(db: dict[str, Any], token: str | None) -> dict[str, str]:
 def authorize(db: dict[str, Any], token: str | None, need: str, action: str, target: str) -> dict[str, str]:
     a = actor_for(db, token)
     if ROLE_RANK[a["role"]] < ROLE_RANK[need]:
-        append_audit(db, a["email"], a["role"], "ACCESS_DENIED", f"{action}:{target}", "DENIED", f"Erfordert {need}")
+        append_denial(db, a["email"], a["role"], "ACCESS_DENIED", f"{action}:{target}", f"Erfordert {need}")
         raise ApiError(403, "FORBIDDEN", f"Diese Aktion erfordert Clearance {need}.")
     return a
 
@@ -567,11 +656,24 @@ ALLOWED_EXT = {".pdf", ".docx", ".md", ".txt"}
 
 
 def safe_doc_name(name: str) -> str:
-    base = Path(name.replace("\\", "/")).name.strip()
+    base = Path(unicodedata.normalize("NFC", name).replace("\\", "/")).name.strip()
     base = re.sub(r"[^\w.\- ]", "_", base)[:120]
     if not re.search(r"\.[A-Za-z0-9]{1,5}$", base):
         base += ".txt"
     return base or "dokument.txt"
+
+
+MAX_UNZIPPED_BYTES = 64 * 1024 * 1024
+
+
+def _check_zip_budget(data: bytes) -> None:
+    """DOCX is a ZIP: reject archives whose declared uncompressed size is absurd *before* any parser allocates memory (zip bomb)."""
+    try:
+        infos = zipfile.ZipFile(io.BytesIO(data)).infolist()
+    except zipfile.BadZipFile:
+        raise ApiError(422, "DOCX_UNREADABLE", "DOCX konnte nicht gelesen werden: BadZipFile")
+    if len(infos) > 2000 or sum(i.file_size for i in infos) > MAX_UNZIPPED_BYTES:
+        raise ApiError(413, "DOCX_TOO_LARGE", "DOCX entpackt zu groß (möglicher Zip-Bomb).")
 
 
 def parse_document(filename: str, data: bytes) -> str:
@@ -599,6 +701,7 @@ def parse_document(filename: str, data: bytes) -> str:
             raise
         except Exception as e:  # noqa: BLE001
             raise ApiError(422, "PDF_UNREADABLE", f"PDF konnte nicht gelesen werden: {type(e).__name__}")
+    _check_zip_budget(data)
     try:
         return _docx_to_text(data)
     except Exception as e:  # noqa: BLE001
@@ -659,6 +762,14 @@ def _docx_to_text(data: bytes) -> str:
 HEAD_MD = re.compile(r"^\s{0,3}(#{1,6})\s+(.+?)\s*#*\s*$")
 HEAD_PARA = re.compile(r"^\s*§\s*(\d+(?:\.\d+)*)\.?\s+(.+?)\s*$")
 HEAD_NUM = re.compile(r"^\s*(\d+(?:\.\d+)*)\.?\s+([A-ZÄÖÜ][^.!?;:]{2,80})\s*$")
+# "2 Stunden", "250.000 EUR", "36 Stunden": KPI values in tables/boxes, not numbered headings (their value would leave the chunk text).
+QUANTITY_TITLE = re.compile(r"^(stunden?|minuten?|tage[n]?|werktage[n]?|wochen?|monate[n]?|jahre[n]?|sekunden?|prozent|zeichen|versuche[n]?|mal|eur|euro|mb|gb|tb)\b", re.I)
+
+
+def is_quantity_heading(number: str, title: str) -> bool:
+    return bool(re.fullmatch(r"\d{1,3}(\.\d{3})+", number)) or bool(QUANTITY_TITLE.match(title.strip()))
+
+
 NUM_TITLE = re.compile(r"^§?\s*(\d+(?:\.\d+)*)\.?\s*[:–-]?\s*(.*)$")
 BULLET = re.compile(r"^\s*(?:[-*•]|\d+[.)])\s+")
 
@@ -802,6 +913,8 @@ def chunk_document(text: str) -> tuple[str | None, list[dict[str, str]]]:
             start(pm.group(2), pm.group(1))
             continue
         nm = HEAD_NUM.match(line)
+        if nm and is_quantity_heading(nm.group(1), nm.group(2)):
+            nm = None
         if nm:
             start(nm.group(2), nm.group(1))
             continue
@@ -936,6 +1049,14 @@ def _record_connector_ingest(db: dict[str, Any], c: dict[str, str], doc_name: st
                  f"{c['file']} → {diff['id']} (SHA-256 {c['sha256'][:12]}…, {len(diff['hunks'])} Chunk(s), {len(diff['conflicts'])} Konflikt(e)) · Trigger: {c['trigger']}")
 
 
+def stage_author_label(actor: dict[str, str], claimed: str | None, trusted: bool) -> str:
+    """The author shown to the CISO comes from the verified session; a client-supplied name is only shown as a claim."""
+    base = f"{actor['email']} ({actor['role']})"
+    if not claimed:
+        return base[:120]
+    return (claimed if trusted else f"{base} · angegeben: {claimed}")[:120]
+
+
 def stage_document(
     token: str | None,
     *,
@@ -947,6 +1068,7 @@ def stage_document(
     replaces: str | None = None,
     as_actor: dict[str, str] | None = None,
     connector: dict[str, str] | None = None,
+    partial: bool = False,
 ) -> dict[str, Any]:
     """`as_actor` (watched-inbox connector) skips token authorization; `connector` {file, sha256, trigger} makes the
     final write also remember the file hash and append AUTO_CONNECTOR_SYNC — all in one atomic DB update."""
@@ -987,7 +1109,8 @@ def stage_document(
     if new_vecs is None:
         eid, vecs = ensure_vectors(db, force_hash=True)
         new_vecs = EMBEDDER.embed([c["content"] for c in chunks], "document", eid)
-    assert new_vecs is not None
+    if new_vecs is None:
+        raise ApiError(503, "EMBED_FAILED", "Embeddings konnten nicht berechnet werden.")
     lat["embedding"] = int((time.perf_counter() - t) * 1000)
     prm = params_for(eid)
 
@@ -1033,7 +1156,8 @@ def stage_document(
     lat["diff"] = int((time.perf_counter() - t) * 1000)
     if not hunks:
         raise ApiError(409, "NO_CHANGES", "Keine Änderungen gegenüber der Live-Version erkannt.")
-    removed_chunk_ids = [c["id"] for j, c in enumerate(series) if j not in used_old]
+    # pasted rule text (partial) updates single clauses; only complete documents may remove the clauses they no longer contain
+    removed_chunk_ids = [] if partial else [c["id"] for j, c in enumerate(series) if j not in used_old]
 
     # Cross-document conflict scanner: vector pre-selection (cosine) → LLM verdict (temp 0.0, JSON) → rule fallback.
     t = time.perf_counter()
@@ -1057,7 +1181,7 @@ def stage_document(
                     verdict, by = _rule_conflict(a["text"], b["text"]), "rules"
                 if not verdict["has_conflict"]:
                     continue
-                shown = scale_score(sim, prm["conflict_sim"], 0.72)
+                shown = round(sim, 2)  # raw cosine similarity (no rescaling)
                 prev = conflicts.get(cand["id"])
                 if prev and prev["similarity"] >= shown:
                     continue
@@ -1080,7 +1204,7 @@ def stage_document(
         "title": (title or doc_title or doc_name)[:120],
         "docName": doc_name,
         "replacesDoc": replaces_doc,
-        "author": (author or f"{actor['email']} ({actor['role']})")[:80],
+        "author": stage_author_label(actor, author, as_actor is not None),
         "uploadedAt": now_iso(),
         "summary": f"{len(hunks)} geänderte/neue Chunk(s), {unchanged} unverändert, {len(conflict_list)} Konflikt(e) · Engine: {label}",
         "sha256": sha256("\n".join(h["newContent"] for h in hunks)),
@@ -1090,6 +1214,14 @@ def stage_document(
     }
     with file_lock():
         db = read_db()
+        duplicate = next((d for d in db["staged_diffs"] if d["status"] == "pending" and d["docName"] == doc_name and d["sha256"] == diff["sha256"]), None)
+        if duplicate:  # idempotent re-submit (e.g. after a gateway timeout)
+            return {"ok": True, "diff": duplicate, "duplicate": True, "stats": {
+                "chunks": len(chunks), "changed": len(duplicate["hunks"]), "unchanged": unchanged, "conflicts": len(duplicate["conflicts"]),
+                "engineMode": label, "latencyMs": lat}}
+        live_now = {c["id"]: c["content"] for c in db["live_chunks"]}
+        if any(h["oldChunkId"] and live_now.get(h["oldChunkId"]) != h["oldContent"] for h in hunks):
+            raise ApiError(409, "STALE_BASE", "Die Live-Version hat sich während der Analyse geändert. Bitte erneut einreichen.")
         db["staged_diffs"].append(diff)
         append_audit(db, actor["email"], actor["role"], "POLICY_STAGED", doc_name, "SUCCESS",
                      f"{len(hunks)} Chunk(s), {len(conflict_list)} Konflikt(e), SHA-256 {diff['sha256'][:12]}…, Engine {label}")
@@ -1111,13 +1243,17 @@ def stage_document(
 def stage_text(token: str | None, *, title: str, target_doc: str, new_text: str, min_role: str = "L1", author: str | None = None) -> dict[str, Any]:
     """Pasted-text variant (same semantics as the Node fallback): existing target ⇒ next version replaces it, else new document."""
     target = target_doc.strip()
+    if not 3 <= len(title.strip()) <= 120:  # same limits as stagePolicy in src/lib/db.ts
+        raise ApiError(400, "BAD_TITLE", "Titel: 3–120 Zeichen.")
     if not re.fullmatch(r"[\w.\- ]{3,120}", target):
         raise ApiError(400, "BAD_TARGET", "Zieldokument: 3–120 Zeichen (Buchstaben, Ziffern, . _ -).")
+    if not 10 <= len(new_text.strip()) <= 2000:
+        raise ApiError(400, "BAD_TEXT", "Regeltext: 10–2000 Zeichen.")
     existing = next((c for c in read_db()["live_chunks"] if c["docName"].lower() == target.lower()), None)
     if existing:
-        return stage_document(token, doc_name=bump_version(existing["docName"]), text=new_text, title=title, min_role=min_role, author=author, replaces=existing["docName"])
+        return stage_document(token, doc_name=bump_version(existing["docName"]), text=new_text, title=title, min_role=min_role, author=author, replaces=existing["docName"], partial=True)
     name = target if re.search(r"\.[A-Za-z0-9]{1,5}$", target) else f"{target}.md"
-    return stage_document(token, doc_name=name, text=new_text, title=title, min_role=min_role, author=author)
+    return stage_document(token, doc_name=name, text=new_text, title=title, min_role=min_role, author=author, partial=True)
 
 
 # ───────────────────────── Zero-touch connector: watched_inbox → staging queue ─────────────────────────
@@ -1222,7 +1358,7 @@ def start_inbox_watcher() -> threading.Event | None:
     return stop
 
 
-def approve_diff(token: str | None, diff_id: str, override: bool = False) -> dict[str, Any]:
+def approve_diff(token: str | None, diff_id: str, override: bool = False, override_reason: str = "") -> dict[str, Any]:
     with locked_db() as db:
         actor = authorize(db, token, "L3", "approve", diff_id)
         idx = next((i for i, d in enumerate(db["staged_diffs"]) if d["id"] == diff_id and d["status"] == "pending"), -1)
@@ -1251,8 +1387,12 @@ def approve_diff(token: str | None, diff_id: str, override: bool = False) -> dic
             if ticket is None or ticket["status"] != "resolved":
                 open_conflicts.append(conflict)
         if open_conflicts and not override:
-            append_audit(db, actor["email"], actor["role"], "MERGE_BLOCKED", diff["docName"], "DENIED", f"{len(open_conflicts)} ungelöste(r) Konflikt(e)")
-            raise ApiError(409, "CONFLICT_UNRESOLVED", "Ungelöste Konflikte: Sync-Ticket erstellen oder Override bestätigen.")
+            ids = ", ".join(c["id"] for c in open_conflicts)
+            append_audit(db, actor["email"], actor["role"], "MERGE_BLOCKED", diff["docName"], "DENIED", f"{len(open_conflicts)} ungelöste(r) Konflikt(e): {ids}")
+            raise ApiError(409, "CONFLICT_UNRESOLVED", "Ungelöste Konflikte: Sync-Ticket erstellen und erledigen oder Override mit Begründung bestätigen.")
+        override_note = (override_reason or "").strip()[:500]
+        if open_conflicts and len(override_note) < 10:
+            raise ApiError(400, "OVERRIDE_REASON_REQUIRED", "Für einen Override ist eine Begründung (mind. 10 Zeichen) erforderlich.")
 
         superseded, moved = 0, 0
         ts = now_iso()
@@ -1289,7 +1429,7 @@ def approve_diff(token: str | None, diff_id: str, override: bool = False) -> dic
         db["staged_diffs"].pop(idx)
         db["meta"]["liveVersion"] += 1
         if open_conflicts:
-            resolution = f"Override ({len(open_conflicts)} Konflikt akzeptiert)"
+            resolution = f"Override ({len(open_conflicts)} Konflikt akzeptiert: {', '.join(c['id'] for c in open_conflicts)}; Begründung: {override_note})"
         elif diff["conflicts"]:
             resolution = "Konflikte per Sync-Ticket adressiert (" + ", ".join(str(c["ticketId"]) for c in diff["conflicts"]) + ")"
         else:
@@ -1334,6 +1474,8 @@ def question_groups(text: str) -> list[list[str]]:
 
 def query_hint(question: str) -> str:
     """Add only high-confidence bilingual policy terms for known multilingual intents."""
+    if DISABLE_HINTS:
+        return ""
     tokens = set(tokenize(question))
     if {"penalty", "usb", "train"} <= tokens:
         return "IAM Endgeräte Wechselmedien: USB-Datenträger Verlust im Zug Sanktionskatalog Abmahnung Kündigung Schadensersatz"
@@ -1374,7 +1516,7 @@ def plausible_rewrite(question: str, line: str) -> bool:
 
 
 def rewrite_query(question: str) -> tuple[str, str]:
-    known = REWRITES.get(" ".join(tokenize(question)))
+    known = None if DISABLE_HINTS else REWRITES.get(" ".join(tokenize(question)))
     hint = query_hint(question)
     out = OLLAMA.chat(REWRITE_SYSTEM, f"Frage: {question} → Suchanfrage:", timeout=REWRITE_TIMEOUT, max_tokens=80)
     if out:
@@ -1424,14 +1566,43 @@ def parse_llm_answer(text: str, ctx: list[dict[str, Any]]) -> list[dict[str, str
         segs.append({"type": "text", "text": (" " if segs else "") + tail})
     if not any(s["type"] == "text" for s in segs):
         return None
-    if not any(s["type"] == "cite" for s in segs):  # model forgot citations → attach the best source
-        segs.append({"type": "text", "text": " "})
-        segs.append({"type": "cite", "chunkId": ctx[0]["id"]})
+    if not any(s["type"] == "cite" for s in segs):  # never show a source the model did not cite → caller falls back to the extractive answer
+        return None
     return segs
 
 
+NEGATION_RE = re.compile(r"\b(nicht|kein\w*|niemals|nie|ohne|untersagt|verboten|unzulässig|ausgeschlossen|not|never|prohibited|forbidden)\b", re.I)
+OBLIGATION_RE = re.compile(r"\b(muss|müssen|zwingend|verpflichtend|verpflichtet|erforderlich|must|shall|mandatory)\b", re.I)
+PERMISSION_RE = re.compile(r"\b(darf|dürfen|kann|können|erlaubt|zulässig|gestattet|may|allowed|permitted)\b", re.I)
+
+
+def claim_mismatches(answer: str, sources: list[str]) -> list[str]:
+    """Cheap semantic guards the bag-of-words check cannot give: negation polarity, obligation↔permission swaps and
+    number↔unit pairing (30 attempts/3 minutes vs 3 attempts/30 minutes). Still heuristic — not a real entailment model."""
+    src_sents = [x for t in sources for x in split_sentences(t)]
+    src_q: dict[str, set[str]] = {}
+    for t in sources:
+        for unit, vals in quantities(t).items():
+            src_q.setdefault(unit, set()).update(vals)
+    problems: list[str] = []
+    for sent in split_sentences(answer):
+        stems = set(content_stems(sent))
+        best = max(src_sents, key=lambda x: len(stems & set(content_stems(x))), default="")
+        if len(stems) < 2 or len(stems & set(content_stems(best))) / len(stems) < 0.3:
+            continue
+        if bool(NEGATION_RE.search(sent)) != bool(NEGATION_RE.search(best)):
+            problems.append("Negation")
+        elif (PERMISSION_RE.search(sent) and OBLIGATION_RE.search(best) and not PERMISSION_RE.search(best)) or (
+            OBLIGATION_RE.search(sent) and PERMISSION_RE.search(best) and not OBLIGATION_RE.search(best)
+        ):
+            problems.append("Modalität")
+    problems += [f"Wert/Einheit {u}" for u, vals in quantities(answer).items() if vals - src_q.get(u, set())]
+    return problems
+
+
 def nli_check(segments: list[dict[str, str]], chunks: dict[str, dict[str, Any]]) -> dict[str, Any]:
-    """Lexical NLI grounding: every number must occur in the cited chunks and ≥ 60 % of content words must be supported."""
+    """Lexical grounding (named NLI in the UI): numbers must occur in the cited chunks, ≥ 60 % of content words must be supported,
+    and claim_mismatches() must find no polarity / modality / number-unit contradiction."""
     answer = re.sub(r"§\s*\d+(?:\.\d+)*", "", " ".join(s["text"] for s in segments if s["type"] == "text"))  # section refs are citations, not claims
     cited_chunks = [chunks[s["chunkId"]] for s in segments if s["type"] == "cite" and s["chunkId"] in chunks]
     cited = [c["content"] for c in cited_chunks]
@@ -1440,7 +1611,9 @@ def nli_check(segments: list[dict[str, str]], chunks: dict[str, dict[str, Any]])
     a_stems, c_stems = content_stems(answer), set(content_stems(ctx))
     coverage = (sum(1 for s in a_stems if s in c_stems) / len(a_stems)) if a_stems else 1.0
     thin = len(a_stems) < 2  # "Nein." / "Ja." are unverifiable claims
-    return {"verified": bool(cited) and not thin and not unsupported and coverage >= 0.6, "unsupportedNumbers": unsupported, "coverage": round(coverage, 2)}
+    mismatches = claim_mismatches(answer, cited) if cited else []
+    return {"verified": bool(cited) and not thin and not unsupported and not mismatches and coverage >= 0.6,
+            "unsupportedNumbers": unsupported, "mismatches": mismatches, "coverage": round(coverage, 2)}
 
 
 def run_query(token: str | None, question: str) -> dict[str, Any]:
@@ -1509,12 +1682,12 @@ def run_query(token: str | None, question: str) -> dict[str, Any]:
 
     if not ok_acc and ok_res:
         with locked_db() as dbw:
-            append_audit(dbw, actor["email"], role, "RBAC_DENIED", ok_res[0][0]["docName"], "DENIED", f"Retrieval erfordert {ok_res[0][0]['minRole']}")
+            append_denial(dbw, actor["email"], role, "RBAC_DENIED", ok_res[0][0]["docName"], f"Retrieval erfordert {ok_res[0][0]['minRole']}")
         trace["topScore"] = 0.0
-        return done("denied", [{"type": "text", "text": NO_ANSWER}], {}, {}, None)
+        return done("fallback", [{"type": "text", "text": NO_ANSWER}], {}, {}, None)  # indistinguishable from "no match" (no existence oracle)
 
     if not ok_acc:
-        trace["confidence"] = min(0.84, scale_score(best, thr, 0.85))  # a fallback never displays ≥ 85 %
+        trace.update({"confidence": round(best, 2), "retrievalScore": round(best, 3), "verification": "none"})
         return done("fallback", [{"type": "text", "text": NO_ANSWER}], {}, {})
 
     # Step 4 — grounded generation (temp 0.0) + NLI verification
@@ -1543,7 +1716,10 @@ def run_query(token: str | None, question: str) -> dict[str, Any]:
     cited_ids = list(dict.fromkeys(s["chunkId"] for s in segments if s["type"] == "cite"))
     scores = {c["id"]: round(s, 3) for c, s in top if c["id"] in cited_ids}
     citations = {i: by_id[i] for i in cited_ids if i in by_id}
-    trace.update({"nliVerified": bool(nli["verified"]), "confidence": scale_score(best, thr, 0.85), "answerBy": answer_by})
+    trace.update({
+        "nliVerified": bool(nli["verified"]), "confidence": round(best, 2), "retrievalScore": round(best, 3),
+        "lexicalSupport": round(ok_acc[0][2], 2), "verification": "lexical-nli", "answerBy": answer_by,
+    })
     return done("answer", segments, citations, scores)
 
 

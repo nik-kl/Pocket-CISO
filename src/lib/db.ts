@@ -39,6 +39,7 @@ interface Meta {
   nextAudit: number;
   seededAt: string;
   ingestedFiles: Record<string, string>; // watched_inbox filename → SHA-256 of the last ingested content
+  auditAnchor?: string; // HMAC(secret, count|headHash): makes truncating the audit tail detectable without the secret
 }
 
 export interface Db {
@@ -62,8 +63,9 @@ interface Actor {
 
 const COLLECTION = "policies_live_v1";
 const GENESIS = "0".repeat(64);
+const AUDIT_SNAPSHOT_LIMIT = 200; // full log is available via export_report; the chain is always verified over all entries
 const TOKEN_TTL_MS = 8 * 3600 * 1000;
-const DB_PATH = path.join(process.cwd(), "data", "pocket-ciso-db.json");
+const DB_PATH = path.join(process.env.POCKET_CISO_DATA_DIR ?? path.join(process.cwd(), "data"), "pocket-ciso-db.json");
 const DATA_DIR = path.dirname(DB_PATH);
 const AUTH_SECRET_PATH = path.join(DATA_DIR, ".auth-secret");
 const IS_PRODUCTION = process.env.NODE_ENV === "production" || process.env.POCKET_CISO_ENV === "production";
@@ -190,12 +192,18 @@ function emptyDb(): Db {
 
 /* ───────────────────────── Persistence ───────────────────────── */
 
-const g = globalThis as unknown as { __pcQueue?: Promise<unknown>; __pcFails?: Record<string, number[]> };
+const g = globalThis as unknown as {
+  __pcQueue?: Promise<unknown>;
+  __pcFails?: Record<string, number[]>;
+  __pcDenials?: Record<string, { at: number; n: number }>;
+  __pcCred?: Partial<Record<"L2" | "L3", { salt: Buffer; hash: Buffer }>>;
+};
 
 // Older DB files: ticket status was "OPEN"/"CLOSED", meta.ingestedFiles did not exist.
 function migrate(db: Db): Db {
   delete (db.meta as Meta & { secret?: string }).secret;
   db.meta.ingestedFiles ??= {};
+  if (!db.meta.auditAnchor && verifyChain(db.audit_logs).valid) db.meta.auditAnchor = anchorOf(db.audit_logs.length, db.audit_logs.at(-1)?.hash ?? GENESIS); // legacy DB: trust on first use
   for (const t of db.tickets) {
     const legacy = t.status as string;
     if (legacy === "OPEN") t.status = "open";
@@ -204,13 +212,31 @@ function migrate(db: Db): Db {
   return db;
 }
 
-function configuredPasswordHash(role: "L2" | "L3"): string {
+const MIN_PASSWORD_LENGTH = 14;
+const ENV_MANAGED = "env-managed"; // the DB never stores a password hash; credentials come from the environment
+
+function configuredPassword(role: "L2" | "L3"): string {
   const envName = role === "L2" ? "POCKET_CISO_L2_PASSWORD" : "POCKET_CISO_L3_PASSWORD";
   const configured = process.env[envName]?.trim();
-  if (configured) return sha256(configured);
+  if (configured) {
+    if (!DEMO_MODE && configured.length < MIN_PASSWORD_LENGTH) throw new Error(`${envName} muss mindestens ${MIN_PASSWORD_LENGTH} Zeichen lang sein.`);
+    return configured;
+  }
   if (!DEMO_MODE) throw new Error(`${envName} muss im Nicht-Demo-Modus gesetzt sein.`);
-  return sha256(role === "L2" ? "admin2026" : "ciso2026");
+  return role === "L2" ? "admin2026" : "ciso2026";
 }
+
+// Per-process random salt; the plaintext only lives in the environment, never in data/.
+function credential(role: "L2" | "L3") {
+  const cache = (g.__pcCred ??= {});
+  if (!cache[role]) {
+    const salt = crypto.randomBytes(16);
+    cache[role] = { salt, hash: crypto.scryptSync(configuredPassword(role), salt, 64) };
+  }
+  return cache[role]!;
+}
+
+const configuredPasswordHash = (role: "L2" | "L3"): string => (configuredPassword(role), ENV_MANAGED);
 
 async function ensureAuthSecret(): Promise<string> {
   if (authSecretCache) return authSecretCache;
@@ -248,9 +274,8 @@ function authSecret(): string {
 
 function applyCredentialPolicy(db: Db): void {
   for (const role of ["L2", "L3"] as const) {
-    const configured = process.env[role === "L2" ? "POCKET_CISO_L2_PASSWORD" : "POCKET_CISO_L3_PASSWORD"]?.trim();
-    if (configured) db.users.find((u) => u.role === role)!.passwordHash = sha256(configured);
-    else if (!DEMO_MODE) throw new Error(`Passwort für ${role} muss im Nicht-Demo-Modus konfiguriert sein.`);
+    configuredPassword(role); // throws on missing / too short non-demo passwords
+    db.users.find((u) => u.role === role)!.passwordHash = ENV_MANAGED;
   }
 }
 
@@ -274,31 +299,62 @@ async function load(): Promise<Db> {
 }
 
 async function persist(db: Db): Promise<void> {
-  await fs.mkdir(path.dirname(DB_PATH), { recursive: true });
+  await fs.mkdir(path.dirname(DB_PATH), { recursive: true, mode: 0o700 });
   const tmp = `${DB_PATH}.${process.pid}.tmp`;
-  await fs.writeFile(tmp, JSON.stringify(db, null, 2), "utf8");
+  await fs.writeFile(tmp, JSON.stringify(db, null, 2), { encoding: "utf8", mode: 0o600 }); // audit data: owner-only
   await fs.rename(tmp, DB_PATH);
 }
 
 // Cross-process mutex (atomic mkdir) shared with the Python backend (backend/rag_engine.py → file_lock).
+// The lock directory holds an `owner` file ("pid:token"): release only removes a lock we own, and a stale lock is stolen by an
+// atomic rename (one winner) after verifying that the renamed directory still carries the owner we judged stale.
+const LOCK_STALE_MS = 60_000;
+
+const pidAlive = (pid: number) => {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (e) {
+    return (e as NodeJS.ErrnoException).code === "EPERM";
+  }
+};
+
+async function ownerOf(lock: string): Promise<string | null> {
+  return fs.readFile(path.join(lock, "owner"), "utf8").then((x) => x.trim(), () => null);
+}
+
+async function stealStaleLock(lock: string): Promise<void> {
+  const st = await fs.stat(lock).catch(() => null);
+  if (!st || Date.now() - st.mtimeMs <= LOCK_STALE_MS) return;
+  const seen = await ownerOf(lock);
+  const pid = Number(seen?.split(":")[0]);
+  if (seen && Number.isInteger(pid) && pidAlive(pid) && Date.now() - st.mtimeMs <= 10 * LOCK_STALE_MS) return; // slow but alive
+  const parked = `${lock}.stale-${crypto.randomBytes(4).toString("hex")}`;
+  try {
+    await fs.rename(lock, parked);
+  } catch {
+    return; // somebody else won the steal
+  }
+  if ((await ownerOf(parked)) === seen) await fs.rm(parked, { recursive: true, force: true });
+  else await fs.rename(parked, lock).catch(() => fs.rm(parked, { recursive: true, force: true })); // we moved a fresh lock: put it back
+}
+
 async function acquireLock(): Promise<() => Promise<void>> {
   const dir = path.dirname(DB_PATH);
   const lock = path.join(dir, ".db.lock");
   await fs.mkdir(dir, { recursive: true });
   const deadline = Date.now() + 10_000;
+  const token = `${process.pid}:${crypto.randomBytes(6).toString("hex")}`;
   for (;;) {
     try {
       await fs.mkdir(lock);
+      await fs.writeFile(path.join(lock, "owner"), token).catch(() => undefined);
       return async () => {
-        await fs.rmdir(lock).catch(() => undefined);
+        if ((await ownerOf(lock)) === token) await fs.rm(lock, { recursive: true, force: true });
       };
     } catch (e) {
       if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
-      const st = await fs.stat(lock).catch(() => null);
-      if (st && Date.now() - st.mtimeMs > 60_000) {
-        await fs.rmdir(lock).catch(() => undefined);
-        continue;
-      }
+      await stealStaleLock(lock);
       if (Date.now() > deadline) throw new Error("Datenbank ist gesperrt.");
       await new Promise((r) => setTimeout(r, 20));
     }
@@ -330,8 +386,13 @@ export const ensureDb = (): Promise<void> => transact(() => undefined);
 
 /* ───────────────────────── Audit trail (hash chain) ───────────────────────── */
 
-const hashEntry = (e: AuditLog) =>
-  sha256([e.prevHash, e.id, e.timestamp, e.actor, e.role, e.action, e.target, e.status, e.detail].join("|"));
+// v2 hashes a JSON array (field boundaries are unambiguous even if a note contains "|"); entries without `v` keep the legacy "|" join.
+const hashEntry = (e: AuditLog) => {
+  const fields = [e.prevHash, e.id, e.timestamp, e.actor, e.role, e.action, e.target, e.status, e.detail];
+  return sha256(e.v === 2 ? JSON.stringify(fields) : fields.join("|"));
+};
+
+const anchorOf = (count: number, head: string) => crypto.createHmac("sha256", authSecret()).update(`audit-anchor|${count}|${head}`).digest("hex");
 
 function appendAudit(
   db: Db,
@@ -342,10 +403,11 @@ function appendAudit(
     id: `AUD-${String(db.meta.nextAudit++).padStart(4, "0")}`,
     timestamp: timestamp ?? nowIso(),
     actor: e.actor, role: e.role, action: e.action, target: e.target, status: e.status, detail: e.detail ?? "",
-    prevHash: db.audit_logs.at(-1)?.hash ?? GENESIS, hash: "",
+    prevHash: db.audit_logs.at(-1)?.hash ?? GENESIS, hash: "", v: 2,
   };
   entry.hash = hashEntry(entry);
   db.audit_logs.push(entry);
+  db.meta.auditAnchor = anchorOf(db.audit_logs.length, entry.hash);
   return entry;
 }
 
@@ -355,7 +417,16 @@ function verifyChain(logs: AuditLog[]) {
     if (l.prevHash !== prev || l.hash !== hashEntry(l)) return { valid: false, entries: logs.length, brokenAt: l.id };
     prev = l.hash;
   }
-  return { valid: true, entries: logs.length, brokenAt: null };
+  return { valid: true, entries: logs.length, brokenAt: null as string | null };
+}
+
+// Chain links + head anchor (a deleted tail or a rewritten chain without the secret fails the anchor).
+function verifyAudit(db: Db) {
+  const chain = verifyChain(db.audit_logs);
+  if (!chain.valid) return chain;
+  const head = db.audit_logs.at(-1)?.hash ?? GENESIS;
+  if (db.meta.auditAnchor !== anchorOf(db.audit_logs.length, head)) return { valid: false, entries: chain.entries, brokenAt: "ANCHOR" as string | null };
+  return chain;
 }
 
 /* ───────────────────────── Auth (HMAC session tokens) ───────────────────────── */
@@ -369,10 +440,13 @@ function signToken(secret: string, role: Role): string {
 
 function verifyToken(secret: string, token: string | null): Role | null {
   if (!token) return null;
-  const [role, exp, sig] = token.split(".");
+  const parts = token.split(".");
+  if (parts.length !== 3) return null;
+  const [role, exp, sig] = parts;
   if ((role !== "L2" && role !== "L3") || !exp || !sig) return null;
-  const expected = mac(secret, `${role}.${exp}`);
-  if (sig.length !== expected.length || !crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected))) return null;
+  const given = Buffer.from(sig, "utf8");
+  const expected = Buffer.from(mac(secret, `${role}.${exp}`), "utf8");
+  if (given.length !== expected.length || !crypto.timingSafeEqual(given, expected)) return null;
   return Number(exp) > Date.now() ? role : null;
 }
 
@@ -381,33 +455,65 @@ function actorFor(db: Db, token: string | null): Actor {
   return { email: db.users.find((u) => u.role === role)!.email, role };
 }
 
+// Denials are sampled: at most one audit entry per (actor, action, target-prefix) per minute; the next entry reports how many were dropped.
+// This keeps anonymous callers from growing / rewriting the audit file at will while every distinct denial class stays visible.
+const DENIAL_WINDOW_MS = 60_000;
+function appendDenial(db: Db, e: { actor: string; role: AuditLog["role"]; action: string; target: string; detail: string }): void {
+  const state = (g.__pcDenials ??= {});
+  const key = `${e.actor}|${e.action}|${e.target.split(":")[0]}`;
+  const now = Date.now();
+  const prev = state[key];
+  if (prev && now - prev.at < DENIAL_WINDOW_MS) {
+    prev.n += 1;
+    return;
+  }
+  state[key] = { at: now, n: 0 };
+  const dropped = prev?.n ? ` (+${prev.n} gleichartige Ablehnungen unterdrückt)` : "";
+  appendAudit(db, { ...e, status: "DENIED", detail: `${e.detail}${dropped}` });
+}
+
 // Returns the actor, or a Fail (and an audit entry) when the role is insufficient.
 function authorize(db: Db, token: string | null, need: Role, action: string, target: string): Actor | Fail {
   const a = actorFor(db, token);
   if (ROLE_RANK[a.role] >= ROLE_RANK[need]) return a;
-  appendAudit(db, { actor: a.email, role: a.role, action: "ACCESS_DENIED", target: `${action}:${target}`, status: "DENIED", detail: `Erfordert ${need}` });
+  appendDenial(db, { actor: a.email, role: a.role, action: "ACCESS_DENIED", target: `${action}:${target}`, detail: `Erfordert ${need}` });
   return fail(403, "FORBIDDEN", `Diese Aktion erfordert Clearance ${need}.`);
 }
 
-export function authenticate(token: string | null, role: string, password: string): Promise<R<{ token: string; session: { role: Role; email: string; clearance: string } }>> {
+const LOGIN_WINDOW_MS = 15 * 60_000;
+
+// Per-(client, role) limit with exponential backoff, plus a higher per-account ceiling so an attacker cannot trivially lock out L3.
+function loginRetryAfterMs(client: string, role: string): number {
+  const now = Date.now();
+  const fails = (g.__pcFails ??= {});
+  const check = (key: string, limit: number) => {
+    const recent = (fails[key] ??= []).filter((t) => now - t < LOGIN_WINDOW_MS);
+    fails[key] = recent;
+    if (recent.length < limit) return 0;
+    const backoff = Math.min(LOGIN_WINDOW_MS, 30_000 * 2 ** (recent.length - limit));
+    return Math.max(0, recent[recent.length - 1] + backoff - now);
+  };
+  return Math.max(check(`ip:${client}|${role}`, client === "direct" ? 30 : 5), check(`acct:${role}`, 30)); // "direct" = no trusted proxy: one shared bucket, so only the account ceiling applies
+}
+
+export function authenticate(token: string | null, role: string, password: string, client = "local"): Promise<R<{ token: string; session: { role: Role; email: string; clearance: string } }>> {
   return transact((db) => {
     const requester = actorFor(db, token);
     const user = db.users.find((u) => u.role === role && u.requiresPassword);
-    if (!user || !user.passwordHash) return fail(400, "BAD_ROLE", "Für diese Rolle ist keine Anmeldung möglich.");
+    if (!user || (user.role !== "L2" && user.role !== "L3")) return fail(400, "BAD_ROLE", "Für diese Rolle ist keine Anmeldung möglich.");
 
-    const fails = (g.__pcFails ??= {});
-    const recent = (fails[user.role] ??= []).filter((t) => Date.now() - t < 60_000);
-    fails[user.role] = recent;
-    if (recent.length >= 5) return fail(429, "RATE_LIMITED", "Zu viele Fehlversuche. Bitte eine Minute warten.");
+    const wait = loginRetryAfterMs(client, user.role);
+    if (wait > 0) return fail(429, "RATE_LIMITED", `Zu viele Fehlversuche. Bitte ${Math.ceil(wait / 1000)} s warten.`);
 
-    const given = Buffer.from(sha256(typeof password === "string" ? password : ""));
-    const valid = crypto.timingSafeEqual(given, Buffer.from(user.passwordHash));
-    if (!valid) {
-      recent.push(Date.now());
+    const cred = credential(user.role);
+    const given = crypto.scryptSync(typeof password === "string" ? password.slice(0, 256) : "", cred.salt, 64);
+    if (!crypto.timingSafeEqual(given, cred.hash)) {
+      const fails = g.__pcFails!;
+      for (const key of [`ip:${client}|${user.role}`, `acct:${user.role}`]) (fails[key] ??= []).push(Date.now());
       appendAudit(db, { actor: requester.email, role: requester.role, action: "AUTH_ELEVATION_FAILED", target: `→ ${user.role} (${user.email})`, status: "FAILED", detail: "Ungültiges Passwort" });
       return fail(401, "INVALID_CREDENTIALS", "Falsches Passwort.");
     }
-    fails[user.role] = [];
+    g.__pcFails![`ip:${client}|${user.role}`] = [];
     appendAudit(db, { actor: user.email, role: user.role, action: "AUTH_ELEVATION_SUCCESS", target: `→ ${user.role} (${user.clearance})`, status: "SUCCESS", detail: `Sitzung ${TOKEN_TTL_MS / 3600000} h gültig` });
     return { ok: true as const, token: signToken(authSecret(), user.role), session: { role: user.role, email: user.email, clearance: user.clearance } };
   });
@@ -448,9 +554,10 @@ export function getSnapshot(token: string | null): Promise<Omit<Snapshot, "backe
       totalChunks: db.live_chunks.length,
       chunks: db.live_chunks.filter((c) => ROLE_RANK[c.minRole] <= ROLE_RANK[a.role]),
       diffs: visibleDiffs,
-      audit: priv ? db.audit_logs : null,
+      audit: priv ? db.audit_logs.slice(-AUDIT_SNAPSHOT_LIMIT) : null,
+      auditTotal: priv ? db.audit_logs.length : null,
       tickets: priv ? db.tickets : null,
-      integrity: priv ? verifyChain(db.audit_logs) : null,
+      integrity: priv ? verifyAudit(db) : null,
     };
   });
 }
@@ -546,6 +653,7 @@ function queryGroups(q: string): string[][] {
 }
 
 function queryHint(q: string): string {
+  if (process.env.POCKET_CISO_DISABLE_HINTS === "1") return ""; // evaluation switch (see backend/rag_engine.py)
   const tokens = new Set(tokenize(q));
   if (["penalty", "usb", "train"].every((token) => tokens.has(token))) {
     return "IAM Endgeräte Wechselmedien USB Datenträger Verlust Zug Sanktionskatalog Abmahnung Kündigung Schadensersatz";
@@ -571,13 +679,6 @@ function coverage(groups: string[][], c: LiveChunk): number {
   return groups.filter((grp) => grp.some((t) => toks.some((x) => tokMatch(t, x)))).length / groups.length;
 }
 
-const confidenceOf = (cov: number, seed: string, threshold = 0.6) => {
-  if (cov < threshold) return Math.round((0.3 + 0.8 * cov) * 100) / 100;
-  const jitter = (parseInt(sha256(seed).slice(0, 2), 16) % 5) / 100;
-  const normalized = Math.min(1, (cov - threshold) / Math.max(0.01, 1 - threshold));
-  return Math.round((0.85 + 0.14 * normalized - jitter) * 100) / 100;
-};
-
 const NO_ANSWER = "Keine eindeutige Richtlinie gefunden — Halluzinationsschutz aktiv (Konfidenz < 85%).";
 const LOCAL_ENGINE = "Local Fallback Engine (keyword)";
 const ms = (t0: number) => Math.round((performance.now() - t0) * 10) / 10;
@@ -593,7 +694,7 @@ export function runQuery(token: string | null, question: string): Promise<R<{ re
     const hint = queryHint(q);
     const groups = queryGroups(`${q} ${hint}`);
     const rewrite =
-      REWRITES[tokenize(q).join(" ")] ??
+      (process.env.POCKET_CISO_DISABLE_HINTS === "1" ? undefined : REWRITES[tokenize(q).join(" ")]) ??
       `Welche freigegebene Richtlinie regelt: „${q}“?${groups.length ? ` [Suchbegriffe: ${groups.map((x) => x[0]).join(", ")}]` : ""}`;
     const tRewrite = ms(tStart);
 
@@ -628,16 +729,16 @@ export function runQuery(token: string | null, question: string): Promise<R<{ re
         scores[s.c.id] = Math.round(s.cov * 100) / 100;
       });
       const tGen = ms(t4);
-      return { ok: true as const, result: { kind: "answer" as const, requiredRole: null, segments, citations, scores, trace: { ...base, nliVerified: true, confidence: confidenceOf(best.cov, q + best.c.id, coverageThreshold), answerBy: "rules", latencyMs: lat(tGen, 0) } } };
+      return { ok: true as const, result: { kind: "answer" as const, requiredRole: null, segments, citations, scores, trace: { ...base, nliVerified: false, verification: "extractive" as const, confidence: Math.round(best.cov * 100) / 100, retrievalScore: Math.round(best.cov * 100) / 100, lexicalSupport: Math.round(best.cov * 100) / 100, answerBy: "rules (extractive)", latencyMs: lat(tGen, 0) } } };
     }
 
     if (restricted[0] && restricted[0].cov >= coverageThreshold) {
       const need = restricted[0].c.minRole;
-      appendAudit(db, { actor: a.email, role: a.role, action: "RBAC_DENIED", target: restricted[0].c.docName, status: "DENIED", detail: `Retrieval erfordert ${need}` });
+      appendDenial(db, { actor: a.email, role: a.role, action: "RBAC_DENIED", target: restricted[0].c.docName, detail: `Retrieval erfordert ${need}` });
       return {
         ok: true as const,
         result: {
-          kind: "denied" as const, requiredRole: null,
+          kind: "fallback" as const, requiredRole: null, // indistinguishable from "no match" (no existence oracle)
           segments: [{ type: "text" as const, text: NO_ANSWER }],
           citations: {}, scores: {}, trace: { ...base, topScore: 0, nliVerified: false, confidence: 0, latencyMs: lat(0, 0) },
         },
@@ -649,7 +750,7 @@ export function runQuery(token: string | null, question: string): Promise<R<{ re
       result: {
         kind: "fallback" as const, requiredRole: null,
         segments: [{ type: "text" as const, text: NO_ANSWER }],
-        citations: {}, scores: {}, trace: { ...base, nliVerified: false, confidence: Math.min(0.84, confidenceOf(best?.cov ?? 0, q)), latencyMs: lat(0, 0) },
+        citations: {}, scores: {}, trace: { ...base, nliVerified: false, verification: "none" as const, confidence: Math.round((best?.cov ?? 0) * 100) / 100, retrievalScore: Math.round((best?.cov ?? 0) * 100) / 100, latencyMs: lat(0, 0) },
       },
     };
   });
@@ -696,11 +797,17 @@ export function resolveTicket(token: string | null, ticketId: string, resolution
   });
 }
 
+const MAX_OPEN_L1_TICKETS = 100; // L1 has no login by design, so open tickets from it are capped instead
+
 export function createTicket(token: string | null, question: string, reason: string): Promise<R<{ ticket: Ticket }>> {
   return transact((db) => {
     const q = typeof question === "string" ? question.trim().slice(0, 500) : "";
     if (q.length < 3) return fail(400, "BAD_QUESTION", "Frage fehlt.");
     const a = actorFor(db, token);
+    const duplicate = db.tickets.find((t) => t.type === "KNOWLEDGE_GAP" && t.status === "open" && t.createdBy === a.email && t.description.endsWith(`„${q}“`));
+    if (duplicate) return { ok: true as const, ticket: duplicate };
+    if (a.role === "L1" && db.tickets.filter((t) => t.status === "open" && t.createdBy === a.email).length >= MAX_OPEN_L1_TICKETS)
+      return fail(429, "TICKET_LIMIT", "Zu viele offene Anfragen. Bitte das CISO-Office kontaktieren.");
     const ticket = newTicket(db, {
       type: "KNOWLEDGE_GAP", title: `Richtlinien-Anfrage: ${q.slice(0, 80)}`, targetDoc: null, ref: null, createdBy: a.email,
       description: `Keine eindeutige Richtlinie gefunden (${reason === "RBAC" ? "RBAC-Sperre" : "Konfidenz < 85%"}). Ursprüngliche Frage: „${q}“`,
@@ -741,28 +848,58 @@ function bumpVersion(name: string): string {
 }
 
 const contentTokens = (s: string) => new Set(tokenize(s).filter((t) => t.length >= 3 && !STOP.has(t) && !/^\d+$/.test(t)).map((t) => (t.length >= 7 ? t.slice(0, 7) : t)));
-const numbersOf = (s: string) => new Set(s.match(/\d+/g) ?? []);
+const numbersOf = (s: string) => new Set((s.match(/\d+(?:[.,]\d+)?/g) ?? []).map((n) => n.replace(",", ".")));
 
-// Simulated semantic contradiction check: same topic (token overlap) but different numeric values. Only chunks the actor may see.
+// Mirrors UNIT_RE / quantities() / _rule_conflict() in backend/rag_engine.py: same unit + different value on the same topic.
+const UNIT_RE = /(\d+(?:[.,]\d+)?)\s*(stunden|stunde|std|tagen|tage|tag|wochen|woche|monaten|monate|monat|jahren|jahre|jahr|minuten|minute|zeichen|sekunden|prozent|%|versuche|versuchen|mal)\b/gi;
+const UNIT_LABEL: Record<string, string> = { stun: "Stunden", tage: "Tage", woch: "Wochen", mona: "Monate", jahr: "Jahre", minu: "Minuten", zeic: "Zeichen", seku: "Sekunden", proz: "%", vers: "Versuche", mal: "Mal" };
+
+function quantities(text: string): Map<string, Set<string>> {
+  const out = new Map<string, Set<string>>();
+  for (const m of text.matchAll(UNIT_RE)) {
+    const u = norm(m[2]);
+    const key = u.startsWith("std") ? "stun" : u === "%" || u === "prozent" ? "proz" : u.slice(0, 4);
+    out.set(key, (out.get(key) ?? new Set()).add(m[1].replace(",", ".")));
+  }
+  return out;
+}
+
+const minus = (x: Set<string>, y: Set<string>) => [...x].filter((v) => !y.has(v));
+
+function ruleConflict(mine: string, theirs: string, overlap: number): { severity: "high" | "medium"; explanation: string } | null {
+  const qa = quantities(mine);
+  const qb = quantities(theirs);
+  const diffs = [...qa.keys()].filter((u) => qb.has(u)).map((u) => [u, minus(qa.get(u)!, qb.get(u)!), minus(qb.get(u)!, qa.get(u)!)] as const).filter(([, x, y]) => x.length && y.length);
+  if (overlap >= 0.25 && diffs.length) {
+    const text = diffs.map(([u, x, y]) => `neu ${x.sort().join(", ")} ${UNIT_LABEL[u] ?? u} ↔ bestehend ${y.sort().join(", ")} ${UNIT_LABEL[u] ?? u}`).join("; ");
+    return { severity: overlap >= 0.5 ? "high" : "medium", explanation: `Abweichende Werte: ${text}.` };
+  }
+  if (overlap >= 0.34 && !qa.size && !qb.size) { // no units on either side: generic number mismatch
+    const na = numbersOf(mine);
+    const nb = numbersOf(theirs);
+    const x = minus(na, nb);
+    const y = minus(nb, na);
+    if (x.length && y.length) return { severity: "medium", explanation: `Abweichende Werte: neu ${x.sort().join(", ")} ↔ bestehend ${y.sort().join(", ")}.` };
+  }
+  return null;
+}
+
+// Rule-based contradiction check against live chunks the actor may see (no vectors in this engine; "similarity" is the raw topical token overlap).
 function detectConflicts(db: Db, text: string, ignoreChunkIds: string[], ignoreDocs: Set<string>, ignoreFamily: string, maxRank: number): Conflict[] {
   const mine = contentTokens(text);
-  const myNums = numbersOf(text);
   const out: Conflict[] = [];
-  if (!myNums.size) return out;
+  if (!numbersOf(text).size) return out;
   for (const c of db.live_chunks) {
     if (ROLE_RANK[c.minRole] > maxRank || ignoreChunkIds.includes(c.id) || ignoreDocs.has(c.docName) || docFamily(c.docName) === ignoreFamily) continue;
     const theirs = contentTokens(c.content);
     const overlap = [...mine].filter((t) => theirs.has(t)).length / Math.max(1, Math.min(mine.size, theirs.size));
-    const theirNums = numbersOf(c.content);
-    const differs = theirNums.size > 0 && ([...myNums].some((n) => !theirNums.has(n)) && [...theirNums].some((n) => !myNums.has(n)));
-    if (overlap >= 0.34 && differs) {
-      const vals = [...theirNums].filter((n) => !myNums.has(n)).join(", ");
-      out.push({
-        id: uid("cf"), chunkId: c.id, docName: c.docName, section: c.section, quote: c.content,
-        message: `Semantischer Konflikt erkannt: Dieses Update widerspricht ${c.docName} (${c.section.split(" ")[0]}), wo weiterhin abweichende Werte (${vals}) gefordert werden.`,
-        similarity: Math.min(0.99, Math.round((0.55 + 0.4 * overlap) * 100) / 100), severity: overlap >= 0.6 ? "high" : "medium", status: "open", ticketId: null, verifiedBy: "rules",
-      });
-    }
+    const verdict = ruleConflict(text, c.content, overlap);
+    if (!verdict) continue;
+    out.push({
+      id: uid("cf"), chunkId: c.id, docName: c.docName, section: c.section, quote: c.content,
+      message: `Semantischer Konflikt erkannt: Dieses Update widerspricht ${c.docName} (${c.section.split(" ")[0]}). ${verdict.explanation}`,
+      similarity: Math.min(0.99, Math.round(overlap * 100) / 100), severity: verdict.severity, status: "open", ticketId: null, verifiedBy: "rules",
+    });
   }
   return out;
 }
@@ -793,6 +930,9 @@ const MAX_CHUNK = 600;
 const HEAD_MD = /^\s{0,3}(#{1,6})\s+(.+?)\s*#*\s*$/;
 const HEAD_PARA = /^\s*§\s*(\d+(?:\.\d+)*)\.?\s+(.+?)\s*$/;
 const HEAD_NUM = /^\s*(\d+(?:\.\d+)*)\.?\s+([A-ZÄÖÜ][^.!?;:]{2,80})\s*$/;
+// "2 Stunden", "250.000 EUR", "36 Stunden": KPI values in tables/boxes, not numbered headings (mirrors is_quantity_heading in rag_engine.py).
+const QUANTITY_TITLE = /^(stunden?|minuten?|tage[n]?|werktage[n]?|wochen?|monate[n]?|jahre[n]?|sekunden?|prozent|zeichen|versuche[n]?|mal|eur|euro|mb|gb|tb)\b/i;
+const isQuantityHeading = (number: string, title: string) => /^\d{1,3}(\.\d{3})+$/.test(number) || QUANTITY_TITLE.test(title.trim());
 const NUM_TITLE = /^§?\s*(\d+(?:\.\d+)*)\.?\s*[:–-]?\s*(.*)$/;
 const BULLET = /^\s*(?:[-*•]|\d+[.)])\s+/;
 
@@ -936,7 +1076,7 @@ export function chunkDocument(raw: string): { title: string | null; chunks: DocC
       continue;
     }
     const nm = HEAD_NUM.exec(line);
-    if (nm) {
+    if (nm && !isQuantityHeading(nm[1], nm[2])) {
       start(nm[2], nm[1]);
       continue;
     }
@@ -954,13 +1094,26 @@ export function chunkDocument(raw: string): { title: string | null; chunks: DocC
 
 /* ── Pipeline A core: chunk → align to series → diff → conflicts ── */
 
+// Unicode-aware (umlauts!) like Python's \w; names are NFC-normalised first because macOS hands out NFD file names.
+const DOC_NAME_RE = /^[\p{L}\p{N}_.\- ]{3,120}$/u;
+export const safeDocName = (name: string) => name.normalize("NFC").replace(/[^\p{L}\p{N}_.\- ]/gu, "_").slice(0, 120);
+
 interface StageInput {
   docName: string;
   title: string;
   text: string;
   minRole: Role;
   author?: string;
+  trustedAuthor?: boolean; // only the server-side connector may set the displayed author
+  partial?: boolean; // pasted rule text updates single clauses: nothing is removed from the replaced document
   replaces?: string | null;
+}
+
+// The displayed author comes from the verified session; a client-supplied name is only shown as a claim.
+function authorLabel(a: Actor, p: StageInput): string {
+  const base = `${a.email} (${a.role})`;
+  if (!p.author) return base.slice(0, 120);
+  return (p.trustedAuthor ? p.author : `${base} · angegeben: ${p.author}`).slice(0, 120);
 }
 
 // Core of Pipeline A inside an open transaction (shared by manual staging and the watched-inbox connector).
@@ -968,7 +1121,7 @@ function stageInTx(db: Db, a: Actor, p: StageInput): R<{ diff: StagedDiff; stats
   const t0 = performance.now();
   if (!(p.minRole in ROLE_RANK)) return fail(400, "BAD_ROLE", "Ungültige Min-Role.");
   if (ROLE_RANK[p.minRole] > ROLE_RANK[a.role]) return fail(403, "FORBIDDEN", `Min-Role ${p.minRole} übersteigt Ihre Clearance (${a.role}).`);
-  if (!/^[\w.\- ]{3,120}$/.test(p.docName)) return fail(400, "BAD_TARGET", "Dokumentname: 3–120 Zeichen (Buchstaben, Ziffern, . _ -).");
+  if (!DOC_NAME_RE.test(p.docName)) return fail(400, "BAD_TARGET", "Dokumentname: 3–120 Zeichen (Buchstaben, Ziffern, . _ -).");
   if (p.text.length > 200_000) return fail(413, "TOO_LARGE", "Text zu groß.");
 
   const { title: docTitle, chunks } = chunkDocument(p.text);
@@ -1011,7 +1164,7 @@ function stageInTx(db: Db, a: Actor, p: StageInput): R<{ diff: StagedDiff; stats
     });
   });
   if (!hunks.length) return fail(409, "NO_CHANGES", "Keine Änderungen gegenüber der Live-Version erkannt.");
-  const removedChunkIds = series.filter((_, j) => !usedOld.has(j)).map((c) => c.id);
+  const removedChunkIds = p.partial ? [] : series.filter((_, j) => !usedOld.has(j)).map((c) => c.id);
 
   const merged = new Map<string, Conflict>();
   for (const h of hunks)
@@ -1022,11 +1175,14 @@ function stageInTx(db: Db, a: Actor, p: StageInput): R<{ diff: StagedDiff; stats
   const replacesDoc = match.size ? [...match.values()].map((j) => series[j].docName).sort((x, y) => [...match.values()].filter((v) => series[v].docName === y).length - [...match.values()].filter((v) => series[v].docName === x).length)[0] : null;
   const diff: StagedDiff = {
     id: uid("diff"), title: (p.title || docTitle || p.docName).slice(0, 120), docName: p.docName, replacesDoc,
-    author: (p.author || `${a.email} (${a.role})`).slice(0, 80), uploadedAt: nowIso(),
+    author: authorLabel(a, p), uploadedAt: nowIso(),
     summary: `${hunks.length} geänderte/neue Chunk(s), ${unchanged} unverändert, ${conflicts.length} Konflikt(e) · Engine: ${LOCAL_ENGINE}`,
     sha256: sha256(hunks.map((h) => h.newContent).join("\n")), targetCollection: COLLECTION, status: "pending",
     decidedAt: null, decidedBy: null,     decisionNote: null, hunks, removedChunkIds, conflicts,
   };
+  const duplicate = db.staged_diffs.find((d) => d.status === "pending" && d.docName === p.docName && d.sha256 === diff.sha256);
+  if (duplicate) // idempotent re-submit (e.g. after a gateway timeout)
+    return { ok: true as const, diff: duplicate, stats: { chunks: picked.length, changed: duplicate.hunks.length, unchanged, conflicts: duplicate.conflicts.length, engineMode: LOCAL_ENGINE, latencyMs: { total: Math.round(performance.now() - t0) } } };
   db.staged_diffs.push(diff);
   appendAudit(db, { actor: a.email, role: a.role, action: "POLICY_STAGED", target: p.docName, status: "SUCCESS", detail: `${hunks.length} Chunk(s), ${conflicts.length} Konflikt(e), SHA-256 ${diff.sha256.slice(0, 12)}…, Engine ${LOCAL_ENGINE}` });
   return {
@@ -1048,12 +1204,12 @@ export async function stagePolicy(token: string | null, p: { title: string; targ
   const title = String(p.title ?? "").trim();
   const text = String(p.newText ?? "").trim();
   if (title.length < 3 || title.length > 120) return fail(400, "BAD_TITLE", "Titel: 3–120 Zeichen.");
-  if (!/^[\w.\- ]{3,120}$/.test(target)) return fail(400, "BAD_TARGET", "Zieldokument: 3–120 Zeichen (Buchstaben, Ziffern, . _ -).");
+  if (!DOC_NAME_RE.test(target)) return fail(400, "BAD_TARGET", "Zieldokument: 3–120 Zeichen (Buchstaben, Ziffern, . _ -).");
   if (text.length < 10 || text.length > 2000) return fail(400, "BAD_TEXT", "Regeltext: 10–2000 Zeichen.");
   const existing = await transact((db) => db.live_chunks.find((c) => c.docName.toLowerCase() === target.toLowerCase())?.docName ?? null);
   return stageDocument(token, {
     docName: existing ? bumpVersion(existing) : /\.[A-Za-z0-9]{1,5}$/.test(target) ? target : `${target}.md`,
-    title, text, minRole: p.minRole as Role, replaces: existing,
+    title, text, minRole: p.minRole as Role, replaces: existing, partial: true,
   });
 }
 
@@ -1078,11 +1234,11 @@ async function listInbox(): Promise<string[]> {
 
 // One transaction per file: dedupe by hash / pending diff → stage → remember hash → audit.
 function ingestInTx(db: Db, file: string, digest: string, text: string, trigger: string): IngestOutcome {
-  const docName = file.replace(/[^\w.\- ]/g, "_").slice(0, 120);
+  const docName = safeDocName(file);
   if (db.meta.ingestedFiles[file] === digest) return { kind: "skipped", file, reason: "unverändert seit dem letzten Sync" };
   if (db.staged_diffs.some((d) => d.status === "pending" && d.docName === docName)) return { kind: "skipped", file, reason: "bereits in der Staging-Queue" };
 
-  const out = stageInTx(db, CONNECTOR, { docName, title: "", text, minRole: "L2", author: CONNECTOR_AUTHOR });
+  const out = stageInTx(db, CONNECTOR, { docName, title: "", text, minRole: "L2", author: CONNECTOR_AUTHOR, trustedAuthor: true });
   if (isFail(out) && out.code === "NO_CHANGES") {
     db.meta.ingestedFiles[file] = digest;
     return { kind: "skipped", file, reason: "identisch mit der Live-Version" };
@@ -1132,7 +1288,7 @@ export function exportReport(token: string | null): Promise<R<{ report: AuditRep
     const a = authorize(db, token, "L2", "export_report", COLLECTION);
     if (isFail(a)) return a;
     appendAudit(db, { actor: a.email, role: a.role, action: "AUDIT_EXPORT", target: "NIS-2 Audit Report", status: "SUCCESS", detail: `${db.audit_logs.length} Einträge, ${db.live_chunks.length} aktive Policy-Chunks` });
-    const chain = verifyChain(db.audit_logs);
+    const chain = verifyAudit(db);
     const activePolicies = [...db.live_chunks]
       .sort((x, y) => x.docName.localeCompare(y.docName) || x.section.localeCompare(y.section))
       .map((c) => ({
@@ -1153,14 +1309,14 @@ export function exportReport(token: string | null): Promise<R<{ report: AuditRep
       ok: true as const,
       report: {
         schema, generatedAt, generatedBy: { email: a.email, role: a.role }, collection: COLLECTION, liveVersion: db.meta.liveVersion,
-        chain: { valid: chain.valid, entries: chain.entries, headHash, algorithm: "sha256(prevHash|id|timestamp|actor|role|action|target|status|detail)" },
+        chain: { valid: chain.valid, entries: chain.entries, headHash, algorithm: "v2: sha256(JSON[prevHash,id,timestamp,actor,role,action,target,status,detail]) (Einträge ohne v: Legacy-\"|\"-Format) + HMAC-Anker über Anzahl|Head-Hash" },
         policySetHash, activePolicies, auditLogs: db.audit_logs, tickets: db.tickets, reportHash,
       },
     };
   });
 }
 
-export function approveDiff(token: string | null, diffId: string, override: boolean): Promise<R<{ merged: number; superseded: number; docName: string }>> {
+export function approveDiff(token: string | null, diffId: string, override: boolean, overrideReason = ""): Promise<R<{ merged: number; superseded: number; docName: string }>> {
   return transact((db) => {
     const a = authorize(db, token, "L3", "approve", diffId);
     if (isFail(a)) return a;
@@ -1184,9 +1340,11 @@ export function approveDiff(token: string | null, diffId: string, override: bool
       return !ticket || ticket.status !== "resolved";
     });
     if (open.length && override !== true) {
-      appendAudit(db, { actor: a.email, role: a.role, action: "MERGE_BLOCKED", target: diff.docName, status: "DENIED", detail: `${open.length} ungelöste(r) Konflikt(e)` });
-      return fail(409, "CONFLICT_UNRESOLVED", "Ungelöste Konflikte: Sync-Ticket erstellen oder Override bestätigen.");
+      appendAudit(db, { actor: a.email, role: a.role, action: "MERGE_BLOCKED", target: diff.docName, status: "DENIED", detail: `${open.length} ungelöste(r) Konflikt(e): ${open.map((c) => c.id).join(", ")}` });
+      return fail(409, "CONFLICT_UNRESOLVED", "Ungelöste Konflikte: Sync-Ticket erstellen und erledigen oder Override mit Begründung bestätigen.");
     }
+    const overrideNote = String(overrideReason ?? "").trim().slice(0, 500);
+    if (open.length && overrideNote.length < 10) return fail(400, "OVERRIDE_REASON_REQUIRED", "Für einen Override ist eine Begründung (mind. 10 Zeichen) erforderlich.");
 
     let superseded = 0;
     const ts = nowIso();
@@ -1214,7 +1372,7 @@ export function approveDiff(token: string | null, diffId: string, override: bool
     }
     db.staged_diffs.splice(idx, 1);
     db.meta.liveVersion += 1;
-    const resolution = open.length ? `Override (${open.length} Konflikt akzeptiert)` : diff.conflicts.length ? `Konflikte per Sync-Ticket adressiert (${diff.conflicts.map((c) => c.ticketId).join(", ")})` : "keine Konflikte";
+    const resolution = open.length ? `Override (${open.length} Konflikt akzeptiert: ${open.map((c) => c.id).join(", ")}; Begründung: ${overrideNote})` : diff.conflicts.length ? `Konflikte per Sync-Ticket adressiert (${diff.conflicts.map((c) => c.ticketId).join(", ")})` : "keine Konflikte";
     appendAudit(db, { actor: a.email, role: a.role, action: "APPROVED_AND_MERGED", target: diff.docName, status: "SUCCESS", detail: `${diff.hunks.length} Chunk(s) live, ${superseded} ersetzt; ${resolution}` });
     return { ok: true as const, merged: diff.hunks.length, superseded, docName: diff.docName };
   });

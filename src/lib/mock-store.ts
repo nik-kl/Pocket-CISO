@@ -95,6 +95,7 @@ export interface AuditLog {
   detail: string;
   prevHash: string;
   hash: string;
+  v?: 2; // hash format: absent = legacy "|"-joined, 2 = JSON array (unambiguous)
 }
 
 export interface Ticket {
@@ -127,6 +128,7 @@ export interface Snapshot {
   chunks: LiveChunk[];
   diffs: StagedDiff[] | null;
   audit: AuditLog[] | null;
+  auditTotal?: number | null;
   tickets: Ticket[] | null;
   integrity: { valid: boolean; entries: number; brokenAt: string | null } | null;
   backend: BackendStatus;
@@ -157,8 +159,11 @@ export interface QueryResult {
     total: number;
     nliVerified: boolean;
     temperature: number;
-    confidence: number;
+    confidence: number; // = retrievalScore (kept for compatibility; not a probability)
     topScore?: number;
+    retrievalScore?: number; // raw cosine of the best chunk (Python) or query-term coverage (local engine)
+    lexicalSupport?: number; // share of question terms found in the best chunk
+    verification?: "lexical-nli" | "extractive" | "none"; // what actually checked the answer
     latencyMs?: LatencyMs;
     engineMode?: string;
     rewriteBy?: string;

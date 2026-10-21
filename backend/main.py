@@ -80,6 +80,7 @@ class StageTextBody(BaseModel):
 
 class ApproveBody(BaseModel):
     override: bool = False
+    overrideReason: str = Field(default="", max_length=500)
 
 
 MAX_REQUEST_BYTES = rag.MAX_UPLOAD_BYTES + 256 * 1024
@@ -100,8 +101,10 @@ def query(body: QueryBody, authorization: str | None = Header(default=None)) -> 
 async def stage_file(request: Request, authorization: str | None = Header(default=None)) -> dict:
     """Pipeline A — multipart (file + author + minRole [+ replaces, title]) OR JSON text."""
     token = bearer(authorization)
-    content_length = int(request.headers.get("content-length", "0") or 0)
-    if content_length > MAX_REQUEST_BYTES:
+    raw_length = request.headers.get("content-length", "")
+    if not raw_length.isdigit():
+        return err(411, "LENGTH_REQUIRED", "Content-Length ist erforderlich.")
+    if int(raw_length) > MAX_REQUEST_BYTES:
         return err(413, "TOO_LARGE", "Upload-Anfrage größer als 10 MB.")
     rag.check_role(token, "L2")
     if request.headers.get("content-type", "").startswith("multipart/form-data"):
@@ -123,7 +126,10 @@ async def stage_file(request: Request, authorization: str | None = Header(defaul
             return err(400, "NO_INPUT", "Datei oder Text erforderlich.")
         return await run_in_threadpool(lambda: rag.stage_document(token, doc_name=name, text=text, title=title, min_role=min_role, author=author, replaces=replaces))
 
-    body = StageTextBody.model_validate(await request.json())
+    try:
+        body = StageTextBody.model_validate(await request.json())
+    except ValueError:  # malformed JSON and pydantic.ValidationError are both ValueErrors
+        return err(422, "BAD_REQUEST", "Ungültiger JSON-Body.")
     if body.newText.strip():
         return await run_in_threadpool(lambda: rag.stage_text(token, title=body.title or body.targetDoc, target_doc=body.targetDoc, new_text=body.newText, min_role=body.minRole, author=body.author))
     if body.text.strip() and body.docName.strip():
@@ -139,7 +145,7 @@ def sync_inbox(authorization: str | None = Header(default=None)) -> dict:
 
 @app.post("/approve/{diff_id}")
 def approve(diff_id: str, body: ApproveBody | None = None, authorization: str | None = Header(default=None)) -> dict:
-    return rag.approve_diff(bearer(authorization), diff_id, bool(body and body.override))
+    return rag.approve_diff(bearer(authorization), diff_id, bool(body and body.override), body.overrideReason if body else "")
 
 
 if __name__ == "__main__":
