@@ -267,9 +267,9 @@ export async function POST(req: NextRequest) {
       case "export_report": return reply(await db.exportReport(token));
 
       case "query": {
-        // Python without Ollama only has hash-embedding retrieval, which measured worse than the local keyword engine → answer locally then.
+        // Python composes every answer (with or without Ollama); the local engine only returns search hits when Python is down.
         const st = await backendStatus();
-        const viaPy = st.mode === "python" && st.ollama ? await viaPython("/query", jsonInit(token, { question: s("question") }), QUERY_TIMEOUT_MS, true) : null;
+        const viaPy = st.mode === "python" ? await viaPython("/query", jsonInit(token, { question: s("question") }), QUERY_TIMEOUT_MS, true) : null;
         return viaPy ?? reply(await db.runQuery(token, s("question")));
       }
 

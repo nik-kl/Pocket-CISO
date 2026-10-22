@@ -623,7 +623,8 @@ function coverage(groups: string[][], c: LiveChunk): number {
   return groups.filter((grp) => grp.some((t) => toks.some((x) => tokMatch(t, x)))).length / groups.length;
 }
 
-const NO_ANSWER = "Keine eindeutige Richtlinie gefunden — Halluzinationsschutz aktiv (Konfidenz < 85%).";
+const NO_ANSWER = "Keine belegbare Antwort im freigegebenen Bestand."; // same text as backend/rag_engine.py
+const SEARCH_LABEL = "Fundstellen, keine KI-Antwort";
 const LOCAL_ENGINE = "Local Fallback Engine (keyword)";
 const ms = (t0: number) => Math.round((performance.now() - t0) * 10) / 10;
 
@@ -658,19 +659,20 @@ export function runQuery(token: string | null, question: string): Promise<R<{ re
     const lat = (generation: number, nli: number) => ({ rewrite: tRewrite, rbac: tRbac, retrieval: tRetrieval, generation, nli, total: ms(tStart) });
 
     if (best && best.cov >= coverageThreshold) {
-      // 4 — extractive, grounded-by-construction answer
+      // 4 — search hits only: this engine never composes an answer (the Python engine does, with a verifier)
       const t4 = performance.now();
-      const top = accessible.filter((s) => s.cov >= coverageThreshold && s.cov >= best.cov - 0.15).slice(0, 4);
-      const segments: AnswerSegment[] = [];
+      const top = accessible.filter((s) => s.cov >= coverageThreshold && s.cov >= best.cov - 0.15).slice(0, 3);
+      const segments: AnswerSegment[] = [{ type: "text", text: `${SEARCH_LABEL}:` }];
       const citations: Record<string, LiveChunk> = {};
       const scores: Record<string, number> = {};
-      top.forEach((s, i) => {
-        segments.push({ type: "text", text: `${i > 0 ? " " : ""}${s.c.content} ` }, { type: "cite", chunkId: s.c.id });
+      top.forEach((s) => {
+        segments.push({ type: "text", text: ` ${s.c.docName} ${s.c.section.split(" ")[0]}: ${s.c.content} ` }, { type: "cite", chunkId: s.c.id });
         citations[s.c.id] = s.c;
         scores[s.c.id] = Math.round(s.cov * 100) / 100;
       });
+      const hits = top.map((s) => ({ chunkId: s.c.id, docName: s.c.docName, section: s.c.section, content: s.c.content }));
       const tGen = ms(t4);
-      return { ok: true as const, result: { kind: "answer" as const, requiredRole: null, segments, citations, scores, trace: { ...base, nliVerified: false, verification: "extractive" as const, confidence: Math.round(best.cov * 100) / 100, retrievalScore: Math.round(best.cov * 100) / 100, lexicalSupport: Math.round(best.cov * 100) / 100, answerBy: "rules (extractive)", latencyMs: lat(tGen, 0) } } };
+      return { ok: true as const, result: { kind: "search" as const, requiredRole: null, segments, citations, scores, hits, trace: { ...base, nliVerified: false, verification: "none" as const, confidence: Math.round(best.cov * 100) / 100, retrievalScore: Math.round(best.cov * 100) / 100, lexicalSupport: Math.round(best.cov * 100) / 100, answerBy: "search", latencyMs: lat(tGen, 0) } } };
     }
 
     if (restricted[0] && restricted[0].cov >= coverageThreshold) {
