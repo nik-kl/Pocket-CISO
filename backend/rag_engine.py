@@ -692,10 +692,11 @@ def _join_cell(a: str, b: str) -> str:
 LAYOUT_TOL = 8  # max. distance (characters) between a cell and its column start; centred cells drift a few characters
 
 
-def _layout_rows(block: list[str], starts: list[int]) -> list[str] | None:
+def _layout_rows(block: list[str], starts: list[int], one_value: bool = False) -> list[str] | None:
     """Cells → columns. None when any assignment is uncertain (cell far from every column start, reaching into the next
     column, or two cells of one line in the same column): the block is then treated as running text, never as a table
-    with values in the wrong column."""
+    with values in the wrong column. one_value: rows split without blank lines — a second line carrying a number into a
+    cell that already has one is a merged row, not a wrapped cell (uncertain → None)."""
     cols = [""] * len(starts)
     for line in block:
         used: set[int] = set()
@@ -703,9 +704,57 @@ def _layout_rows(block: list[str], starts: list[int]) -> list[str] | None:
             k = min(range(len(starts)), key=lambda j: (abs(starts[j] - pos), j))
             if abs(starts[k] - pos) > LAYOUT_TOL or k in used or (k + 1 < len(starts) and pos + len(text) > starts[k + 1] + 1):
                 return None
+            if one_value and re.search(r"\d", cols[k]) and re.search(r"\d", text):
+                return None
             used.add(k)
             cols[k] = _join_cell(cols[k], text)
     return [c.replace("|", "\\|").strip() for c in cols]
+
+
+CONT_END = re.compile(r"(?:[-/&,+(]|\b(?:or|and|und|oder|with|mit|of|der|des|für|for))$")
+
+
+def _continues(prev: dict[int, str], cells: list[tuple[int, str]], starts: list[int]) -> bool:
+    """Visible evidence that a line continues the cells above it: a cell above ends open ('ChaCha20-', 'Storage /', 'und',
+    an unclosed bracket) or a cell starts lower case / with a closing bracket."""
+    for pos, text in cells:
+        k = min(range(len(starts)), key=lambda j: (abs(starts[j] - pos), j))
+        above = prev.get(k, "")
+        if text[:1].islower() or text[:1] == ")" or (above and (CONT_END.search(above) or above.count("(") > above.count(")"))):
+            return True
+    return False
+
+
+def _row_groups(block: list[str], starts: list[int], header: bool) -> list[list[str]] | None:
+    """Lines of a table without blank lines between rows → one line group per row, via the first column. A line without a
+    first-column cell continues the current row (wrapped cells); a line with one starts a new row when it fills every
+    column and shows no continuation evidence (_continues), continues the row when it shows such evidence, and is
+    uncertain otherwise (partial line, capitalised: new row with an empty cell or a wrapped first cell?) → None, i.e.
+    running text. Rows must also agree on numeric columns: a row without a number in a column where every other row has
+    one is a wrapped line split off by mistake → None."""
+    groups: list[list[str]] = []
+    prev: dict[int, str] = {}
+    for line in block:
+        cells = _layout_cells(line)
+        if not cells:
+            continue
+        first = abs(cells[0][0] - starts[0]) <= LAYOUT_TOL
+        if groups and (not first or _continues(prev, cells, starts)):
+            groups[-1].append(line)
+        elif not groups or len(cells) == len(starts):
+            groups.append([line])
+            prev = {}
+        else:
+            return None
+        for pos, text in cells:
+            prev[min(range(len(starts)), key=lambda j: (abs(starts[j] - pos), j))] = text
+    body = [_layout_rows(g, starts) for g in groups[1 if header else 0:]]
+    if len(body) >= 2 and all(r is not None for r in body):
+        for k in range(len(starts)):
+            numeric = [bool(re.search(r"\d", r[k])) for r in body if r is not None and r[k]]
+            if len(numeric) >= 3 and sum(numeric) == len(numeric) - 1:
+                return None
+    return groups
 
 
 def _pdf_page_text(page: Any) -> str:
@@ -736,15 +785,26 @@ def _pdf_page_text(page: Any) -> str:
     while i < len(blocks):
         head = blocks[i]
         widest = max(head, key=lambda ln: len(_layout_cells(ln)))
-        if len(head) <= 3 and len(_layout_cells(widest)) >= 3:
+        if len(_layout_cells(widest)) >= 3:
             rows = []
             j = i + 1
             while j < len(blocks) and len(_layout_cells(blocks[j][0])) >= 2:
                 rows.append(blocks[j])
                 j += 1
             starts = [p for p, _ in _layout_cells(widest)]
-            header = _layout_rows(head, starts) if rows else None
-            body = [_layout_rows(r, starts) for r in rows]
+            header, body = None, []
+            if rows and len(head) <= 3:
+                header = _layout_rows(head, starts)
+                # rows separated by blank lines: one block = one row (wrapped cells may fill every column); a single
+                # block after the header holds all rows without blank lines and is split by the first column
+                groups = _row_groups(rows[0], starts, False) if len(rows) == 1 else rows
+                tight = len(rows) == 1
+                body = [_layout_rows(g, starts, tight) for g in groups] if groups else []
+            elif not rows and len(head) >= 3:  # whole table in one block: header row + ≥ 2 rows split by the first column
+                groups = _row_groups(head, starts, True)
+                if groups and len(groups) >= 3:
+                    header = _layout_rows(groups[0], starts)
+                    body = [_layout_rows(g, starts, True) for g in groups[1:]]
             if header is not None and body and all(x is not None for x in body):
                 out += ["", "| " + " | ".join(header) + " |", "|" + "---|" * len(starts)]
                 out += ["| " + " | ".join(x) + " |" for x in body if x is not None] + [""]

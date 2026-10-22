@@ -29,6 +29,7 @@ for _k in ("POCKET_CISO_DEMO", "POCKET_CISO_DEMO_MODE", "AUTO_SYNC"):
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import rag_engine as rag  # noqa: E402
+from eval import make_pdf  # noqa: E402
 
 SECRET = os.environ["POCKET_CISO_SECRET"]
 
@@ -457,35 +458,12 @@ if __name__ == "__main__":
     unittest.main()
 
 
-def _make_pdf(lines: list[list[tuple[float, str]]], font: str = "Courier", size: float = 9.0) -> bytes:
-    """Minimal one-page PDF (standard library) with text at fixed positions — for layout/table detection tests."""
-    ops, y = [f"BT /F1 {size} Tf"], 760.0
-    for line in lines:
-        for x, text in line:
-            esc = text.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
-            ops.append(f"1 0 0 1 {x:.1f} {y:.1f} Tm ({esc}) Tj")
-        y -= 12.0
-    stream = "\n".join(ops + ["ET"]).encode("latin-1")
-    objs = [b"<< /Type /Catalog /Pages 2 0 R >>", b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
-            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>",
-            b"<< /Length %d >>\nstream\n" % len(stream) + stream + b"\nendstream",
-            f"<< /Type /Font /Subtype /Type1 /BaseFont /{font} /Encoding /WinAnsiEncoding >>".encode()]
-    out, offsets = bytearray(b"%PDF-1.4\n"), []
-    for n, body in enumerate(objs, start=1):
-        offsets.append(len(out))
-        out += f"{n} 0 obj\n".encode() + body + b"\nendobj\n"
-    xref = len(out)
-    out += f"xref\n0 {len(objs) + 1}\n0000000000 65535 f \n".encode() + b"".join(f"{o:010d} 00000 n \n".encode() for o in offsets)
-    out += f"trailer\n<< /Size {len(objs) + 1} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n".encode()
-    return bytes(out)
-
-
 class PdfLayoutTables(unittest.TestCase):
     """PDFs generated here (not from the corpus): aligned tables become row statements; running text with multiple spaces
     never becomes a table, and no value may land in another column."""
 
     def test_wide_courier_table_with_wrapped_cells(self) -> None:
-        pdf = _make_pdf([[(50, "Section 1 Backup Targets")], [],
+        pdf = make_pdf([[(50, "Section 1 Backup Targets")], [],
                          [(50, "System"), (200, "Restore Time"), (330, "Data Loss"), (450, "Owner")], [],
                          [(50, "Payroll"), (200, "4 Stunden"), (330, "30 Minuten"), (450, "Finance Lead")], [(50, "database"), (450, "Team")], [],
                          [(50, "Web Shop"), (200, "8 Stunden"), (330, "1 Stunde"), (450, "IT Ops")], [],
@@ -495,8 +473,35 @@ class PdfLayoutTables(unittest.TestCase):
         self.assertIn("System: Payroll database | Restore Time: 4 Stunden | Data Loss: 30 Minuten | Owner: Finance Lead Team", text)
         self.assertIn("System: Web Shop | Restore Time: 8 Stunden | Data Loss: 1 Stunde | Owner: IT Ops", text)
 
+    ROWS = [[(50, "Geraet"), (200, "Pruefintervall"), (350, "Verantwortlich")],
+            [(50, "Kran 3"), (200, "6 Monate"), (350, "Hallenmeister")],
+            [(50, "Gabelstapler"), (200, "12 Monate"), (350, "Fuhrparkleitung")], [(50, "und Anhaenger"), (350, "Nord")],
+            [(50, "Hebebuehne"), (200, "3 Monate"), (350, "Werkstatt")]]
+
+    def test_rows_without_blank_lines_are_split_by_first_column(self) -> None:
+        # Word export pattern: no blank line between rows; wrapped cells (lower-case continuation line) stay in their row
+        tight = make_pdf(self.ROWS)
+        spaced = make_pdf([self.ROWS[0], [], self.ROWS[1], [], self.ROWS[2], self.ROWS[3], [], self.ROWS[4]])
+        header_apart = make_pdf([self.ROWS[0], []] + self.ROWS[1:])
+        for pdf in (tight, spaced, header_apart):
+            _, chunks = rag.chunk_document(rag.parse_document("t.pdf", pdf))
+            text = " ".join(c["content"] for c in chunks)
+            self.assertIn("Geraet: Kran 3 | Pruefintervall: 6 Monate | Verantwortlich: Hallenmeister.", text)
+            self.assertIn("Geraet: Gabelstapler und Anhaenger | Pruefintervall: 12 Monate | Verantwortlich: Fuhrparkleitung Nord.", text)
+            self.assertIn("Geraet: Hebebuehne | Pruefintervall: 3 Monate | Verantwortlich: Werkstatt.", text)
+
+    def test_uncertain_row_boundary_falls_back_to_text(self) -> None:
+        # a capitalised partial line could be a new row with an empty cell or a wrapped first cell → running text
+        partial = make_pdf(self.ROWS[:3] + [[(50, "Leiter"), (350, "Nord")]] + self.ROWS[4:])
+        # a second number under a cell that already has one is a merged row, never one wrapped cell
+        merged = make_pdf(self.ROWS[:2] + [[(50, "im Lager"), (200, "9 Monate"), (350, "Lager")]] + self.ROWS[2:])
+        for pdf in (partial, merged):
+            raw = rag.parse_document("t.pdf", pdf)
+            self.assertNotIn("|", raw)
+            self.assertIn("Kran 3 6 Monate Hallenmeister", raw)
+
     def test_justified_prose_is_not_a_table(self) -> None:
-        pdf = _make_pdf([[(50, "Section 2 Rules")], [],
+        pdf = make_pdf([[(50, "Section 2 Rules")], [],
                          [(50, "Die   Richtlinie   gilt   fuer   alle   Mitarbeitenden   und   Dienstleister.")],
                          [(50, "Ausnahmen   beduerfen   der   schriftlichen   Freigabe   durch   den   CISO.")], [],
                          [(50, "Passwoerter   muessen   mindestens   14   Zeichen   lang   sein   und   werden")],
@@ -511,7 +516,7 @@ class PdfLayoutTables(unittest.TestCase):
         self.assertEqual(table_lines, ["| Klasse | Frist | Verantwortlich |", "| Hoch | 2 Tage | CISO |", "| Niedrig | 10 Tage | Fachbereich |"])
 
     def test_misaligned_rows_fall_back_to_text(self) -> None:
-        pdf = _make_pdf([[(50, "Alpha"), (200, "Beta"), (350, "Gamma")], [],
+        pdf = make_pdf([[(50, "Alpha"), (200, "Beta"), (350, "Gamma")], [],
                          [(50, "eins"), (120, "zwei drei vier fuenf sechs"), (350, "sieben")], [],
                          [(50, "acht"), (200, "neun"), (350, "zehn")]])
         raw = rag.parse_document("t.pdf", pdf)
@@ -521,7 +526,7 @@ class PdfLayoutTables(unittest.TestCase):
 
     def test_centred_columns_within_tolerance(self) -> None:
         # pattern of the corpus risk matrix: header cells centred, drifting up to 6 characters from the row cells
-        pdf = _make_pdf([[(60, "Matrix"), (200, "Gering"), (330, "Mittel"), (460, "Hoch")],
+        pdf = make_pdf([[(60, "Matrix"), (200, "Gering"), (330, "Mittel"), (460, "Hoch")],
                          [(60, "Wahrsch."), (180, "(kaum spuerbar)"), (318, "(Stoerfaktor)"), (430, "(Geschaeftskritisch)")], [],
                          [(60, "Selten"), (200, "1 (Gering)"), (330, "2 (Gering)"), (460, "3 (Gering)")], [],
                          [(60, "Haeufig"), (200, "4 (Moderat)"), (330, "8 (Kritisch)"), (460, "12 (Kritisch)")]])
@@ -530,11 +535,11 @@ class PdfLayoutTables(unittest.TestCase):
         self.assertIn("| Haeufig | 4 (Moderat) | 8 (Kritisch) | 12 (Kritisch) |", raw)
 
     def test_kpi_box_values_under_labels(self) -> None:
-        pdf = _make_pdf([[(80, "2 Stunden"), (270, "250.000 EUR"), (460, "6 Monate")], [(60, "ZIEL-RTO TIER 1"), (260, "SCHADEN / TAG"), (450, "REVISION")], [],
+        pdf = make_pdf([[(80, "2 Stunden"), (270, "250.000 EUR"), (460, "6 Monate")], [(60, "ZIEL-RTO TIER 1"), (260, "SCHADEN / TAG"), (450, "REVISION")], [],
                          [(50, "Fliesstext danach.")]])
         _, chunks = rag.chunk_document(rag.parse_document("t.pdf", pdf))
         self.assertIn("ZIEL-RTO TIER 1: 2 Stunden | SCHADEN / TAG: 250.000 EUR | REVISION: 6 Monate", chunks[0]["content"])
-        shifted = _make_pdf([[(80, "2 Stunden"), (380, "250.000 EUR"), (460, "6 Monate")], [(60, "ZIEL-RTO TIER 1"), (260, "SCHADEN / TAG"), (450, "REVISION")]])
+        shifted = make_pdf([[(80, "2 Stunden"), (380, "250.000 EUR"), (460, "6 Monate")], [(60, "ZIEL-RTO TIER 1"), (260, "SCHADEN / TAG"), (450, "REVISION")]])
         self.assertNotIn("|", rag.parse_document("t.pdf", shifted))  # a value not under its label → running text
 
 
