@@ -2380,6 +2380,7 @@ def select_windows(idx: "LexIndex", view: RoleView, part: Part, ranked: list[int
     chosen = [first]
     got = window_terms(idx, first)
     base = coverage(part.qt, got, idx.ctx_terms[first[-1][0]])
+    doc = idx.chunks[first[-1][0]]["docName"]
     for w in good[1:]:
         if set(w) & set(first):
             continue
@@ -2390,6 +2391,20 @@ def select_windows(idx: "LexIndex", view: RoleView, part: Part, ranked: list[int
             chosen.append(w)
             got = got | window_terms(idx, w)
             break
+    # evidence across sections (class 4): up to 3 windows from different sections of the selected document, each carrying another part of the key
+    # terms (gain >= 0.2); only the first must hold the value/role ("Dieselvorrat reicht für 48 Stunden" + "Die
+    # Netzersatzanlage versorgt das Rechenzentrum"). The judge then rates the combination.
+    for _, w in scored:
+        if len(chosen) >= 3:
+            break
+        if idx.chunks[w[-1][0]]["docName"] != doc or any(set(w) & set(c) for c in chosen):
+            continue
+        if any(idx.section_key[w[-1][0]] == idx.section_key[c[-1][0]] for c in chosen) or \
+                any(idx.span_text[i][k].startswith("Tabelle [") for i, k in w + first):
+            continue  # another section of the document; table rows are self-contained and never combined
+        if coverage(part.qt, got | window_terms(idx, w)) - coverage(part.qt, got) >= 0.2:
+            chosen.append(w)
+            got = got | window_terms(idx, w)
     part.windows = chosen
     part.coverage = max(base, coverage(part.qt, got, idx.ctx_terms[first[-1][0]]))
 
@@ -2627,7 +2642,7 @@ def run_query(token: str | None, question: str) -> dict[str, Any]:
                 if confirmed:
                     part.contradiction = [found[0]] + confirmed
             if use_llm:
-                part.features["judge"] = judge_answerable(ptext + ctx_note, [idx.span_text[i][k] for w in part.windows for i, k in w][:4])
+                part.features["judge"] = judge_answerable(ptext + ctx_note, [idx.span_text[i][k] for w in part.windows for i, k in w][:6])
         # dense path: below the lexical floor, or the judge rejected the lexical window and the best dense chunk is another one
         lex_rejected = part.lexical_ok and part.features.get("judge") is False and not part.contradiction
         if dense and (not part.lexical_ok or lex_rejected):

@@ -465,6 +465,35 @@ class FactsAndContradictions(unittest.TestCase):
         self.assertEqual([(f["dim"], f["value"]) for f in chunk["facts"]], [("time", 1440.0)])
 
 
+class EvidenceAcrossSections(unittest.TestCase):
+    def test_windows_of_one_document_are_combined(self) -> None:
+        fresh_db([("Kühlhausordnung.md", "§2 Kältemaschine", "L2", "Die Kältemaschine kühlt das Tiefkühllager bei Hitzewellen."),
+                  ("Kühlhausordnung.md", "§5 Reserve", "L2", "Der Kältemittelvorrat reicht für 10 Tage Dauerbetrieb."),
+                  ("Kühlhausordnung.md", "§6 Reinigung", "L2", "Das Tiefkühllager wird wöchentlich gereinigt."),
+                  ("Kantinenordnung.md", "§1 Vorrat", "L2", "Der Lebensmittelvorrat reicht für 3 Tage.")])
+        rag._LEX_CACHE = None
+        rag.reset_query_caches()
+        seen: list[str] = []
+        def chat(system: str, user: str, **_: object) -> str | None:
+            seen.append(user)
+            return "JA" if system == rag.JUDGE_SYSTEM else None
+        with mock.patch.object(rag.OLLAMA, "llm_model", return_value="stub"), mock.patch.object(rag.OLLAMA, "chat", side_effect=chat):
+            res = rag.run_query(token("L2"), "Wie lange reicht der Kältemittelvorrat, wenn die Kältemaschine das Tiefkühllager kühlt?")
+        self.assertEqual(res["result"]["kind"], "answer")
+        self.assertIn("10 Tage", res["answer"])
+        self.assertIn("Kältemaschine kühlt das Tiefkühllager", seen[0])  # the judge rates the combination of both sections
+        self.assertNotIn("3 Tage", res["answer"])
+        self.assertNotIn("gereinigt", res["answer"])  # a window that adds no key term is not combined
+
+    def test_table_rows_are_never_combined(self) -> None:
+        fresh_db([("Geräteliste.md", "§1 Geräte", "L2", "Tabelle [§1 Geräte]: Gerät: Presse | Wartung: 2 Monate | Wartet: Team Süd. "
+                   "Tabelle [§1 Geräte]: Gerät: Fräse | Wartung: 4 Monate | Wartet: Team Nord.")])
+        rag._LEX_CACHE = None
+        with stub_llm("JA"):
+            res = rag.run_query(token("L2"), "Wie oft wird die Presse gewartet und von wem?")
+        self.assertNotIn("Fräse", res["answer"])
+
+
 class QuestionHandling(unittest.TestCase):
     def test_parts_and_context(self) -> None:
         parts, ctx, inj = rag.question_parts("Wir planen eine Migration. Wer genehmigt das und wie lange dauert die Prüfung?")
