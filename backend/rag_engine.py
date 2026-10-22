@@ -47,6 +47,10 @@ OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").rstrip(
 LLM_MODEL = os.getenv("LLM_MODEL", "qwen2.5:7b")
 EMBED_MODEL = os.getenv("EMBED_MODEL", "bge-m3")
 LLM_TIMEOUT = float(os.getenv("LLM_TIMEOUT", "14"))
+# chat context and residency: judge/phrasing prompts are < 2k tokens, so 4096 is enough and keeps a 14B model at ~10 GB
+# instead of its 32k default; keep_alive 30m avoids the cold start (qwen3:14b ~16 s) between queries
+LLM_NUM_CTX = int(os.getenv("LLM_NUM_CTX", "4096"))
+LLM_KEEP_ALIVE = os.getenv("LLM_KEEP_ALIVE", "30m")
 EMBED_TIMEOUT = float(os.getenv("EMBED_TIMEOUT", "20"))
 EMBED_TOTAL_BUDGET = float(os.getenv("EMBED_TOTAL_BUDGET", "100"))  # whole embed() call; staging stays below the gateway timeout (180 s)
 CONFLICT_LLM_TIMEOUT = float(os.getenv("CONFLICT_LLM_TIMEOUT", "20"))
@@ -238,7 +242,8 @@ class OllamaClient:
             "model": model,
             "stream": False,
             "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
-            "options": {"temperature": 0.0, "seed": 7, "num_predict": max_tokens},
+            "options": {"temperature": 0.0, "seed": 7, "num_predict": max_tokens, "num_ctx": LLM_NUM_CTX},
+            "keep_alive": LLM_KEEP_ALIVE,
         }
         if json_mode:
             payload["format"] = "json"

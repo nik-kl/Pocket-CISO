@@ -548,6 +548,8 @@ class OllamaPayload(unittest.TestCase):
                 post.return_value.json.return_value = {"message": {"content": "JA"}}
                 self.assertEqual(rag.OLLAMA.chat("s", "u"), "JA")
                 self.assertEqual(post.call_args.kwargs["json"].get("think"), think)
+                self.assertEqual(post.call_args.kwargs["json"]["options"]["num_ctx"], rag.LLM_NUM_CTX)
+                self.assertEqual(post.call_args.kwargs["json"]["keep_alive"], rag.LLM_KEEP_ALIVE)
 
 
 class Display(unittest.TestCase):
