@@ -541,7 +541,7 @@ def score_one(q: dict[str, Any], res: dict[str, Any], chunks: list[dict[str, Any
         outcome = "false_abstention"
     elif must_not_hit or not source_ok or errs or (q["facts"] and not any(facts_hit)):
         outcome = "false_answer"
-    elif all(facts_hit) and not (q.get("complete") and x["notes"]):
+    elif all(facts_hit) and not (q.get("complete") and any("keine belegbare" in n for n in x["notes"])):
         outcome = "correct"
     else:
         outcome = "incomplete"

@@ -2182,7 +2182,13 @@ INSTRUCTION_RE = re.compile(
 INTERROG = (r"(?:wie|wer|wem|wen|was|wo|wohin|woher|wann|welche\w*|warum|wieso|weshalb|ob|darf|durfen|muss|mussen|ist|sind|gibt|gilt|kann|"
             r"konnen|soll|sollen|braucht|brauchen|bis|ab|innerhalb|binnen|nach|how|who|whom|what|where|when|which|why|whether|is|are|do|does|"
             r"did|can|could|must|may|should|shall|will|within)")
-PART_SPLIT = re.compile(r"(?<=[?!.;:])\s+|,?\s+(?:und|sowie|oder|and|or)\s+(?=" + INTERROG + r"\b)|,\s+(?=(?:wie|wer|was|wo|wann|welche\w*|darf|durfen|muss|mussen|how|who|what|where|when|which)\b)")
+# split at sentence ends; inside question sentences (ending with "?", or every sentence when none does) also at "und/oder"
+# + question word and at a comma + question word or modal verb — a statement such as "… und müssen schnell handeln:" stays
+# context. Matched on a length-preserving fold (lower case, umlauts → base letter) so "müssen", "Dürfen" split like "mussen".
+SENT_SPLIT = re.compile(r"(?<=[?!.;:])\s+")
+PART_SPLIT = re.compile(r",?\s+(?:und|sowie|oder|and|or)\s+(?=" + INTERROG + r"\b)|,\s+(?=(?:wie|wer|wen|wem|was|wo|wann|welche\w*|"
+                        r"darf|durfen|muss|mussen|kann|konnen|how|who|whom|what|where|when|which|can|may|must)\b)")
+_SPLIT_FOLD = str.maketrans("äöüÄÖÜß", "aouaous")
 QUESTION_START = re.compile(r"^\s*(?:und\s+|and\s+)?" + INTERROG + r"\b")
 VALUE_Q = re.compile(r"\b(?:wie (?:lange?|viele?\w*|oft|schnell|hoch|gross|fruh)|bis wann|ab wann|ab welche\w*|bis zu welche\w*|innerhalb welche\w*|"
                      r"binnen welche\w*|in welche\w* (?:frist|zeit|intervall)|welche\w* (?:frist|intervall|wert|hohe|dauer|zeit|lange|mindestlange|gultigkeit)|"
@@ -2240,6 +2246,7 @@ class Part:
     norm: bool = False
     lexical_ok: bool = False
     capped_only: bool = False
+    pooled: bool = False  # judged against the windows of the answered parts
     dense_ok: bool = False
     ranked: list[int] = field(default_factory=list)
     features: dict[str, Any] | None = None
@@ -2251,7 +2258,18 @@ class Part:
 
 def question_parts(question: str) -> tuple[list[str], list[str], bool]:
     """→ (question parts, context sentences, injection_removed). Instructions to the assistant are dropped before analysis."""
-    pieces = [p.strip(" ,;:") for p in PART_SPLIT.split(question) if p and p.strip(" ,;:")]
+    sentences = [x for x in SENT_SPLIT.split(question.strip()) if x.strip()]
+    any_q = any(x.rstrip().endswith("?") for x in sentences)
+    cuts: list[str] = []
+    for sent in sentences:
+        folded = sent.translate(_SPLIT_FOLD).lower()
+        pos = 0
+        if len(folded) == len(sent) and (sent.rstrip().endswith("?") or not any_q):
+            for m in PART_SPLIT.finditer(folded):
+                cuts.append(sent[pos:m.start()])
+                pos = m.end()
+        cuts.append(sent[pos:])
+    pieces = [p.strip(" ,;:") for p in cuts if p and p.strip(" ,;:")]
     clean = [p for p in pieces if not INSTRUCTION_RE.search(fold(p))]
     removed = len(clean) < len(pieces)
     parts = [p for p in clean if QUESTION_START.match(fold(p)) or p.rstrip().endswith("?")]
@@ -2560,6 +2578,7 @@ def run_query(token: str | None, question: str) -> dict[str, Any]:
             ctx_weights[x] = max(ctx_weights.get(x, 0.0), 0.3 * w)
     dense_all = dense_scores(db, view, texts) if texts and view.n else None
     use_llm = bool(OLLAMA.llm_model())
+    ctx_note = f" (Kontext: {' '.join(context)})" if context else ""  # the judge needs the scenario to resolve "sie", "das"
     parts: list[Part] = []
     best_dense = 0.0
     candidate_docs: list[str] = []
@@ -2608,7 +2627,7 @@ def run_query(token: str | None, question: str) -> dict[str, Any]:
                 if confirmed:
                     part.contradiction = [found[0]] + confirmed
             if use_llm:
-                part.features["judge"] = judge_answerable(ptext, [idx.span_text[i][k] for w in part.windows for i, k in w][:4])
+                part.features["judge"] = judge_answerable(ptext + ctx_note, [idx.span_text[i][k] for w in part.windows for i, k in w][:4])
         # dense path: below the lexical floor, or the judge rejected the lexical window and the best dense chunk is another one
         lex_rejected = part.lexical_ok and part.features.get("judge") is False and not part.contradiction
         if dense and (not part.lexical_ok or lex_rejected):
@@ -2619,11 +2638,26 @@ def run_query(token: str | None, question: str) -> dict[str, Any]:
                 part.dense_ok, part.windows = True, [dw[0]]
                 part.features["densePath"] = round(dw[1], 4)
                 if use_llm:
-                    part.features["judge"] = judge_answerable(ptext, [idx.span_text[i][k] for i, k in dw[0]])
+                    part.features["judge"] = judge_answerable(ptext + ctx_note, [idx.span_text[i][k] for i, k in dw[0]])
         part.answered = (part.lexical_ok or part.dense_ok) and part.features.get("judge") is True and not part.contradiction
         if not part.answered and part.windows:
             part.reason = ("Abdeckung zu gering" if not (part.lexical_ok or part.dense_ok) else "Antwortbarkeitsprüfung: nein" if use_llm else "kein LLM: nur Fundstellen")
         parts.append(part)
+    # shared evidence pool: before a part is reported as unsupported, the judge checks it against the windows already selected
+    # for the answered parts (e.g. "… und wer nimmt die Anmeldung entgegen?" answered by the cited registration sentence),
+    # so the answer never cites a sentence and calls the same point unsupported
+    if use_llm:
+        pool = [w for p in parts if p.answered for w in p.windows]
+        for p in parts:
+            if p.answered or p.contradiction or not pool:
+                continue
+            ws = [w for w in pool if not p.value or window_ok(idx, p, w)]  # role names are left to the judge here
+            spans = [idx.span_text[i][k] for w in ws for i, k in w][:6]
+            p.pooled = bool(spans)
+            if spans and judge_answerable(f"{p.text} (Gesamtfrage: {q})", spans) is True:
+                p.windows, p.answered, p.reason = ws, True, ""
+                p.coverage = max(p.coverage, coverage(p.qt, frozenset().union(*(window_terms(idx, w) for w in ws))))
+                p.features = {**(p.features or {}), "pool": True}
     lat["retrieval"] = int((time.perf_counter() - t) * 1000)
 
     label = engine_label()
@@ -2697,8 +2731,9 @@ def run_query(token: str | None, question: str) -> dict[str, Any]:
         for sid in s.spans:
             segments.append({"type": "cite", "chunkId": idx.chunks[span_chunk[sid]]["id"], "spanId": sid})
     unanswered = [p for p in parts if not p.answered]
-    for p in unanswered:
-        segments.append({"type": "note", "text": f"Zu „{p.text}“ enthält der freigegebene Bestand keine belegbare Aussage."})
+    for p in unanswered:  # after a pool check the cited spans may touch the point: no claim that nothing exists
+        segments.append({"type": "note", "text": f"Zu „{p.text}“ wurde keine Aussage als Antwort bestätigt; bitte die zitierten Stellen prüfen."
+                         if p.pooled else f"Zu „{p.text}“ enthält der freigegebene Bestand keine belegbare Aussage."})
     cited_chunks = list(dict.fromkeys(s["chunkId"] for s in segments if s["type"] == "cite"))
     by_id = {c["id"]: c for c in idx.chunks}
     spans_out = {sid: {"chunkId": idx.chunks[span_chunk[sid]]["id"], "text": text} for sid, text in ordered}
