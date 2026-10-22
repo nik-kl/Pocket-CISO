@@ -2482,12 +2482,19 @@ def run_query(token: str | None, question: str) -> dict[str, Any]:
         }
         part.ranked = ranked
         part.lexical_ok = bool(part.windows) and part.coverage >= GATE_COVERAGE and part.features["missingMax"] <= GATE_MISSING
-        if part.lexical_ok and use_llm:
-            part.features["judge"] = judge_answerable(ptext, [idx.span_text[i][k] for w in part.windows for i, k in w][:4])
+        if part.lexical_ok:
+            # a contradiction is reported only when the judge confirms every listed window on its own (no new false flags)
+            found = find_contradiction(idx, view, part, ranked) if use_llm else []
+            confirmed = [(w, v) for w, v in found if judge_answerable(ptext, [idx.span_text[i][k] for i, k in w]) is True]
+            if confirmed:  # only judge-confirmed windows are listed; the first one is the anchor the others must disagree with
+                anchor = confirmed[0][1]
+                confirmed = confirmed[:1] + [(w, v) for w, v in confirmed[1:] if any(d in anchor and not (v[d] & anchor[d]) for d in v)]
+            if len(confirmed) >= 2:
+                part.contradiction, part.features["judge"] = confirmed, True
+            elif use_llm:
+                part.features["judge"] = judge_answerable(ptext, [idx.span_text[i][k] for w in part.windows for i, k in w][:4])
         part.answered = part.lexical_ok and part.features.get("judge") is True
-        if part.answered:
-            part.contradiction = find_contradiction(idx, view, part, ranked) or None
-        elif part.windows:
+        if not part.answered and part.windows:
             part.reason = ("Abdeckung zu gering" if not part.lexical_ok else "Antwortbarkeitsprüfung: nein" if use_llm else "kein LLM: nur Fundstellen")
         parts.append(part)
     lat["retrieval"] = int((time.perf_counter() - t) * 1000)
