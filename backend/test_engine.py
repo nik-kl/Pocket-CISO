@@ -100,6 +100,10 @@ class Chunker(unittest.TestCase):
         self.assertEqual([c["section"] for c in chunks], ["§1 Zweck", "§2 Regeln"])
         self.assertIn("erste Regel. zweite Regel.", chunks[1]["content"])
 
+    def test_numbered_lines_are_not_headings_in_paragraph_documents(self) -> None:
+        _, chunks = rag.chunk_document("§ 1 Ablauf\nDie Schritte sind:\n1. Host Isolation\n2. Volatile Capture\n§ 2 Fristen\nInnerhalb von 4 Stunden.\n")
+        self.assertEqual([c["section"] for c in chunks], ["§1 Ablauf", "§2 Fristen"])
+
     def test_chunking_is_deterministic(self) -> None:
         text = (Path(__file__).resolve().parent / "seed_policies" / "Passwort_Richtlinie_v4.md").read_text(encoding="utf-8")
         self.assertEqual(rag.chunk_document(text), rag.chunk_document(text))

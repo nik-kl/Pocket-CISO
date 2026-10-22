@@ -22,11 +22,13 @@ import unicodedata
 import uuid
 import zipfile
 import zlib
-from collections import Counter
+from collections import Counter, defaultdict
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Iterable, Iterator
 
 import httpx
 import numpy as np
@@ -51,8 +53,6 @@ EMBED_TOTAL_BUDGET = float(os.getenv("EMBED_TOTAL_BUDGET", "100"))  # whole embe
 CONFLICT_LLM_TIMEOUT = float(os.getenv("CONFLICT_LLM_TIMEOUT", "20"))
 MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_MB", "10")) * 1024 * 1024
 MAX_CHUNK_CHARS = 600
-DISABLE_HINTS = os.getenv("POCKET_CISO_DISABLE_HINTS") == "1"  # evaluation switch: measure how much the hard-coded query hints contribute
-LEX_MIN = float(os.getenv("LEX_MIN", "0.34"))  # min. share of question terms (incl. synonyms) a chunk must contain
 COLLECTION = "policies_live_v1"
 INBOX_DIR = Path(os.getenv("WATCHED_INBOX_DIR", Path(__file__).resolve().parent / "watched_inbox"))
 AUTO_SYNC = os.getenv("AUTO_SYNC", "0") == "1"
@@ -64,7 +64,6 @@ GENESIS = "0" * 64
 VERSION = "0.6.0"
 
 HASH_ID = "hash-ngram-v1"
-NO_ANSWER = "Keine eindeutige Richtlinie gefunden — Halluzinationsschutz aktiv (Konfidenz < 85%)."
 
 # Similarity thresholds per embedding space (cosine). Ollama values follow the product spec; the hash space is calibrated.
 PARAMS = {
@@ -113,62 +112,6 @@ STOP = set(
      "a an am an and are as at be been being but by can does for from have how i if in is it may my of on or our the their them these they this to us was we what who with").split()
 )
 
-SYN: dict[str, list[str]] = {
-    "zug": ["bahn", "offentlich", "verkehrsmittel", "personenverkehr"],
-    "bahn": ["zug", "offentlich", "verkehrsmittel"],
-    "unterwegs": ["offentlich", "bahn", "mobile"],
-    "homeoffice": ["mobile", "remote"],
-    "kennwort": ["passwort"],
-    "vorfall": ["sicherheitsvorfall", "incident"],
-    "incident": ["sicherheitsvorfall", "vorfall"],
-    "gemeldet": ["melden", "meldung", "meldepflicht"],
-    "melden": ["meldung", "meldepflicht"],
-    "meldung": ["melden", "meldepflicht"],
-    "meldepflicht": ["melden", "meldung"],
-    "chatgpt": ["generative", "ki", "kunstliche"],
-    "ki": ["kunstliche", "intelligenz", "generative"],
-    "nutzen": ["verwendung", "einsatz", "verwenden"],
-    "assessment": ["risikobewertung", "risikoanalyse", "vendor", "prufung"],
-    "risikobewertung": ["assessment", "risikoanalyse"],
-    "cloudsystem": ["cloud", "cloud dienst", "cloud service"],
-    "geschaftskritischen": ["kritisch", "tier"],
-    "restrisiken": ["risikoakzeptanz", "akzeptanz", "risk owner"],
-    "restrisiko": ["risikoakzeptanz", "akzeptanz", "risk owner"],
-    "absegnen": ["akzeptieren", "genehmigen", "freigeben", "signoff"],
-    "ransomware": ["cyberangriff", "sicherheitsvorfall", "verschlusselung"],
-    "krisenstab": ["krisenmanagement", "ciso", "geschaftsfuhrung"],
-    "erstmeldung": ["fruhwarnung", "meldung", "meldepflicht"],
-    "allowed": ["zulass", "erlaub", "genehmigt"],
-    "based": ["sitz", "standort"],
-    "saas": ["cloud", "dienst"],
-    "application": ["anwendung", "cloud"],
-    "store": ["speich", "ableg"],
-    "process": ["verarbeit"],
-    "strictly": ["streng"],
-    "confidential": ["vertraulich"],
-    "customer": ["kund"],
-    "data": ["daten"],
-    "primary": ["primar", "kritisch"],
-    "systems": ["system"],
-    "cyberattack": ["cyberangriff"],
-    "maximum": ["maximal"],
-    "acceptable": ["zulass"],
-    "loss": ["verlust"],
-    "restore": ["wiederherstell"],
-    "operations": ["betrieb"],
-    "accepts": ["akzept", "genehmig"],
-    "critical": ["kritisch"],
-    "risks": ["risiko", "restrisiko"],
-}
-
-REWRITES = {
-    " ".join(tokenize("Darf ich das auch im Zug machen?")): "Ist das Arbeiten mit vertraulichen Daten im öffentlichen Personenverkehr (Zug) laut Mobile-Work-Policy erlaubt?",
-    " ".join(tokenize("Wie lang muss mein Passwort sein?")): "Welche Mindestlänge und welche Wechselintervalle gelten laut aktueller Passwort-Policy für Benutzerpasswörter?",
-    " ".join(tokenize("Bis wann muss ein Sicherheitsvorfall nach NIS-2 gemeldet werden?")): "Welche Meldefristen gelten für erhebliche Sicherheitsvorfälle gegenüber dem BSI gemäß NIS-2 und Incident-Response-Runbook?",
-    " ".join(tokenize("Darf ich private KI-Tools wie ChatGPT für Kundenangebote nutzen?")): "Ist die Nutzung nicht freigegebener generativer KI-Dienste zur Verarbeitung von Kundendaten laut Unternehmensrichtlinie erlaubt?",
-}
-
-
 def stem(t: str) -> str:
     return t[:7] if len(t) >= 7 else t
 
@@ -184,8 +127,34 @@ def numbers_of(text: str) -> set[str]:
     return {n.replace(",", ".") for n in NUM_RE.findall(text)}
 
 
+SENT_BREAK = re.compile(r"(?<=[.!?])\s+(?=[A-ZÄÖÜ0-9„\"(])")
+# Abbreviations after which a period does not end a sentence ("z. B.", "bzw.", "Art. 33", "max. 90 Tage", "e.g.").
+ABBREV = frozenset("z b bzw ca inkl exkl nr art abs max min mind ggf evtl vgl u a d h e g i s etc usw sog zzgl gem lt str dr st vs no "
+                   "approx incl resp cf fig sec bspw ff".split())
+
+
 def split_sentences(text: str) -> list[str]:
-    return [s.strip() for s in re.split(r"(?<=[.!?])\s+(?=[A-ZÄÖÜ0-9„\"(])", text) if s.strip()]
+    """Sentence spans; generated table statements ("Tabelle [§…]: …") always start a new span."""
+    pieces = re.split(r"\s+(?=Tabelle \[)", text)
+    if len(pieces) > 1:
+        return [s for p in pieces for s in split_sentences(p)]
+    out: list[str] = []
+    start = 0
+    for m in SENT_BREAK.finditer(text):
+        before = text[start : m.start()]
+        word = re.search(r"([A-Za-zÄÖÜäöüß]+)\.$", before)
+        if word and (word.group(1).lower() in ABBREV or len(word.group(1)) == 1):
+            continue
+        if re.search(r"(?:^|[:|]\s*)\d{1,3}\.$", before):  # enumeration "Action: 1. Host …"
+            continue
+        piece = text[start : m.start()].strip()
+        if piece:
+            out.append(piece)
+        start = m.end()
+    tail = text[start:].strip()
+    if tail:
+        out.append(tail)
+    return out
 
 
 # ───────────────────────── Ollama client + embeddings ─────────────────────────
@@ -296,12 +265,9 @@ def _bucket(token: str) -> tuple[int, float]:
     return h % HASH_DIM, 1.0 if (h >> 16) & 1 else -1.0
 
 
-def hash_embed(text: str, expand: bool = False) -> np.ndarray:
-    """Deterministic TF + char-4-gram feature hashing (offline embedding space)."""
+def hash_embed(text: str) -> np.ndarray:
+    """Deterministic TF + char-4-gram feature hashing (offline space; staging alignment and conflict pre-selection only)."""
     toks = content_stems(text)
-    if expand:
-        for t in list(toks):
-            toks += [stem(s) for s in SYN.get(t, [])]
     v = np.zeros(HASH_DIM, dtype=np.float32)
     for t, c in Counter(toks).items():
         i, s = _bucket("w:" + t)
@@ -323,7 +289,7 @@ class Embedder:
         if not texts:
             return np.zeros((0, HASH_DIM), dtype=np.float32)
         if engine_id == HASH_ID:
-            return np.stack([hash_embed(t, expand=(kind == "query")) for t in texts])
+            return np.stack([hash_embed(t) for t in texts])
         prefix = ""
         if "nomic" in engine_id:
             prefix = "search_query: " if kind == "query" else "search_document: "
@@ -508,13 +474,14 @@ class VectorStore:
         self.engine: str | None = None
         self.vecs: dict[str, np.ndarray] = {}
         self.stash: dict[str, dict[str, np.ndarray]] = {}  # expensive Ollama vector set kept while the hash engine is active (Ollama flapping)
+        self.lexical: dict[str, Any] | None = None  # BM25 terms/spans of the live chunks (built at approval time, see LexIndex)
         self._mtime: float | None = None
 
     def reload(self) -> None:
         try:
             mt = VEC_PATH.stat().st_mtime
         except FileNotFoundError:
-            self.engine, self.vecs, self._mtime = None, {}, None
+            self.engine, self.vecs, self.lexical, self._mtime = None, {}, None, None
             return
         if mt == self._mtime:
             return
@@ -523,8 +490,9 @@ class VectorStore:
             self.engine = raw.get("engine")
             self.vecs = {k: np.asarray(v, dtype=np.float32) for k, v in raw.get("vectors", {}).items()}
             self.stash = {e: {k: np.asarray(v, dtype=np.float32) for k, v in vs.items()} for e, vs in raw.get("stash", {}).items()}
+            self.lexical = raw.get("lexical")
         except Exception:
-            self.engine, self.vecs = None, {}
+            self.engine, self.vecs, self.lexical = None, {}, None
         self._mtime = mt
 
     def save(self) -> None:
@@ -535,6 +503,7 @@ class VectorStore:
             "updatedAt": now_iso(),
             "vectors": {k: [round(float(x), 6) for x in v] for k, v in self.vecs.items()},
             "stash": {e: {k: [round(float(x), 6) for x in v] for k, v in vs.items()} for e, vs in self.stash.items()},
+            "lexical": self.lexical,
         }
         _atomic_write(VEC_PATH, json.dumps(payload))
         self._mtime = VEC_PATH.stat().st_mtime
@@ -657,7 +626,7 @@ ALLOWED_EXT = {".pdf", ".docx", ".md", ".txt"}
 
 def safe_doc_name(name: str) -> str:
     base = Path(unicodedata.normalize("NFC", name).replace("\\", "/")).name.strip()
-    base = re.sub(r"[^\w.\- ]", "_", base)[:120]
+    base = re.sub(r"[^\w.\-&,() ]", "_", base)[:120]  # keeps "IAM, Endgeräte & Wechselmedien (v2).pdf" readable
     if not re.search(r"\.[A-Za-z0-9]{1,5}$", base):
         base += ".txt"
     return base or "dokument.txt"
@@ -696,7 +665,7 @@ def parse_document(filename: str, data: bytes) -> str:
             reader = PdfReader(io.BytesIO(data))
             if reader.is_encrypted:
                 raise ApiError(422, "PDF_ENCRYPTED", "Verschlüsselte PDFs werden nicht unterstützt.")
-            return "\n\n".join((p.extract_text() or "") for p in reader.pages[:300])
+            return "\n\n".join(_pdf_page_text(p) for p in reader.pages[:300])
         except ApiError:
             raise
         except Exception as e:  # noqa: BLE001
@@ -706,6 +675,81 @@ def parse_document(filename: str, data: bytes) -> str:
         return _docx_to_text(data)
     except Exception as e:  # noqa: BLE001
         raise ApiError(422, "DOCX_UNREADABLE", f"DOCX konnte nicht gelesen werden: {type(e).__name__}")
+
+
+PAGE_FOOTER = re.compile(r"\b(?:Seite|Page)\s+\d+\s+(?:von|of)\s+\d+\s*$", re.I)
+LAYOUT_CELL = re.compile(r"\S+(?: {1,2}\S+)*")  # a cell = words separated by ≤ 2 spaces; columns are ≥ 3 spaces apart
+
+
+def _layout_cells(line: str) -> list[tuple[int, str]]:
+    return [(m.start(), m.group(0)) for m in LAYOUT_CELL.finditer(line)]
+
+
+def _join_cell(a: str, b: str) -> str:
+    if not a:
+        return b
+    return a + b if re.search(r"\w-$", a) and b[:1].isalnum() else f"{a} {b}"  # "ERP-" + "Auftragsbearbeitung"
+
+
+def _layout_rows(block: list[str], starts: list[int]) -> list[str]:
+    cols = [""] * len(starts)
+    for line in block:
+        for pos, text in _layout_cells(line):
+            k = min(range(len(starts)), key=lambda j: (abs(starts[j] - pos), j))  # nearest column start (cells may be centred)
+            cols[k] = _join_cell(cols[k], text)
+    return [c.replace("|", "\\|").strip() for c in cols]
+
+
+def _pdf_page_text(page: Any) -> str:
+    """Layout-mode extraction keeps table columns: blocks with ≥ 3 aligned cells become Markdown tables (header + one row
+    per blank-line separated block), two-line KPI boxes (values over UPPERCASE labels) become one-row tables, page footers
+    are dropped. Falls back to plain extraction when the layout mode yields nothing."""
+    try:
+        raw = page.extract_text(extraction_mode="layout") or ""
+    except Exception:  # noqa: BLE001 — older pypdf / odd fonts
+        raw = ""
+    if not raw.strip():
+        return page.extract_text() or ""
+    blocks: list[list[str]] = []
+    cur: list[str] = []
+    for line in raw.split("\n"):
+        line = line.rstrip()
+        if PAGE_FOOTER.search(line):
+            continue
+        if line.strip():
+            cur.append(line)
+        elif cur:
+            blocks.append(cur)
+            cur = []
+    if cur:
+        blocks.append(cur)
+    out: list[str] = []
+    i = 0
+    while i < len(blocks):
+        head = blocks[i]
+        widest = max(head, key=lambda ln: len(_layout_cells(ln)))
+        if len(head) <= 3 and len(_layout_cells(widest)) >= 3:
+            rows = []
+            j = i + 1
+            while j < len(blocks) and len(_layout_cells(blocks[j][0])) >= 2:
+                rows.append(blocks[j])
+                j += 1
+            starts = [p for p, _ in _layout_cells(widest)]
+            if rows:
+                out += ["", "| " + " | ".join(_layout_rows(head, starts)) + " |", "|" + "---|" * len(starts)]
+                out += ["| " + " | ".join(_layout_rows(r, starts)) + " |" for r in rows] + [""]
+                i = j
+                continue
+            if len(head) == 2:
+                vals, labels = (_layout_cells(head[0]), _layout_cells(head[1]))
+                letters = re.sub(r"[^A-Za-zÄÖÜäöüß]", "", head[1])
+                if len(vals) == len(labels) and letters and letters.isupper():
+                    out += ["", "| " + " | ".join(t for _, t in labels) + " |", "|" + "---|" * len(labels), "| " + " | ".join(t for _, t in vals) + " |", ""]
+                    i += 1
+                    continue
+        out += [re.sub(r"\s{2,}", " ", ln.strip()) for ln in head] + [""]
+        i += 1
+    return "\n".join(out)
 
 
 def _docx_paragraph_line(p: Any) -> str:
@@ -812,7 +856,10 @@ def _body_paragraphs(lines: list[str]) -> list[str]:
 
     def flush() -> None:
         if buf:
-            paras.append(" ".join(buf))
+            joined = buf[0]
+            for nxt in buf[1:]:  # "Endgeräte-" + "Richtlinie" (line-break hyphen) → "Endgeräte-Richtlinie"
+                joined = joined + nxt if re.search(r"\w-$", joined) and nxt[:1].isalpha() else f"{joined} {nxt}"
+            paras.append(joined)
             buf.clear()
 
     for ln in lines:
@@ -885,7 +932,10 @@ def _section_paragraphs(lines: list[str], label: str) -> list[str]:
 
 def chunk_document(text: str) -> tuple[str | None, list[dict[str, str]]]:
     """Split by headings (## / §N / 1.2 Title) into atomic policy chunks of ≤ ~600 chars. Returns (title, chunks)."""
-    text = text.replace("\r\n", "\n").replace("\r", "\n").replace("\x00", "")
+    text = unicodedata.normalize("NFKC", text.replace("\r\n", "\n").replace("\r", "\n").replace("\x00", ""))  # PDF ligatures (ﬁ → fi)
+    lines_in = [ln for ln in text.split("\n") if not PAGE_FOOTER.search(ln)]
+    # "1. Host & VLAN Isolation" inside a §-structured document is a list/table item, not a heading
+    explicit = any(HEAD_MD.match(ln) or HEAD_PARA.match(ln) for ln in lines_in)
     title: str | None = None
     sections: list[dict[str, Any]] = []
     cur: dict[str, Any] | None = None
@@ -900,7 +950,7 @@ def chunk_document(text: str) -> tuple[str | None, list[dict[str, str]]]:
         cur = {"number": number or str(len(sections) + 1), "title": label_title or "Abschnitt", "lines": []}
         sections.append(cur)
 
-    for line in text.split("\n"):
+    for line in lines_in:
         md = HEAD_MD.match(line)
         if md:
             if len(md.group(1)) == 1 and title is None and not sections:
@@ -912,7 +962,7 @@ def chunk_document(text: str) -> tuple[str | None, list[dict[str, str]]]:
         if pm:
             start(pm.group(2), pm.group(1))
             continue
-        nm = HEAD_NUM.match(line)
+        nm = None if explicit else HEAD_NUM.match(line)
         if nm and is_quantity_heading(nm.group(1), nm.group(2)):
             nm = None
         if nm:
@@ -1245,8 +1295,8 @@ def stage_text(token: str | None, *, title: str, target_doc: str, new_text: str,
     target = target_doc.strip()
     if not 3 <= len(title.strip()) <= 120:  # same limits as stagePolicy in src/lib/db.ts
         raise ApiError(400, "BAD_TITLE", "Titel: 3–120 Zeichen.")
-    if not re.fullmatch(r"[\w.\- ]{3,120}", target):
-        raise ApiError(400, "BAD_TARGET", "Zieldokument: 3–120 Zeichen (Buchstaben, Ziffern, . _ -).")
+    if not re.fullmatch(r"[\w.\-&,() ]{3,120}", target):
+        raise ApiError(400, "BAD_TARGET", "Zieldokument: 3–120 Zeichen (Buchstaben, Ziffern, Leerzeichen, . _ - & , ( )).")
     if not 10 <= len(new_text.strip()) <= 2000:
         raise ApiError(400, "BAD_TEXT", "Regeltext: 10–2000 Zeichen.")
     existing = next((c for c in read_db()["live_chunks"] if c["docName"].lower() == target.lower()), None)
@@ -1425,6 +1475,7 @@ def approve_diff(token: str | None, diff_id: str, override: bool = False, overri
                     if chunk["docName"] == diff["replacesDoc"]:
                         chunk["docName"] = diff["docName"]
                         chunk["sha256"] = sha256(f"{chunk['docName']}|{chunk['section']}|{chunk['content']}")
+            refresh_lexical(db["live_chunks"])  # BM25 terms + spans are precomputed here, never per query
             VECTORS.save()
         db["staged_diffs"].pop(idx)
         db["meta"]["liveVersion"] += 1
@@ -1439,14 +1490,555 @@ def approve_diff(token: str | None, diff_id: str, override: bool = False, overri
     return {"ok": True, "merged": len(diff["hunks"]), "superseded": superseded, "docName": diff["docName"]}
 
 
-# ───────────────────────── Pipeline B: stateless 4-stage compliance RAG ─────────────────────────
+# ───────────────────────── Retrieval text analysis (normalisation, stemming, compounds, glossary) ─────────────────────────
+
+_FOLD = str.maketrans({"ä": "a", "ö": "o", "ü": "u", "ß": "ss", "é": "e", "è": "e", "á": "a", "à": "a"})
+
+
+def fold(s: str) -> str:
+    """NFKC (PDF ligatures 'ﬁ' → 'fi'), case folding, umlaut and ß folding."""
+    return unicodedata.normalize("NFKC", s).casefold().translate(_FOLD)
+
+
+# Function words, question words, auxiliaries and modal verbs (folded, DE + EN). Negations and modal verbs matter to the
+# verifier, not to retrieval.
+R_STOP = frozenset("""
+ab aber alle allem allen aller alles als also am an andere anderen anderer anderes auch auf aus ausser bei beim bin bis
+bisher bist bitte da dabei dadurch dafur dagegen daher damit danach dann daran darauf daraus darf darfst darin darum darunter
+das dass davon dazu dem den denen denn der deren des dessen dich die dies diese diesem diesen dieser dieses dir doch dort du
+durch durfen durfte durften ein eine einem einen einer eines einige einmal er es etwa etwas euch euer eure fur gab gibt gilt
+gelten genau gemass gem geben habe haben hat hatte hatten hier hin ich ihm ihn ihnen ihr ihre ihrem ihren ihrer im in indem
+ins ist ja je jede jedem jeden jeder jedes jemand jetzt kann kannst konnen konnte konnten lt laut machen macht man mehr mein
+meine meinem meinen meiner meines mich mir mit muss musst mussen musste mussten nach nachdem neben noch nun nur ob oder ohne
+per pro schon sehr sein seine seinem seinen seiner seit selbst sich sie sind so solche soll sollen sollte sollten sondern
+sonst sowie sowohl tun uber um und uns unser unsere unserem unseren unserer unter viel viele vom von vor wahrend war waren
+warum was weil welche welchem welchen welcher welches wem wen wenn wer werde werden wessen wie wieso wieviel wieviele weshalb
+wir wird wo wobei wodurch wofur woher wohin womit worden wurde wurden zu zum zur zwar zwischen eigentlich gerne bzw nicht kein
+keine keinem keinen keiner keines nie niemals oft wann lange denn mal bitte darfst eigene eigenen eigener
+a about above after again against all also am an and any are as at be because been before being below between both but by
+can cannot could did do does doing done down during each else ever every few for from further had has have having he her
+here hers him his how however i if in into is it its itself just may me might more most must my no nor not now of off on
+once only or other our ours out over own per please same shall she should so some such than that the their theirs them then
+there these they this those through to too under until up us very was we were what when where which while who whom whose why
+will with within without would you your yours according regarding exactly exact many much often long allowed
+""".split())
+# Document-type words: weak evidence for a topic (weight 0.3), still useful to rank the referenced document.
+GENERIC_WORDS = frozenset("richtlinie richtlinien policy policies unternehmen company firma organisation regel regeln vorgabe vorgaben dokument document".split())
+
+UNIT_CANON: dict[str, str] = {}
+for _canon, _words in {
+    "h": "h std stunde stunden hour hours hr hrs", "min": "min minute minuten minutes mins", "s": "sek sekunde sekunden second seconds sec",
+    "wd": "werktag werktage werktagen", "d": "tag tage tagen day days", "w": "woche wochen week weeks", "mo": "monat monate monaten month months",
+    "y": "jahr jahre jahren year years", "chr": "zeichen character characters chars", "pct": "prozent percent", "eur": "eur euro",
+    "mb": "mb", "gb": "gb", "tb": "tb",
+}.items():
+    for _w in _words.split():
+        UNIT_CANON[_w] = _canon
+FREQ_WORDS = {"jahrlich": "12mo", "annual": "12mo", "annually": "12mo", "yearly": "12mo", "halbjahrlich": "6mo", "semiannual": "6mo",
+              "vierteljahrlich": "3mo", "quarterly": "3mo", "monatlich": "1mo", "monthly": "1mo", "wochentlich": "7d", "weekly": "7d",
+              "taglich": "1d", "daily": "1d", "biennial": "24mo"}
+_LEX = re.compile(r"\d+(?:[.,]\d+)*|[a-z]+|%")
+
+
+def _num(tok: str) -> str:
+    if re.fullmatch(r"\d{1,3}(?:[.,]\d{3})+", tok):  # 250.000 / 50,000 → 250000 / 50000
+        return re.sub(r"[.,]", "", tok).lstrip("0") or "0"
+    tok = tok.replace(",", ".")
+    return tok if "." in tok else (tok.lstrip("0") or "0")
+
+
+def _unit_at(toks: list[str], k: int) -> str | None:
+    if k >= len(toks):
+        return None
+    return "pct" if toks[k] == "%" else UNIT_CANON.get(toks[k])
+
+
+def _qty(value: str, unit: str) -> str:
+    """Canonical quantity term: years → months, weeks → days ("1 year" = "12 Monate", "2 Jahre" = "24 Monate")."""
+    factor = {"y": ("mo", 12), "w": ("d", 7)}.get(unit)
+    if factor:
+        try:
+            v = float(value) * factor[1]
+            value, unit = (str(int(v)) if v.is_integer() else str(v)), factor[0]
+        except ValueError:
+            pass
+    return f"{value}{unit}"
+
+
+def _cue(unit: str) -> str:
+    return {"y": "mo", "w": "d"}.get(unit, unit)
+
+
+@lru_cache(maxsize=50_000)
+def cistem(w: str) -> str:
+    """CISTEM stemmer (Weißweiler & Fraser 2017), case-insensitive variant; input is already folded."""
+    if len(w) <= 3:
+        return w
+    w = re.sub(r"^ge(.{4,})", r"\1", w)
+    w = w.replace("sch", "$").replace("ei", "%").replace("ie", "&")
+    w = re.sub(r"(.)\1", r"\1*", w)
+    while len(w) > 3:
+        if len(w) > 5:
+            w2 = re.sub(r"e[mr]$", "", w)
+            if w2 == w:
+                w2 = re.sub(r"nd$", "", w)
+            if w2 != w:
+                w = w2
+                continue
+        w2 = re.sub(r"t$", "", w)
+        if w2 == w:
+            w2 = re.sub(r"[esn]$", "", w)
+        if w2 == w:
+            break
+        w = w2
+    w = re.sub(r"(.)\*", r"\1\1", w)
+    return w.replace("$", "sch").replace("%", "ei").replace("&", "ie")
+
+
+class Vocab:
+    """Compound splitting against the corpus vocabulary: longest known head, optional linking element, known or recursively
+    split remainder (an unknown inflected tail ≥ 5 chars is kept): 'wiederanlaufzeiten' → wiederanlauf + zeiten."""
+
+    def __init__(self, words: Iterable[str]) -> None:
+        self.words = frozenset(w for w in words if len(w) >= 4 and w not in R_STOP)
+        self._memo: dict[str, list[str]] = {}
+
+    def split(self, w: str) -> list[str]:
+        if w not in self._memo:
+            parts = self._split(w, 0)
+            self._memo[w] = parts if len(parts) > 1 else []
+        return self._memo[w]
+
+    def _split(self, w: str, depth: int) -> list[str]:
+        fallback: list[str] | None = None
+        for i in range(len(w) - 4, 3, -1):
+            head = w[:i]
+            if head not in self.words:
+                continue
+            rest = w[i:]
+            for link in ("", "s", "es", "n", "en"):
+                if not rest.startswith(link) or len(rest) - len(link) < 4:
+                    continue
+                r = rest[len(link):]
+                if r in self.words:
+                    return [head, r]
+                if depth < 2:
+                    sub = self._split(r, depth + 1)
+                    if len(sub) > 1:
+                        return [head] + sub
+            if fallback is None and len(rest) >= 5:
+                fallback = [head, rest]
+        return fallback or [w]
+
+
+def analyze(text: str, vocab: Vocab | None = None) -> list[str]:
+    """Index/query terms: stems, compound parts, numbers ('50000'), quantities ('24h', '12mo'), unit cues ('u:h') and
+    identifiers ('tier2', 'tls1.3', 'aes256')."""
+    toks = _LEX.findall(fold(text))
+    out: list[str] = []
+    i, n = 0, len(toks)
+    while i < n:
+        t = toks[i]
+        if t[0].isdigit():
+            v = _num(t)
+            out.append(v)
+            u = _unit_at(toks, i + 1)
+            if u:
+                out += [_qty(v, u), "u:" + _cue(u)]
+                i += 2
+                continue
+        elif t != "%":
+            if t in FREQ_WORDS:
+                out.append(FREQ_WORDS[t])
+            if t in UNIT_CANON and len(t) > 3:
+                out.append("u:" + _cue(UNIT_CANON[t]))
+            elif len(t) >= 2 and t not in R_STOP:
+                if i + 1 < n and toks[i + 1][0].isdigit() and not _unit_at(toks, i + 2):
+                    out.append(t + _num(toks[i + 1]))
+                out.append(cistem(t))
+                if vocab is not None and len(t) >= 8:
+                    out += [cistem(p) for p in vocab.split(t)]
+        i += 1
+    return out
+
+
+def _edit_distance(a: str, b: str, cap: int) -> int:
+    """Damerau-Levenshtein (optimal string alignment) with early exit above `cap`."""
+    if abs(len(a) - len(b)) > cap:
+        return cap + 1
+    prev2: list[int] = []
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i] + [0] * len(b)
+        for j, cb in enumerate(b, 1):
+            cur[j] = min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (ca != cb))
+            if i > 1 and j > 1 and ca == b[j - 2] and a[i - 2] == cb:
+                cur[j] = min(cur[j], prev2[j - 2] + 1)
+        if min(cur) > cap:
+            return cap + 1
+        prev2, prev = prev, cur
+    return prev[-1]
+
+
+GLOSSARY_PATH = Path(__file__).resolve().parent / "glossary.json"
+
+
+class Glossary:
+    """backend/glossary.json: groups of interchangeable domain terms (DE/EN pairs, abbreviations)."""
+
+    def __init__(self, path: Path) -> None:
+        try:
+            raw = path.read_bytes()
+            groups = json.loads(raw).get("groups", [])
+        except (OSError, ValueError):
+            raw, groups = b"", []
+        self.digest = hashlib.sha256(raw).hexdigest()[:16]
+        self.words = {w for g in groups for m in g for w in _LEX.findall(fold(m)) if w.isalpha()}
+        self.groups: list[list[frozenset[str]]] = []
+        self.single: dict[str, list[int]] = defaultdict(list)
+        self.multi: list[tuple[frozenset[str], int]] = []
+        for g in groups:
+            members = [frozenset(t for t in analyze(m) if not t.startswith("u:")) for m in g]
+            members = [m for m in members if m]
+            gi = len(self.groups)
+            self.groups.append(members)
+            for m in members:
+                if len(m) == 1:
+                    self.single[next(iter(m))].append(gi)
+                else:
+                    self.multi.append((m, gi))
+
+
+GLOSSARY = Glossary(GLOSSARY_PATH)
+
+
+# ───────────────────────── Lexical index (built at approval time, persisted next to the vectors) ─────────────────────────
+
+INDEX_VERSION = "lex-1"
+BM25_K1, BM25_B = 1.2, 0.75
+RRF_K = 60
+
+
+def section_title(section: str) -> str:
+    return re.sub(r"\s*\(Teil \d+\)$", "", re.sub(r"^§\S*\s*", "", section))
+
+
+def doc_title(doc_name: str) -> str:
+    return re.sub(r"[_]+", " ", re.sub(r"\.[A-Za-z0-9]{1,5}$", "", doc_name))
+
+
+def corpus_signature(chunks: list[dict[str, Any]]) -> str:
+    h = hashlib.sha256(f"{INDEX_VERSION}|{GLOSSARY.digest}".encode())
+    for c in sorted(chunks, key=lambda x: x["id"]):
+        h.update(f"\x1e{c['id']}\x1f{c['docName']}\x1f{c['section']}\x1f{c['minRole']}\x1f{sha256(c['content'])}".encode())
+    return h.hexdigest()
+
+
+class LexIndex:
+    def __init__(self, chunks: list[dict[str, Any]], payload: dict[str, Any] | None = None) -> None:
+        self.chunks = sorted(chunks, key=lambda c: c["id"])
+        self.sig = corpus_signature(self.chunks)
+        if payload and payload.get("sig") == self.sig:
+            self.words = set(payload["words"])
+            self.doc_terms = [list(t) for t in payload["terms"]]
+            self.span_text = [list(s) for s in payload["spanText"]]
+            self.span_terms = [[frozenset(t) for t in s] for s in payload["spanTerms"]]
+            self.ctx_terms = [frozenset(t) for t in payload["ctx"]]
+        else:
+            self.words = {w for c in self.chunks for w in _LEX.findall(fold(f"{c['content']} {c['section']} {doc_title(c['docName'])}")) if w.isalpha()}
+            vocab = Vocab(self.words | GLOSSARY.words)
+            self.doc_terms, self.span_text, self.span_terms, self.ctx_terms = [], [], [], []
+            for c in self.chunks:
+                ctx = f"{section_title(c['section'])} {doc_title(c['docName'])}"
+                self.doc_terms.append(analyze(f"{c['content']} {ctx}", vocab))
+                spans = split_sentences(c["content"]) or [c["content"]]
+                self.span_text.append(spans)
+                self.span_terms.append([frozenset(analyze(s, vocab)) for s in spans])
+                self.ctx_terms.append(frozenset(analyze(ctx, vocab)))
+        self.pos = {c["id"]: i for i, c in enumerate(self.chunks)}
+        self.tf = [Counter(t) for t in self.doc_terms]
+        self.dl = [len(t) for t in self.doc_terms]
+        self._views: dict[str, RoleView] = {}
+
+    def payload(self) -> dict[str, Any]:
+        return {"version": INDEX_VERSION, "sig": self.sig, "words": sorted(self.words), "terms": self.doc_terms, "spanText": self.span_text,
+                "spanTerms": [[sorted(t) for t in s] for s in self.span_terms], "ctx": [sorted(t) for t in self.ctx_terms]}
+
+    def view(self, role: str) -> "RoleView":
+        if role not in self._views:
+            self._views[role] = RoleView(self, role)
+        return self._views[role]
+
+
+class RoleView:
+    """Everything a role's query may touch: RBAC filter BEFORE scoring — document frequencies, vocabulary (compound
+    splitting, typo correction) and candidates come from the chunks the role may read only."""
+
+    def __init__(self, idx: LexIndex, role: str) -> None:
+        self.idx = idx
+        self.allowed = [i for i, c in enumerate(idx.chunks) if ROLE_RANK[c["minRole"]] <= ROLE_RANK[role]]
+        self.n = len(self.allowed)
+        self.df: Counter[str] = Counter()
+        words: set[str] = set()
+        for i in self.allowed:
+            self.df.update(set(idx.doc_terms[i]))
+            words |= set(_LEX.findall(fold(f"{idx.chunks[i]['content']} {idx.chunks[i]['section']} {doc_title(idx.chunks[i]['docName'])}")))
+        self.vocab = Vocab({w for w in words if w.isalpha()} | GLOSSARY.words)
+        self.avgdl = (sum(idx.dl[i] for i in self.allowed) / self.n) if self.n else 1.0
+        self.postings: dict[str, list[tuple[int, int]]] = defaultdict(list)
+        for i in self.allowed:
+            for t, f in idx.tf[i].items():
+                self.postings[t].append((i, f))
+        self.stems_by_initial: dict[str, list[str]] = defaultdict(list)
+        for t in sorted(self.df):
+            if t.isalpha() and len(t) >= 4:
+                self.stems_by_initial[t[0]].append(t)
+
+    def idf(self, t: str) -> float:
+        df = self.df.get(t, 0)
+        return math.log(1 + (self.n - df + 0.5) / (df + 0.5))
+
+    def bm25(self, weights: dict[str, float]) -> dict[int, float]:
+        scores: dict[int, float] = defaultdict(float)
+        for t, w in sorted(weights.items()):
+            for i, f in self.postings.get(t, ()):
+                norm_len = f + BM25_K1 * (1 - BM25_B + BM25_B * self.idx.dl[i] / self.avgdl)
+                scores[i] += w * self.idf(t) * f * (BM25_K1 + 1) / norm_len
+        return scores
+
+    def fuzzy(self, stem_: str) -> str | None:
+        """Typo tolerance: the closest known stem (edit distance ≤ 1, ≤ 2 for long words); ties → higher df, then alphabetical."""
+        if len(stem_) < 4:
+            return None
+        cap = 2 if len(stem_) >= 8 else 1
+        best: tuple[int, int, str] | None = None
+        for cand in self.stems_by_initial.get(stem_[0], ()):
+            d = _edit_distance(stem_, cand, cap)
+            if d <= cap:
+                key = (d, -self.df[cand], cand)
+                if best is None or key < best:
+                    best = key
+        return best[2] if best else None
+
+
+_LEX_CACHE: LexIndex | None = None
+
+
+def lexical_index(db: dict[str, Any]) -> LexIndex:
+    """mtime/signature-checked: reuses the in-memory index, else the persisted one (vectors.json → 'lexical'), else rebuilds."""
+    global _LEX_CACHE
+    sig = corpus_signature(db["live_chunks"])
+    if _LEX_CACHE is not None and _LEX_CACHE.sig == sig:
+        return _LEX_CACHE
+    with VECTORS.lock:
+        VECTORS.reload()
+        idx = LexIndex(db["live_chunks"], VECTORS.lexical)
+        if VECTORS.lexical is None or VECTORS.lexical.get("sig") != sig:
+            VECTORS.lexical = idx.payload()
+            VECTORS.save()
+    _LEX_CACHE = idx
+    return idx
+
+
+def refresh_lexical(live_chunks: list[dict[str, Any]]) -> None:
+    """Approval time: rebuild and persist the lexical index (caller holds VECTORS.lock and saves afterwards)."""
+    global _LEX_CACHE
+    idx = LexIndex(live_chunks)
+    VECTORS.lexical = idx.payload()
+    _LEX_CACHE = idx
+
+
+# ───────────────────────── Query analysis: key terms + glossary expansion ─────────────────────────
+
+@dataclass
+class KeyTerm:
+    surface: str
+    kind: str  # word | phrase | ident | qty | num
+    alts: list[frozenset[str]]  # matched when ANY alternative is fully contained; alts[0] is the question's own form
+    weight: float = 1.0
+
+
+@dataclass
+class QueryTerms:
+    keys: list[KeyTerm]
+    weights: dict[str, float]  # BM25 query term weights (own form 1.0, compound parts 0.8, glossary/typo alternatives 0.5)
+    unit_cues: set[str]
+
+
+def key_terms(question: str, view: RoleView) -> QueryTerms:
+    toks = _LEX.findall(fold(question))
+    items: list[KeyTerm] = []
+    cues: set[str] = set()
+    i, n = 0, len(toks)
+    while i < n:
+        t = toks[i]
+        if t[0].isdigit():
+            v = _num(t)
+            u = _unit_at(toks, i + 1)
+            if u:
+                items.append(KeyTerm(f"{t} {toks[i + 1]}", "qty", [frozenset({_qty(v, u)})]))
+                cues.add(_cue(u))
+                i += 2
+                continue
+            items.append(KeyTerm(t, "num", [frozenset({v})]))
+        elif t != "%":
+            if t in UNIT_CANON and len(t) > 3:
+                cues.add(_cue(UNIT_CANON[t]))
+            elif t in FREQ_WORDS:
+                items.append(KeyTerm(t, "word", [frozenset({cistem(t)}), frozenset({FREQ_WORDS[t]})]))
+            elif len(t) >= 2:
+                w = t
+                if w not in R_STOP and re.search(r"ae|oe|ue", w):  # "fuer", "Geschaeftsfuehrung" typed without umlauts
+                    alt = w.replace("ae", "a").replace("oe", "o").replace("ue", "u")
+                    if alt in R_STOP or cistem(alt) in view.df:
+                        w = alt
+                if w in R_STOP or (len(w) >= 5 and cistem(w) not in view.df  # typo of a function word ("wiviele")
+                                   and any(_edit_distance(w, s, 1) <= 1 for s in R_STOP if abs(len(s) - len(w)) <= 1 and len(s) >= 4)):
+                    i += 1
+                    continue
+                if i + 1 < n and toks[i + 1][0].isdigit() and not _unit_at(toks, i + 2):
+                    items.append(KeyTerm(f"{t} {toks[i + 1]}", "ident", [frozenset({w + _num(toks[i + 1])})]))
+                    i += 2
+                    continue
+                s = cistem(w)
+                alts = [frozenset({s})]
+                if len(w) >= 8:
+                    parts = view.vocab.split(w)
+                    if parts:
+                        alts.append(frozenset(cistem(p) for p in parts))
+                items.append(KeyTerm(t, "word", alts, 0.3 if w in GENERIC_WORDS else 1.0))
+        i += 1
+
+    # glossary: multi-word members first (consume consecutive word items), then single-term members
+    merged: list[KeyTerm] = []
+    k = 0
+    while k < len(items):
+        hit = None
+        for member, gi in GLOSSARY.multi:
+            span = len(member)
+            window = items[k : k + span]
+            if len(window) == span and all(x.kind == "word" for x in window) and {next(iter(x.alts[0])) for x in window} == set(member):
+                hit = (gi, window)
+                break
+        if hit:
+            gi, window = hit
+            merged.append(KeyTerm(" ".join(x.surface for x in window), "phrase", [frozenset().union(*(x.alts[0] for x in window))] + [m for m in GLOSSARY.groups[gi]]))
+            k += len(hit[1])
+            continue
+        merged.append(items[k])
+        k += 1
+    for it in merged:
+        if it.kind in ("word", "ident", "num"):
+            for gi in GLOSSARY.single.get(next(iter(it.alts[0])), []):
+                it.alts += [m for m in GLOSSARY.groups[gi] if m not in it.alts]
+        if it.kind == "word" and not any(all(x in view.df for x in a) for a in it.alts):
+            near = view.fuzzy(next(iter(it.alts[0])))
+            if near:
+                it.alts.append(frozenset({near}))
+                for gi in GLOSSARY.single.get(near, []):
+                    it.alts += [m for m in GLOSSARY.groups[gi] if m not in it.alts]
+
+    weights: dict[str, float] = {}
+    for it in merged:
+        own = it.alts[0]
+        it.weight *= sum(view.idf(x) for x in own) / len(own)
+        for a_i, alt in enumerate(it.alts):
+            w = (1.0 if a_i == 0 else 0.8 if (a_i == 1 and it.kind == "word" and len(alt) > 1) else 0.5) * (0.3 if it.surface in GENERIC_WORDS else 1.0)
+            for x in alt:
+                weights[x] = max(weights.get(x, 0.0), w)
+    return QueryTerms(merged, weights, cues)
+
+
+def coverage(qt: QueryTerms, terms: frozenset[str], ctx: frozenset[str] = frozenset()) -> float:
+    """Weighted share of the question's key terms present in `terms` (context-only matches — section/document title — count half)."""
+    total = sum(k.weight for k in qt.keys)
+    if total <= 0:
+        return 0.0
+    got = 0.0
+    for k in qt.keys:
+        if any(a <= terms for a in k.alts):
+            got += k.weight
+        elif any(a <= ctx for a in k.alts):
+            got += 0.5 * k.weight
+    return got / total
+
+
+# ───────────────────────── Dense retrieval + fusion ─────────────────────────
+
+_QVEC_CACHE: dict[tuple[str, str], np.ndarray] = {}
+_DB_CACHE: dict[str, Any] = {"key": None, "db": None}
+
+
+def reset_query_caches() -> None:
+    _QVEC_CACHE.clear()
+    _DB_CACHE.update(key=None, db=None)
+
+
+def cached_db() -> dict[str, Any]:
+    """Read-only DB view for queries; re-parsed only when the file's mtime/size changed."""
+    try:
+        st = DB_PATH.stat()
+        key = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        key = None
+    if key is None or key != _DB_CACHE["key"]:
+        _DB_CACHE.update(db=read_db(), key=key)
+    return _DB_CACHE["db"]
+
+
+def query_vectors(texts: list[str], eid: str) -> np.ndarray | None:
+    missing = [t for t in texts if (eid, t) not in _QVEC_CACHE]
+    if missing:
+        arr = EMBEDDER.embed(missing, "query", eid)
+        if arr is None:
+            return None
+        for t, v in zip(missing, arr):
+            if len(_QVEC_CACHE) > 2000:
+                _QVEC_CACHE.clear()
+            _QVEC_CACHE[(eid, t)] = v
+    return np.stack([_QVEC_CACHE[(eid, t)] for t in texts])
+
+
+def dense_scores(db: dict[str, Any], view: RoleView, texts: list[str]) -> dict[int, float] | None:
+    """Cosine of each allowed chunk (max over the query texts); None when no Ollama embedding model is available."""
+    if not OLLAMA.embed_model():
+        return None
+    eid, vecs = ensure_vectors(db)
+    if not eid.startswith("ollama:"):
+        return None
+    qm = query_vectors(texts, eid)
+    if qm is None:
+        return None
+    out: dict[int, float] = {}
+    for i in view.allowed:
+        v = vecs.get(view.idx.chunks[i]["id"])
+        if v is not None:
+            out[i] = float(np.max(qm @ v))
+    return out
+
+
+def fuse(view: RoleView, *scores: dict[int, float] | None) -> list[int]:
+    """Reciprocal rank fusion (k = 60); deterministic tie-break by chunk id."""
+    fused: dict[int, float] = defaultdict(float)
+    for sc in scores:
+        if not sc:
+            continue
+        ranking = sorted((i for i in sc if sc[i] > 0), key=lambda i: (-sc[i], view.idx.chunks[i]["id"]))
+        for r, i in enumerate(ranking):
+            fused[i] += 1.0 / (RRF_K + r + 1)
+    return sorted(fused, key=lambda i: (-fused[i], view.idx.chunks[i]["id"]))
+
+
+# ───────────────────────── Pipeline B: stateless compliance RAG ─────────────────────────
+
+NO_ANSWER = "Keine belegbare Antwort im freigegebenen Bestand."
+COV_MIN = float(os.getenv("COV_MIN", "0.5"))  # step-2 gate (replaced by the feature gate in step 5)
+QUERY_REWRITE = os.getenv("QUERY_REWRITE", "0") == "1"  # LLM rewrite only for the measurement in step 2
 
 REWRITE_SYSTEM = (
     "Du bist ein Query-Rewriter für ein Compliance-RAG-System. Du beantwortest NIEMALS Fragen. "
     "Formuliere die Nutzerfrage als eine einzige, eigenständige, explizite deutsche Suchanfrage zu Unternehmensrichtlinien um "
-    "und behalte alle Schlüsselbegriffe bei. Antworte NUR mit der Suchanfrage in einem Satz.\n"
-    "Beispiel 1: Frage: Darf ich Daten per USB-Stick mitnehmen? → Suchanfrage: Ist die Mitnahme vertraulicher Daten auf USB-Speichermedien laut Richtlinie zulässig?\n"
-    "Beispiel 2: Frage: Wie oft Backup? → Suchanfrage: In welchen Intervallen müssen Datensicherungen laut Backup-Richtlinie erstellt werden?"
+    "und behalte alle Schlüsselbegriffe bei. Antworte NUR mit der Suchanfrage in einem Satz."
 )
 ANSWER_SYSTEM = (
     "Du bist Pocket CISO, ein Compliance-Assistent. Beantworte die Frage in 1 bis 3 knappen deutschen Sätzen und verwende dafür "
@@ -1454,87 +2046,21 @@ ANSWER_SYSTEM = (
     "z. B. [C1]. Behandle jede Teilfrage vollständig, auch wenn dafür mehrere Kontext-Abschnitte nötig sind. "
     "Übernimm Zahlen, Rollen und Fristen exakt aus dem Kontext und füge nichts hinzu."
 )
-
-
 REFUSAL_RE = re.compile(r"^(ich kann|ich habe|leider|entschuldig|es tut mir leid|tut mir leid|als ki|sorry|i cannot|i can't)", re.I)
 
 
-def question_groups(text: str) -> list[list[str]]:
-    """Content-term groups (term + synonyms, as stems) used for lexical support checks."""
-    seen: set[str] = set()
-    groups: list[list[str]] = []
-    for t in tokenize(text):
-        key = stem(t)
-        if len(t) < 3 or t in STOP or t.isdigit() or key in seen:
-            continue
-        seen.add(key)
-        groups.append([stem(t)] + [stem(norm(x)) for x in SYN.get(t, [])])
-    return groups
-
-
-def query_hint(question: str) -> str:
-    """Add only high-confidence bilingual policy terms for known multilingual intents."""
-    if DISABLE_HINTS:
-        return ""
-    tokens = set(tokenize(question))
-    if {"penalty", "usb", "train"} <= tokens:
-        return "IAM Endgeräte Wechselmedien: USB-Datenträger Verlust im Zug Sanktionskatalog Abmahnung Kündigung Schadensersatz"
-    if {"usb", "flash", "drives"} <= tokens and any(t in tokens for t in ("blackout", "emergency", "keys", "pins")):
-        return "Business Impact Analyse: Notfall-USB-Datenträger feuerfester Tresor Rechenzentrum Raum RZ-02 Wiederherstellungsschlüssel"
-    if {"saas", "strictly", "confidential"} <= tokens and ("us" in tokens or "based" in tokens):
-        return "Cloud Security Policy: streng vertrauliche Kundendaten nicht in Public Cloud, US-Provider, EU-Standort, On-Premise"
-    if "rpo" in tokens and "tier" in tokens and "2" in tokens:
-        return "BCM Wiederanlaufmatrix: Tier 2 RTO 12 Stunden, RPO 1 Stunde, maximaler Datenverlust"
-    if {"critical", "risks"} <= tokens and any(t in tokens for t in ("accepts", "accept", "accepting", "who")):
-        return "Risikoakzeptanz-Richtlinie: kritische Restrisiken, CISO und Geschäftsführung, Risk Owner"
-    return ""
-
-
-def lexical_support(groups: list[list[str]], chunk: dict[str, Any]) -> float:
-    if not groups:
-        return 0.0
-    toks = {stem(t) for t in tokenize(f"{chunk['docName']} {chunk['section']} {chunk['content']}")}
-    return sum(1 for g in groups if any(x in toks for x in g)) / len(groups)
-
-
-def lexical_threshold(groups: list[list[str]]) -> float:
-    """Use a lower lexical share for multi-intent questions without weakening dense retrieval."""
-    if len(groups) >= 8:
-        return max(0.12, min(LEX_MIN, 2 / len(groups)))
-    return LEX_MIN
-
-
-def plausible_rewrite(question: str, line: str) -> bool:
-    """Small models sometimes answer/refuse instead of rewriting — keep only rewrites that preserve the question's terms."""
-    if REFUSAL_RE.match(line.strip()):
-        return False
-    groups = question_groups(question)
-    if not groups:
-        return True
-    keep = {stem(t) for t in tokenize(line)}
-    return sum(1 for g in groups if any(x in keep for x in g)) / len(groups) >= 0.5
-
-
-def rewrite_query(question: str) -> tuple[str, str]:
-    known = None if DISABLE_HINTS else REWRITES.get(" ".join(tokenize(question)))
-    hint = query_hint(question)
+def rewrite_query(question: str) -> str | None:
     out = OLLAMA.chat(REWRITE_SYSTEM, f"Frage: {question} → Suchanfrage:", timeout=REWRITE_TIMEOUT, max_tokens=80)
-    if out:
-        line = out.strip().splitlines()[0].strip().strip("\"'„“”` ")
-        line = re.sub(r"^(suchanfrage|antwort)\s*:\s*", "", line, flags=re.I)
-        if 8 <= len(line) <= 300 and plausible_rewrite(question, line):
-            return f"{line} ({hint})" if hint and hint.lower() not in line.lower() else line, "llm"
-    if known:
-        return f"{known} ({hint})" if hint else known, "rules"
-    kw = ", ".join(dict.fromkeys(content_stems(question)))
-    terms = ", ".join(x for x in (kw, hint) if x)
-    return f"Welche freigegebene Richtlinie regelt: „{question}“?" + (f" [Suchbegriffe: {terms}]" if terms else ""), "rules"
+    if not out:
+        return None
+    line = re.sub(r"^(suchanfrage|antwort)\s*:\s*", "", out.strip().splitlines()[0].strip().strip("\"'„“”` "), flags=re.I)
+    return line if 8 <= len(line) <= 300 and not REFUSAL_RE.match(line) else None
 
 
-def extractive_answer(question: str, ranked: list[tuple[dict[str, Any], float]]) -> list[dict[str, str]]:
+def extractive_answer(question: str, ranked: list[dict[str, Any]]) -> list[dict[str, str]]:
     q = set(content_stems(question))
     segs: list[dict[str, str]] = []
-    for i, (c, _s) in enumerate(ranked[:2]):
+    for i, c in enumerate(ranked[:2]):
         text = c["content"]
         if len(text) > 320:
             sents = split_sentences(text)
@@ -1564,9 +2090,7 @@ def parse_llm_answer(text: str, ctx: list[dict[str, Any]]) -> list[dict[str, str
     tail = cleaned[pos:].strip()
     if tail:
         segs.append({"type": "text", "text": (" " if segs else "") + tail})
-    if not any(s["type"] == "text" for s in segs):
-        return None
-    if not any(s["type"] == "cite" for s in segs):  # never show a source the model did not cite → caller falls back to the extractive answer
+    if not any(s["type"] == "text" for s in segs) or not any(s["type"] == "cite" for s in segs):
         return None
     return segs
 
@@ -1577,8 +2101,6 @@ PERMISSION_RE = re.compile(r"\b(darf|dürfen|kann|können|erlaubt|zulässig|gest
 
 
 def claim_mismatches(answer: str, sources: list[str]) -> list[str]:
-    """Cheap semantic guards the bag-of-words check cannot give: negation polarity, obligation↔permission swaps and
-    number↔unit pairing (30 attempts/3 minutes vs 3 attempts/30 minutes). Still heuristic — not a real entailment model."""
     src_sents = [x for t in sources for x in split_sentences(t)]
     src_q: dict[str, set[str]] = {}
     for t in sources:
@@ -1601,19 +2123,33 @@ def claim_mismatches(answer: str, sources: list[str]) -> list[str]:
 
 
 def nli_check(segments: list[dict[str, str]], chunks: dict[str, dict[str, Any]]) -> dict[str, Any]:
-    """Lexical grounding (named NLI in the UI): numbers must occur in the cited chunks, ≥ 60 % of content words must be supported,
-    and claim_mismatches() must find no polarity / modality / number-unit contradiction."""
-    answer = re.sub(r"§\s*\d+(?:\.\d+)*", "", " ".join(s["text"] for s in segments if s["type"] == "text"))  # section refs are citations, not claims
+    answer = re.sub(r"§\s*\d+(?:\.\d+)*", "", " ".join(s["text"] for s in segments if s["type"] == "text"))
     cited_chunks = [chunks[s["chunkId"]] for s in segments if s["type"] == "cite" and s["chunkId"] in chunks]
     cited = [c["content"] for c in cited_chunks]
     ctx = " ".join(cited + [f"{c['docName']} {c['section']}" for c in cited_chunks])
     unsupported = sorted(numbers_of(answer) - numbers_of(ctx))
     a_stems, c_stems = content_stems(answer), set(content_stems(ctx))
-    coverage = (sum(1 for s in a_stems if s in c_stems) / len(a_stems)) if a_stems else 1.0
-    thin = len(a_stems) < 2  # "Nein." / "Ja." are unverifiable claims
+    cov = (sum(1 for s in a_stems if s in c_stems) / len(a_stems)) if a_stems else 1.0
     mismatches = claim_mismatches(answer, cited) if cited else []
-    return {"verified": bool(cited) and not thin and not unsupported and not mismatches and coverage >= 0.6,
-            "unsupportedNumbers": unsupported, "mismatches": mismatches, "coverage": round(coverage, 2)}
+    return {"verified": bool(cited) and len(a_stems) >= 2 and not unsupported and not mismatches and cov >= 0.6,
+            "unsupportedNumbers": unsupported, "mismatches": mismatches, "coverage": round(cov, 2)}
+
+
+def _restricted_match(db: dict[str, Any], role: str, question: str) -> dict[str, Any] | None:
+    """Audit only (RBAC_DENIED): would a chunk above the caller's clearance have answered? Never influences the response."""
+    if role == "L3":
+        return None
+    idx = lexical_index(db)
+    full = idx.view("L3")
+    restricted = {i for i in full.allowed if ROLE_RANK[idx.chunks[i]["minRole"]] > ROLE_RANK[role]}
+    if not restricted:
+        return None
+    qt = key_terms(question, full)
+    bm = {i: s for i, s in full.bm25(qt.weights).items() if i in restricted}
+    for i in sorted(bm, key=lambda i: (-bm[i], idx.chunks[i]["id"]))[:3]:
+        if coverage(qt, frozenset(idx.doc_terms[i]), idx.ctx_terms[i]) >= COV_MIN:
+            return idx.chunks[i]
+    return None
 
 
 def run_query(token: str | None, question: str) -> dict[str, Any]:
@@ -1622,105 +2158,82 @@ def run_query(token: str | None, question: str) -> dict[str, Any]:
     if not 3 <= len(q) <= 500:
         raise ApiError(400, "BAD_QUESTION", "Die Frage muss zwischen 3 und 500 Zeichen lang sein.")
     lat: dict[str, int] = {}
-    db = read_db()
+    db = cached_db()
     actor = actor_for(db, token)
     role = actor["role"]
 
-    # Step 1 — isolated query rewrite (no history exists anywhere in this function by design)
     t = time.perf_counter()
-    rewrite, rewrite_by = rewrite_query(q)
+    rewrite = rewrite_query(q) if QUERY_REWRITE and OLLAMA.llm_model() else None
     lat["rewrite"] = int((time.perf_counter() - t) * 1000)
 
-    # Step 2 — RBAC pre-filter BEFORE ranking
     t = time.perf_counter()
-    live = db["live_chunks"]
-    accessible = [c for c in live if ROLE_RANK[c["minRole"]] <= ROLE_RANK[role]]
-    restricted = [c for c in live if ROLE_RANK[c["minRole"]] > ROLE_RANK[role]]
+    idx = lexical_index(db)
+    view = idx.view(role)  # RBAC pre-filter before any scoring
     lat["rbac"] = int((time.perf_counter() - t) * 1000)
 
-    # Step 3 — hybrid retrieval: dense cosine (original ∨ rewrite) gated by lexical support, then threshold gate
     t = time.perf_counter()
-    eid, vecs = ensure_vectors(db)
-    qm = EMBEDDER.embed([q, rewrite], "query", eid)
-    if qm is None:  # Ollama went away between sync and query
-        eid, vecs = ensure_vectors(db, force_hash=True)
-        qm = EMBEDDER.embed([q, rewrite], "query", eid)
-    prm = params_for(eid)
-    thr = prm["min_score"]
-    groups = question_groups(q + " " + query_hint(q))
-
-    def rank(chunks: list[dict[str, Any]]) -> list[tuple[dict[str, Any], float, float]]:
-        rows = [(c, float(np.max(qm @ vecs[c["id"]])), lexical_support(groups, c)) for c in chunks if c["id"] in vecs]
-        return sorted(rows, key=lambda r: -(r[1] + 0.15 * r[2]))
-
-    lex_thr = lexical_threshold(groups)
-
-    def passes(row: tuple[dict[str, Any], float, float]) -> bool:
-        return row[1] >= thr and row[2] >= lex_thr
-
-    acc, res = rank(accessible), rank(restricted)
-    ok_acc = [r for r in acc if passes(r)]
-    ok_res = [r for r in res if passes(r)]
-    best = ok_acc[0][1] if ok_acc else (max((r[1] for r in acc), default=0.0))
+    qt = key_terms(q, view)
+    weights = dict(qt.weights)
+    if rewrite:
+        for x, w in key_terms(rewrite, view).weights.items():
+            weights[x] = max(weights.get(x, 0.0), 0.5 * w)
+    bm = view.bm25(weights)
+    dense = dense_scores(db, view, [q] + ([rewrite] if rewrite else []))
+    ranked = fuse(view, bm, dense)[:8]
+    covs = {i: coverage(qt, frozenset(idx.doc_terms[i]), idx.ctx_terms[i]) for i in ranked}
+    top = ranked[:4]
+    best_cov = max((covs[i] for i in top), default=0.0)
+    dense_top = max((dense[i] for i in top), default=0.0) if dense else None
     lat["retrieval"] = int((time.perf_counter() - t) * 1000)
-    label = engine_label(eid)
-    trace = {
-        "original": q, "rewrite": rewrite, "rbacFilter": f"min_role <= {role}", "searched": len(accessible), "total": len(live),
-        "nliVerified": False, "temperature": 0.0, "confidence": 0.0, "topScore": round(best, 3), "latencyMs": lat,
-        "engineMode": label, "rewriteBy": rewrite_by, "answerBy": "none",
+    label = engine_label()
+    trace: dict[str, Any] = {
+        "original": q, "rewrite": rewrite or q, "rbacFilter": f"min_role <= {role}", "searched": view.n, "total": len(idx.chunks),
+        "nliVerified": False, "temperature": 0.0, "confidence": 0.0, "topScore": 0.0, "latencyMs": lat, "engineMode": label,
+        "rewriteBy": "llm" if rewrite else "none", "answerBy": "none", "coverage": round(best_cov, 3),
+        "denseTop": round(dense_top, 3) if dense_top is not None else None, "bm25Top": round(max((bm[i] for i in top if i in bm), default=0.0), 3),
+        "candidateDocs": [idx.chunks[i]["docName"] for i in ranked],
     }
 
-    def done(kind: str, segments: list[dict[str, str]], citations: dict[str, Any], scores: dict[str, float], required: str | None = None) -> dict[str, Any]:
+    def done(kind: str, segments: list[dict[str, str]], citations: dict[str, Any], scores: dict[str, float]) -> dict[str, Any]:
         lat["total"] = int((time.perf_counter() - t_all) * 1000)
         plain = " ".join(s["text"].strip() for s in segments if s["type"] == "text")
-        telemetry = {
-            "rewrittenQuery": rewrite, "rbacFilter": trace["rbacFilter"], "topScore": trace["topScore"], "nliVerified": trace["nliVerified"],
-            "latencyMs": lat, "engineMode": label, "rbacDenied": kind == "denied", "requiredRole": required,
-        }
-        return {"ok": True, "result": {"kind": kind, "requiredRole": required, "segments": segments, "citations": citations, "scores": scores, "trace": trace},
+        telemetry = {"rewrittenQuery": trace["rewrite"], "rbacFilter": trace["rbacFilter"], "topScore": trace["topScore"], "nliVerified": trace["nliVerified"],
+                     "latencyMs": lat, "engineMode": label, "rbacDenied": False, "requiredRole": None}
+        return {"ok": True, "result": {"kind": kind, "requiredRole": None, "segments": segments, "citations": citations, "scores": scores, "trace": trace},
                 "answer": plain, "citations": list(citations.values()), "telemetry": telemetry}
 
-    if not ok_acc and ok_res:
-        with locked_db() as dbw:
-            append_denial(dbw, actor["email"], role, "RBAC_DENIED", ok_res[0][0]["docName"], f"Retrieval erfordert {ok_res[0][0]['minRole']}")
-        trace["topScore"] = 0.0
-        return done("fallback", [{"type": "text", "text": NO_ANSWER}], {}, {}, None)  # indistinguishable from "no match" (no existence oracle)
-
-    if not ok_acc:
-        trace.update({"confidence": round(best, 2), "retrievalScore": round(best, 3), "verification": "none"})
+    answerable = bool(top) and best_cov >= COV_MIN and (dense_top is None or dense_top >= PARAMS["ollama"]["min_score"])
+    if not answerable:
+        hidden = _restricted_match(db, role, q)
+        if hidden:
+            with locked_db() as dbw:
+                append_denial(dbw, actor["email"], role, "RBAC_DENIED", hidden["docName"], f"Retrieval erfordert {hidden['minRole']}")
+        trace.update({"verification": "none", "candidateDocs": trace["candidateDocs"] if view.n else []})
         return done("fallback", [{"type": "text", "text": NO_ANSWER}], {}, {})
 
-    # Step 4 — grounded generation (temp 0.0) + NLI verification
     t = time.perf_counter()
-    # Multi-intent questions often need one chunk per sub-question (for example,
-    # assessment + approval authority). Keep the strongest grounded candidates
-    # instead of requiring every answer fact to live in the top chunk.
-    top = [(c, d) for c, d, _lx in ok_acc[:4]]
-    ctx = [c for c, _ in top]
+    ctx = [idx.chunks[i] for i in top if covs[i] >= COV_MIN * 0.6]
     segments: list[dict[str, str]] | None = None
     answer_by = "rules"
-    prompt = "Kontext:\n" + "\n".join(f"[C{i + 1}] {c['docName']} {c['section']}: {c['content']}" for i, c in enumerate(ctx)) + f"\n\nFrage: {q}\nAntwort:"
-    llm_out = OLLAMA.chat(ANSWER_SYSTEM, prompt, timeout=LLM_TIMEOUT, max_tokens=260)
-    if llm_out and "KEINE_ANTWORT" not in llm_out.upper():
-        segments, answer_by = parse_llm_answer(llm_out, ctx), "llm"
+    llm_out = None
+    if OLLAMA.llm_model():
+        prompt = "Kontext:\n" + "\n".join(f"[C{k + 1}] {c['docName']} {c['section']}: {c['content']}" for k, c in enumerate(ctx)) + f"\n\nFrage: {q}\nAntwort:"
+        llm_out = OLLAMA.chat(ANSWER_SYSTEM, prompt, timeout=LLM_TIMEOUT, max_tokens=260)
+        if llm_out:
+            segments, answer_by = parse_llm_answer(llm_out, ctx), "llm"
     lat["generation"] = int((time.perf_counter() - t) * 1000)
-
     t = time.perf_counter()
     by_id = {c["id"]: c for c in ctx}
     nli = nli_check(segments, by_id) if segments else {"verified": False}
-    if not nli["verified"]:  # hallucination guard: replace with the guaranteed-grounded extractive answer
-        segments, answer_by = extractive_answer(q + " " + rewrite, top), "rules" if not llm_out else "rules (NLI-Fallback)"
+    if not nli["verified"]:
+        segments, answer_by = extractive_answer(q, ctx), "rules" if not llm_out else "rules (NLI-Fallback)"
         nli = nli_check(segments, by_id)
     lat["nli"] = int((time.perf_counter() - t) * 1000)
-
     cited_ids = list(dict.fromkeys(s["chunkId"] for s in segments if s["type"] == "cite"))
-    scores = {c["id"]: round(s, 3) for c, s in top if c["id"] in cited_ids}
-    citations = {i: by_id[i] for i in cited_ids if i in by_id}
-    trace.update({
-        "nliVerified": bool(nli["verified"]), "confidence": round(best, 2), "retrievalScore": round(best, 3),
-        "lexicalSupport": round(ok_acc[0][2], 2), "verification": "lexical-nli", "answerBy": answer_by,
-    })
-    return done("answer", segments, citations, scores)
+    score_of = {idx.chunks[i]["id"]: (dense[i] if dense else covs[i]) for i in top}
+    trace.update({"nliVerified": bool(nli["verified"]), "confidence": round(best_cov, 2), "retrievalScore": round(dense_top if dense_top is not None else best_cov, 3),
+                  "topScore": round(dense_top if dense_top is not None else best_cov, 3), "lexicalSupport": round(best_cov, 2), "verification": "lexical-nli", "answerBy": answer_by})
+    return done("answer", segments, {i: by_id[i] for i in cited_ids if i in by_id}, {i: round(score_of.get(i, 0.0), 3) for i in cited_ids})
 
 
 # ───────────────────────── Health ─────────────────────────

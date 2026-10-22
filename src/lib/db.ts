@@ -2,7 +2,7 @@
 // Zero native deps: fs/promises + path + crypto. Every public function is one atomic transaction
 // and maps 1:1 to an /api/v1 action (→ future FastAPI endpoint).
 
-import { promises as fs } from "fs";
+import { promises as fs, readFileSync } from "fs";
 import path from "path";
 import crypto from "crypto";
 import {
@@ -584,59 +584,24 @@ const STOP = new Set(
     "a an and are as at be been being but by can does for from have how i if in is it may my of on or our the their them these they this to us was we what who with").split(" ")
 );
 
-const SYN: Record<string, string[]> = {
-  zug: ["bahn", "offentlich", "verkehrsmittel", "personenverkehr"],
-  bahn: ["zug", "offentlich", "verkehrsmittel"],
-  unterwegs: ["offentlich", "bahn", "mobile"],
-  homeoffice: ["mobile", "remote"],
-  kennwort: ["passwort"],
-  vorfall: ["sicherheitsvorfall", "incident"],
-  incident: ["sicherheitsvorfall", "vorfall"],
-  gemeldet: ["melden", "meldung", "meldepflicht"],
-  melden: ["meldung", "meldepflicht"],
-  meldung: ["melden", "meldepflicht"],
-  meldepflicht: ["melden", "meldung"],
-  assessment: ["risikobewertung", "risikoanalyse", "vendor", "prufung"],
-  risikobewertung: ["assessment", "risikoanalyse"],
-  restrisiken: ["risikoakzeptanz", "akzeptanz", "risk owner"],
-  restrisiko: ["risikoakzeptanz", "akzeptanz", "risk owner"],
-  absegnen: ["akzeptieren", "genehmigen", "freigeben", "signoff"],
-  ransomware: ["cyberangriff", "sicherheitsvorfall", "verschlusselung"],
-  krisenstab: ["krisenmanagement", "ciso", "geschaftsfuhrung"],
-  erstmeldung: ["fruhwarnung", "meldung", "meldepflicht"],
-  allowed: ["zulass", "erlaub", "genehmigt"],
-  based: ["sitz", "standort"],
-  saas: ["cloud", "dienst"],
-  application: ["anwendung", "cloud"],
-  store: ["speich", "ableg"],
-  process: ["verarbeit"],
-  strictly: ["streng"],
-  confidential: ["vertraulich"],
-  customer: ["kund"],
-  data: ["daten"],
-  primary: ["primar", "kritisch"],
-  systems: ["system"],
-  cyberattack: ["cyberangriff"],
-  maximum: ["maximal"],
-  acceptable: ["zulass"],
-  loss: ["verlust"],
-  restore: ["wiederherstell"],
-  operations: ["betrieb"],
-  accepts: ["akzept", "genehmig"],
-  critical: ["kritisch"],
-  risks: ["risiko", "restrisiko"],
-};
-
-const REWRITES: Record<string, string> = {
-  [tokenize("Darf ich das auch im Zug machen?").join(" ")]:
-    "Ist das Arbeiten mit vertraulichen Daten im öffentlichen Personenverkehr (Zug) laut Mobile-Work-Policy erlaubt?",
-  [tokenize("Wie lang muss mein Passwort sein?").join(" ")]:
-    "Welche Mindestlänge und welche Wechselintervalle gelten laut aktueller Passwort-Policy für Benutzerpasswörter?",
-  [tokenize("Bis wann muss ein Sicherheitsvorfall nach NIS-2 gemeldet werden?").join(" ")]:
-    "Welche Meldefristen gelten für erhebliche Sicherheitsvorfälle gegenüber dem BSI gemäß NIS-2 und Incident-Response-Runbook?",
-  [tokenize("Darf ich private KI-Tools wie ChatGPT für Kundenangebote nutzen?").join(" ")]:
-    "Ist die Nutzung nicht freigegebener generativer KI-Dienste zur Verarbeitung von Kundendaten laut Unternehmensrichtlinie erlaubt?",
-};
+// General domain glossary shared with the Python engine (backend/glossary.json): German/English pairs and abbreviations.
+// Each single-word member expands to the other single-word members of its group (no question-specific hints).
+let glossaryCache: Map<string, string[]> | null = null;
+function glossary(): Map<string, string[]> {
+  if (glossaryCache) return glossaryCache;
+  const map = new Map<string, string[]>();
+  try {
+    const raw = JSON.parse(readFileSync(path.join(process.cwd(), "backend", "glossary.json"), "utf8")) as { groups?: string[][] };
+    for (const group of raw.groups ?? []) {
+      const words = group.map((m) => tokenize(m)).filter((t) => t.length === 1).map((t) => t[0]);
+      for (const w of words) map.set(w, [...new Set([...(map.get(w) ?? []), ...words.filter((x) => x !== w)])]);
+    }
+  } catch {
+    // no glossary → plain keyword matching
+  }
+  glossaryCache = map;
+  return map;
+}
 
 const tokMatch = (a: string, b: string) => a === b || (a.length >= 7 && b.length >= 7 && a.slice(0, 7) === b.slice(0, 7));
 
@@ -647,30 +612,9 @@ function queryGroups(q: string): string[][] {
     const key = t.length >= 7 ? t.slice(0, 7) : t;
     if (t.length < 3 || STOP.has(t) || /^\d+$/.test(t) || seen.has(key)) continue;
     seen.add(key);
-    groups.push([t, ...(SYN[t] ?? []).map(norm)]);
+    groups.push([t, ...(glossary().get(t) ?? [])]);
   }
   return groups;
-}
-
-function queryHint(q: string): string {
-  if (process.env.POCKET_CISO_DISABLE_HINTS === "1") return ""; // evaluation switch (see backend/rag_engine.py)
-  const tokens = new Set(tokenize(q));
-  if (["penalty", "usb", "train"].every((token) => tokens.has(token))) {
-    return "IAM Endgeräte Wechselmedien USB Datenträger Verlust Zug Sanktionskatalog Abmahnung Kündigung Schadensersatz";
-  }
-  if (["usb", "flash", "drives"].every((token) => tokens.has(token)) && ["blackout", "emergency", "keys", "pins"].some((token) => tokens.has(token))) {
-    return "Business Impact Analyse Notfall USB Datenträger feuerfester Tresor Rechenzentrum Raum RZ 02 Wiederherstellungsschlüssel";
-  }
-  if (tokens.has("saas") && tokens.has("strictly") && tokens.has("confidential") && (tokens.has("us") || tokens.has("based"))) {
-    return "Cloud Security Policy streng vertrauliche Kundendaten Public Cloud US Provider EU Standort On Premise";
-  }
-  if (tokens.has("rpo") && tokens.has("tier") && tokens.has("2")) {
-    return "BCM Wiederanlaufmatrix Tier 2 RTO 12 Stunden RPO 1 Stunde maximaler Datenverlust";
-  }
-  if (tokens.has("critical") && tokens.has("risks") && (tokens.has("accepts") || tokens.has("accept") || tokens.has("who"))) {
-    return "Risikoakzeptanz Richtlinie kritische Restrisiken CISO Geschäftsführung Risk Owner";
-  }
-  return "";
 }
 
 function coverage(groups: string[][], c: LiveChunk): number {
@@ -691,11 +635,8 @@ export function runQuery(token: string | null, question: string): Promise<R<{ re
     const a = actorFor(db, token);
 
     // 1 — isolated rewrite (no history exists in this function by design)
-    const hint = queryHint(q);
-    const groups = queryGroups(`${q} ${hint}`);
-    const rewrite =
-      (process.env.POCKET_CISO_DISABLE_HINTS === "1" ? undefined : REWRITES[tokenize(q).join(" ")]) ??
-      `Welche freigegebene Richtlinie regelt: „${q}“?${groups.length ? ` [Suchbegriffe: ${groups.map((x) => x[0]).join(", ")}]` : ""}`;
+    const groups = queryGroups(q);
+    const rewrite = `Welche freigegebene Richtlinie regelt: „${q}“?${groups.length ? ` [Suchbegriffe: ${groups.map((x) => x[0]).join(", ")}]` : ""}`;
     const tRewrite = ms(tStart);
 
     // 2 — RBAC pre-filter before ranking
