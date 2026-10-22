@@ -306,11 +306,11 @@ class Windows(unittest.TestCase):
 
 
 @contextmanager
-def stub_llm(judge: str | None = "JA", pair: str | None = "JA"):
-    """Deterministic stand-in for Ollama: the answerability judge replies `judge`, the contradiction pair judge `pair`
-    (None = no reply), phrasing never replies, so answers stay verbatim."""
+def stub_llm(judge: str | None = "JA"):
+    """Deterministic stand-in for Ollama: the answerability judge replies `judge` (None = no reply), phrasing never
+    replies, so answers stay verbatim."""
     def chat(system: str, user: str, **_: object) -> str | None:
-        return judge if system == rag.JUDGE_SYSTEM else pair if system == rag.PAIR_SYSTEM else None
+        return judge if system == rag.JUDGE_SYSTEM else None
     with mock.patch.object(rag.OLLAMA, "llm_model", return_value="stub"), mock.patch.object(rag.OLLAMA, "chat", side_effect=chat):
         yield
 
@@ -438,17 +438,64 @@ class FactsAndContradictions(unittest.TestCase):
         self.assertIn("3 Stunden", res["answer"])
         self.assertEqual({v["docName"] for v in tr["contradictionValues"]}, {"Hallenordnung.md", "Reinigungsplan.md"})
 
-    def test_pair_judge_no_means_no_flag(self) -> None:
-        for pair in ("NEIN", None):
-            with stub_llm(pair=pair):
+    def test_contradiction_is_deterministic_without_llm(self) -> None:
+        for judge in ("NEIN", None):
+            with stub_llm(judge):
                 res = rag.run_query(token("L2"), "Wie lange dauert die Reinigung der Halle 2?")
-            self.assertFalse(res["result"]["trace"]["contradiction"])
+            self.assertTrue(res["result"]["trace"]["contradiction"])
+        res = rag.run_query(token("L2"), "Wie lange dauert die Reinigung der Halle 2?")  # no LLM at all
+        self.assertEqual(res["result"]["kind"], "search")
+        self.assertIn("(Wert: 2 Stunden)", res["answer"])
+        self.assertIn("(Wert: 3 Stunden)", res["answer"])
+
+    def test_large_document_does_not_hide_other_documents(self) -> None:
+        # eleven sections of one document outrank the second document
+        big = [("Lagerhandbuch.md", f"§{n} Paletten {n}", "L2", f"Paletten im Lager dürfen hoch gestapelt werden, wenn Paletten im Lager der Zone {z} hoch gestapelt geprüft sind.") for n, z in enumerate("ABCDEFGHIJK", 1)]
+        fresh_db(big + [("Lagerhandbuch.md", "§20 Höhe", "L2", "Paletten im Lager dürfen höchstens 3 Meter hoch gestapelt werden."),
+                        ("Brandschutzordnung.md", "§4 Lager", "L2", "Paletten im Lager dürfen höchstens 2 Meter hoch gestapelt werden.")])
+        rag._LEX_CACHE = None
+        res = rag.run_query(token("L2"), "Wie hoch dürfen Paletten im Lager gestapelt werden?")
+        self.assertTrue(res["result"]["trace"]["contradiction"])
+        self.assertEqual({v["docName"] for v in res["result"]["trace"]["contradictionValues"]}, {"Lagerhandbuch.md", "Brandschutzordnung.md"})
+        idx = rag.lexical_index(rag.read_db())
+        other = next(i for i, c in enumerate(idx.chunks) if c["docName"] == "Brandschutzordnung.md")
+        fused = [i for i in range(len(idx.chunks)) if i != other] + [other]  # other document ranked last
+        cand = rag.diversify(idx, fused)
+        self.assertIn(other, cand)
+        self.assertLessEqual(sum(idx.chunks[i]["docName"] == "Lagerhandbuch.md" for i in cand), rag.CAND_PER_DOC)
 
     def test_document_named_in_question_is_not_contradicted(self) -> None:
         with stub_llm():
             res = rag.run_query(token("L2"), "Wie lange dauert die Reinigung der Halle 2 laut Reinigungsplan?")
         self.assertFalse(res["result"]["trace"]["contradiction"])
         self.assertEqual([c["docName"] for c in res["citations"]], ["Reinigungsplan.md"])
+
+    def test_row_with_several_values_and_no_asked_column_is_not_compared(self) -> None:
+        fresh_db([("Lüftungsplan.md", "§1 Lüftung", "L2", "Die Halle 5 wird halbjährlich gelüftet."),
+                  ("Hallenplan.md", "§1 Hallen", "L2", "Tabelle [§1 Hallen]: Bereich: Halle 5 gelüftet | Aufbau: 2 Stunden | Abbau: 1 Stunde.")])
+        rag._LEX_CACHE = None
+        res = rag.run_query(token("L2"), "Wie oft wird die Halle 5 gelüftet?")
+        self.assertFalse(res["result"]["trace"]["contradiction"])  # which of 2 h / 1 h would answer "wie oft"? neither
+
+    def test_interval_and_duration_are_not_compared(self) -> None:
+        fresh_db([("Übungsplan.md", "§1 Übungen", "L2", "Die Räumungsübung der Halle 7 findet halbjährlich statt."),
+                  ("Räumungskonzept.md", "§2 Räumung", "L2", "Die Räumungsübung der Halle 7 dauert 2 Stunden.")])
+        rag._LEX_CACHE = None
+        self.assertEqual(rag.values_in("halbjährlich")[0][1], rag.values_in("6 Monate")[0][1])  # same minutes, different meaning
+        res = rag.run_query(token("L2"), "Wie oft findet die Räumungsübung der Halle 7 statt?")
+        self.assertFalse(res["result"]["trace"]["contradiction"])
+        fresh_db([("Übungsplan.md", "§1 Übungen", "L2", "Die Räumungsübung der Halle 7 findet halbjährlich statt."),
+                  ("Räumungskonzept.md", "§2 Räumung", "L2", "Die Räumungsübung der Halle 7 findet alle 12 Monate statt.")])
+        rag._LEX_CACHE = None
+        self.assertTrue(rag.run_query(token("L2"), "Wie oft findet die Räumungsübung der Halle 7 statt?")["result"]["trace"]["contradiction"])
+
+    def test_document_named_with_laut_keeps_windows_in_that_document(self) -> None:
+        fresh_db([("Hallenordnung.md", "§1 Zeiten", "L2", "Die Hallenordnung-Prüfung der Halle 2 erfolgt durch das Hallen-Team."),
+                  ("Reinigungsplan.md", "§1 Reinigung", "L2", "Die Prüfung der Halle 2 erfolgt durch das Reinigungsteam.")])
+        rag._LEX_CACHE = None
+        with stub_llm("JA"):
+            res = rag.run_query(token("L2"), "Wer prüft laut Hallenordnung die Halle 2?")
+        self.assertEqual({c["docName"] for c in res["citations"]}, {"Hallenordnung.md"})
 
     def test_other_column_values_are_not_compared(self) -> None:
         with stub_llm():

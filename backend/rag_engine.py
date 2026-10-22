@@ -2149,6 +2149,24 @@ def fuse(view: RoleView, *scores: dict[int, float] | None) -> list[int]:
     return sorted(fused, key=lambda i: (-fused[i], view.idx.chunks[i]["id"]))
 
 
+CAND_K, CAND_PER_DOC = 12, 3
+
+
+def diversify(idx: "LexIndex", fused: list[int], k: int = CAND_K, per_doc: int = CAND_PER_DOC) -> list[int]:
+    """Candidates diversified by document (class 5): fused order, at most `per_doc` chunks per document, `k` in total, so a
+    large document on the topic cannot push other documents (and their contradicting values) out of the candidate list."""
+    out: list[int] = []
+    n: Counter[str] = Counter()
+    for i in fused:
+        d = idx.chunks[i]["docName"]
+        if n[d] < per_doc:
+            out.append(i)
+            n[d] += 1
+            if len(out) >= k:
+                break
+    return out
+
+
 # ───────────────────────── Pipeline B: stateless compliance RAG (extract first, verify every sentence) ─────────────────────────
 
 NO_ANSWER = "Keine belegbare Antwort im freigegebenen Bestand."
@@ -2350,6 +2368,17 @@ def fact_chunks(idx: "LexIndex", view: RoleView, part: Part, limit: int = 6) -> 
     return out
 
 
+DOC_REF = re.compile(r"\b(?:laut|gemass|according to|as per)\s+(?:der|dem|den|des|die|das|the|our|unserer?|unserem)?\s*([a-z0-9-]+)")
+
+
+def doc_refs(part: Part, terms: frozenset[str], ctx: frozenset[str]) -> list[KeyTerm]:
+    """Key terms naming the selected window's document: found only in its section/document title, or introduced as a
+    source in the question ("laut BIA", "gemäß BCM-Matrix", "according to the playbook") and present in that title."""
+    named = {w for m in DOC_REF.finditer(fold(part.text)) for w in m.group(1).split("-")}
+    return [kt for kt in part.qt.keys if kt.weight > 0 and any(a <= ctx for a in kt.alts)
+            and (not any(a <= terms for a in kt.alts) or kt.surface in named)]
+
+
 def select_windows(idx: "LexIndex", view: RoleView, part: Part, ranked: list[int]) -> None:
     rank_of = {i: r for r, i in enumerate(ranked)}
     cands = span_windows(idx, view, ranked)
@@ -2381,9 +2410,12 @@ def select_windows(idx: "LexIndex", view: RoleView, part: Part, ranked: list[int
     got = window_terms(idx, first)
     base = coverage(part.qt, got, idx.ctx_terms[first[-1][0]])
     doc = idx.chunks[first[-1][0]]["docName"]
+    refs = doc_refs(part, got, idx.ctx_terms[first[-1][0]])
     for w in good[1:]:
         if set(w) & set(first):
             continue
+        if any(not any(a <= window_terms(idx, w) | idx.ctx_terms[w[-1][0]] for a in kt.alts) for kt in refs):
+            continue  # the question names the selected document ("laut BIA"): no window from a document it does not name
         gain = coverage(part.qt, got | window_terms(idx, w)) - coverage(part.qt, got)
         close = idx.section_key[w[-1][0]] != idx.section_key[first[-1][0]] and \
             coverage(part.qt, window_terms(idx, w), idx.ctx_terms[w[-1][0]]) >= 0.9 * base
@@ -2433,20 +2465,7 @@ def judge_answerable(question: str, spans: list[str]) -> bool | None:
     return None if out is None else fold(out).startswith("ja")
 
 
-PAIR_SYSTEM = (
-    "Du prüfst zwei Textstellen auf einen Widerspruch bei der gefragten Größe. Antworte nur mit JA oder NEIN. "
-    "JA: beide Stellen nennen einen Wert für die Größe, nach der die Frage fragt, und die Werte sind verschieden. "
-    "NEIN: gleiche Werte, oder eine Stelle behandelt eine andere Größe oder einen anderen Gegenstand."
-)
-CONTRADICTION_LABEL = "Mögliche Widersprüche im Bestand – nicht als Antwort bestätigt"
-
-
-def judge_pair(question: str, a: list[str], b: list[str]) -> bool:
-    """Pair judge for contradictions (temp 0, seed 7): do both windows give different values for the quantity asked about?
-    No reply = NEIN."""
-    out = OLLAMA.chat(PAIR_SYSTEM, "Frage: " + question + "\nStelle A: " + " ".join(a) + "\nStelle B: " + " ".join(b) + "\nAntwort (JA/NEIN):",
-                      timeout=LLM_TIMEOUT, max_tokens=3)
-    return out is not None and fold(out).startswith("ja")
+CONTRADICTION_LABEL = "Mögliche Widersprüche – nicht als Antwort bestätigt"
 
 
 @dataclass
@@ -2610,7 +2629,7 @@ def run_query(token: str | None, question: str) -> dict[str, Any]:
             weights[x] = max(weights.get(x, 0.0), w)
         bm = view.bm25(weights)
         dense = dense_scores(db, view, [ptext]) if dense_all is not None else None
-        ranked = fuse(view, bm, dense)[:8]
+        ranked = diversify(idx, fuse(view, bm, dense))
         if part.value:  # exact facts first: chunks with a matching fact join the candidates even outside the fused top-k
             ranked += [i for i in fact_chunks(idx, view, part) if i not in ranked]
         candidate_docs += [idx.chunks[i]["docName"] for i in ranked]
@@ -2635,13 +2654,9 @@ def run_query(token: str | None, question: str) -> dict[str, Any]:
         part.capped_only = part.lexical_ok and raw_total > total_w and (total_w - sum(unmatched)) < GATE_COVERAGE * raw_total
         if part.lexical_ok:
             # a contradiction is reported only when the judge confirms every listed window on its own (no new false flags)
-            found = find_contradiction(idx, view, part, ranked) if use_llm else []
-            if found:  # the pair judge must confirm each window against the selected one; a contradiction is never an answer
-                win_text = lambda w: [idx.span_text[i][k] for i, k in w]
-                confirmed = [(w, v) for w, v in found[1:] if judge_pair(ptext, win_text(found[0][0]), win_text(w))]
-                if confirmed:
-                    part.contradiction = [found[0]] + confirmed
-            if use_llm:
+            # deterministic contradiction rule (step 4, same with and without LLM): never an answer, shown as search hits
+            part.contradiction = find_contradiction(idx, view, part, ranked) or None
+            if use_llm and not part.contradiction:
                 part.features["judge"] = judge_answerable(ptext + ctx_note, [idx.span_text[i][k] for w in part.windows for i, k in w][:6])
         # dense path: below the lexical floor, or the judge rejected the lexical window and the best dense chunk is another one
         lex_rejected = part.lexical_ok and part.features.get("judge") is False and not part.contradiction
@@ -2702,11 +2717,13 @@ def run_query(token: str | None, question: str) -> dict[str, Any]:
         segments: list[dict[str, str]] = [{"type": "text", "text": CONTRADICTION_LABEL + ":"}]
         hits = []
         for p in conflicts:
-            for w, _ in p.contradiction:
+            for w, vals in p.contradiction:
                 c = idx.chunks[w[-1][0]]
                 text = " ".join(display_span(idx.span_text[i][k]) for i, k in w)
-                segments += [{"type": "text", "text": f" {c['docName']} {c['section'].split(' ')[0]}: {text} "}, {"type": "cite", "chunkId": c["id"]}]
-                hits.append({"chunkId": c["id"], "docName": c["docName"], "section": c["section"], "content": text})
+                shown = list(dict.fromkeys(sf.strip() for d, v, sf in values_in(text) if round(v, 6) in vals.get(d, set())))
+                value = f" (Wert: {', '.join(shown)})" if shown else ""
+                segments += [{"type": "text", "text": f" {c['docName']} {c['section'].split(' ')[0]}: {text}{value} "}, {"type": "cite", "chunkId": c["id"]}]
+                hits.append({"chunkId": c["id"], "docName": c["docName"], "section": c["section"], "content": text, "values": shown})
         out = done("search", segments, {h["chunkId"]: idx.chunks[[c["id"] for c in idx.chunks].index(h["chunkId"])] for h in hits}, {}, {})
         out["result"]["hits"] = hits
         return out
@@ -2863,13 +2880,35 @@ def window_values(idx: "LexIndex", part: "Part", w: list[tuple[int, int]]) -> di
         elif not part.value:
             vals = []  # no asked column and no value question: numbers in the window are not the answer
         elif row:
-            vals = [(f["dim"], f["value"]) for f in row]
+            # no asked column: a row with several values of one dimension ('RTO 12 Stunden | RPO 1 Stunde') does not say
+            # which one answers the question → none of them is used
+            by_dim: dict[str, set[float]] = defaultdict(set)
+            for f in row:
+                by_dim[f["dim"]].add(f["value"])
+            vals = [(d, v) for d, vs in by_dim.items() if len(vs) == 1 for v in vs]
         else:
             vals = [(d, v) for d, v, _ in values_in(idx.span_text[i][k])]
+        text = fold(idx.span_text[i][k])
+        by_col = {round(f["value"], 6) for f in row if INTERVAL_COL.search(fold(f["attribute"]))}  # 'Prüfintervall: 6 Monate'
         for d, v in vals:
             if not dims or d in dims:
-                out[d].add(round(v, 6))
+                out["freq" if d == "time" and round(v, 6) in by_col else _freq_or(d, v, text)].add(round(v, 6))
     return out
+
+
+INTERVAL_COL = re.compile(r"intervall|interval|zyklus|turnus|frequen|rhythmus|haufigkeit")
+FREQ_CUE = re.compile(r"\b(?:alle|every|each|je|pro|per)\s+(\d+(?:[.,]\d+)?)\b")
+
+
+def _freq_or(dim: str, value: float, text: str) -> str:
+    """Contradictions compare like with like: an interval ('halbjährlich', 'alle 6 Monate') is 'freq', a duration
+    ('Wiederanlaufzeit von 24 Stunden') stays 'time' — both are minutes in values_in."""
+    if dim != "time":
+        return dim
+    freq = {round(DURATION_MIN[re.match(r"\d+(\w+)", q).group(1)] * float(re.match(r"\d+", q).group(0)), 6)
+            for w, q in FREQ_WORDS.items() if re.search(rf"\b{w}\b", text)}
+    freq |= {round(base, 6) for _, base, sf in values_in(text) for m in FREQ_CUE.finditer(text) if sf.startswith(m.group(1))}
+    return "freq" if round(value, 6) in freq else "time"
 
 
 CONTRA_OVERLAP = 0.25  # same threshold as the staging conflict rule (_rule_conflict); 0.15 measured: 3 false flags, no gain
@@ -2888,10 +2927,7 @@ def find_contradiction(idx: "LexIndex", view: RoleView, part: "Part", ranked: li
     if not best_vals:
         return []
     idents = [kt.alts[0] for kt in part.qt.keys if kt.kind == "ident"]
-    best_terms, best_ctx = window_terms(idx, best), idx.ctx_terms[best[-1][0]]
-    # key terms found only in the selected document's title ("laut BCM-Matrix", "according to the BIA"): the question names
-    # that document, so another document cannot contradict the answer
-    doc_refs = [kt for kt in part.qt.keys if kt.weight > 0 and any(a <= best_ctx for a in kt.alts) and not any(a <= best_terms for a in kt.alts)]
+    refs = doc_refs(part, window_terms(idx, best), idx.ctx_terms[best[-1][0]])
     floor = max(0.4, part.coverage - 0.45)
     best_doc = idx.chunks[best[-1][0]]["docName"]
     per_doc: dict[str, tuple[float, list[tuple[int, int]], dict[str, set[float]]]] = {}
@@ -2903,8 +2939,8 @@ def find_contradiction(idx: "LexIndex", view: RoleView, part: "Part", ranked: li
         cov = coverage(part.qt, terms, idx.ctx_terms[w[-1][0]])
         if cov < floor or not all(a <= terms for a in idents):
             continue
-        if any(not any(a <= terms | idx.ctx_terms[w[-1][0]] for a in kt.alts) for kt in doc_refs):
-            continue
+        if any(not any(a <= terms | idx.ctx_terms[w[-1][0]] for a in kt.alts) for kt in refs):
+            continue  # the question names the selected document: another document cannot contradict the answer
         if topical_overlap(best_text, " ".join(idx.span_text[i][k] for i, k in w)) < CONTRA_OVERLAP:
             continue
         vals = window_values(idx, part, w)
