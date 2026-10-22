@@ -35,6 +35,18 @@ export interface LiveChunk {
   updatedAt: string;
   sha256: string;
   approvedBy?: string;
+  // Exact facts extracted by the Python engine at approval time (table cells, value sentences); absent for Node-side approvals.
+  facts?: ChunkFact[];
+  factsVersion?: number;
+}
+
+export interface ChunkFact {
+  span: number; // sentence index inside the chunk content
+  subject: string; // first table cell, empty for value sentences
+  attribute: string; // column header, empty for value sentences
+  dim: string; // "time" (minutes) | unit name | "num"
+  value: number;
+  surface: string; // literal text, e.g. "2 Stunden"
 }
 
 export interface Conflict {

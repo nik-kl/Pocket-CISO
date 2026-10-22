@@ -302,6 +302,55 @@ class Windows(unittest.TestCase):
         self.assertIn(["Der Koch plant das Menü.", "Er ist verantwortlich für die Allergenkennzeichnung."], self.texts(i))
 
 
+class FactsAndContradictions(unittest.TestCase):
+    DOCS = [
+        ("Hallenordnung.md", "§1 Zeiten", "L2", "Tabelle [§1 Zeiten]: Bereich: Halle 2 | Öffnung: 11 Uhr | Reinigung: 2 Stunden. Tabelle [§1 Zeiten]: Bereich: Halle 3 | Öffnung: 12 Uhr | Reinigung: 4 Stunden."),
+        ("Reinigungsplan.md", "§1 Reinigung", "L2", "Die Reinigung der Halle 2 dauert höchstens 3 Stunden."),
+        ("Kassenordnung.md", "§1 Kassen", "L2", "Die Kassen werden jährlich geprüft. Gäste zahlen 8 EUR."),
+    ]
+
+    def setUp(self) -> None:
+        fresh_db(self.DOCS)
+        rag._LEX_CACHE = None
+        rag.reset_query_caches()
+
+    def test_fact_extraction(self) -> None:
+        facts = rag.extract_facts(self.DOCS[0][3])
+        self.assertIn({"span": 0, "subject": "Halle 2", "attribute": "Reinigung", "dim": "time", "value": 120.0, "surface": "2 Stunden"}, facts)
+        self.assertFalse(any(f["attribute"] == "Bereich" for f in facts))  # "Halle 2" is an identifier, not a value
+        self.assertEqual([(f["dim"], f["value"]) for f in rag.extract_facts("Die Kassen werden jährlich geprüft.")], [("time", 518400.0)])
+
+    def test_identifier_vs_value(self) -> None:
+        self.assertEqual(rag.values_in("Tier 1 nach 3 Versuchen, AES-256, ab 6"), [("num", 3.0, "3"), ("num", 6.0, "6")])
+        self.assertEqual(rag.values_in("1 year")[0][:2], rag.values_in("12 Monate")[0][:2])
+
+    def test_contradiction_lists_both_values(self) -> None:
+        res = rag.run_query(token("L2"), "Wie lange dauert die Reinigung der Halle 2?")
+        tr = res["result"]["trace"]
+        self.assertTrue(tr["contradiction"])
+        self.assertIn("2 Stunden", res["answer"])
+        self.assertIn("3 Stunden", res["answer"])
+        self.assertEqual({v["docName"] for v in tr["contradictionValues"]}, {"Hallenordnung.md", "Reinigungsplan.md"})
+
+    def test_document_named_in_question_is_not_contradicted(self) -> None:
+        res = rag.run_query(token("L2"), "Wie lange dauert die Reinigung der Halle 2 laut Reinigungsplan?")
+        self.assertFalse(res["result"]["trace"]["contradiction"])
+        self.assertEqual([c["docName"] for c in res["citations"]], ["Reinigungsplan.md"])
+
+    def test_other_column_values_are_not_compared(self) -> None:
+        res = rag.run_query(token("L2"), "Wann öffnet Halle 2?")
+        self.assertFalse(res["result"]["trace"].get("contradiction"))
+
+    def test_approval_stores_facts_in_chunk_record(self) -> None:
+        fresh_db([])
+        rag.VECTORS.__init__()
+        rag.stage_document(token("L2"), doc_name="Werte.md", text="## §1 Fristen\nMeldungen erfolgen innerhalb von 24 Stunden.\n", min_role="L2")
+        rag.approve_diff(token("L3"), rag.read_db()["staged_diffs"][0]["id"])
+        chunk = rag.read_db()["live_chunks"][0]
+        self.assertEqual(chunk["factsVersion"], rag.FACTS_VERSION)
+        self.assertEqual([(f["dim"], f["value"]) for f in chunk["facts"]], [("time", 1440.0)])
+
+
 class QuestionHandling(unittest.TestCase):
     def test_parts_and_context(self) -> None:
         parts, ctx, inj = rag.question_parts("Wir planen eine Migration. Wer genehmigt das und wie lange dauert die Prüfung?")

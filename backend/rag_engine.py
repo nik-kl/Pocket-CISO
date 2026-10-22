@@ -1487,6 +1487,9 @@ def approve_diff(token: str | None, diff_id: str, override: bool = False, overri
                     if chunk["docName"] == diff["replacesDoc"]:
                         chunk["docName"] = diff["docName"]
                         chunk["sha256"] = sha256(f"{chunk['docName']}|{chunk['section']}|{chunk['content']}")
+            for chunk in db["live_chunks"]:  # exact facts (table cells, value sentences) live in the chunk record
+                if chunk.get("factsVersion") != FACTS_VERSION:
+                    chunk["facts"], chunk["factsVersion"] = extract_facts(chunk["content"]), FACTS_VERSION
             refresh_lexical(db["live_chunks"])  # BM25 terms + spans are precomputed here, never per query
             VECTORS.save()
         db["staged_diffs"].pop(idx)
@@ -1782,6 +1785,11 @@ class LexIndex:
         self.span_ids = [[f"{c['id']}:{k}" for k in range(len(self.span_text[i]))] for i, c in enumerate(self.chunks)]
         self.span_instr = [[bool(INSTRUCTION_RE.search(fold(t))) for t in spans] for spans in self.span_text]
         self.section_key = [(c["docName"], section_title(c["section"])) for c in self.chunks]
+        self.facts_by_span: dict[tuple[int, int], list[dict[str, Any]]] = defaultdict(list)
+        for i, c in enumerate(self.chunks):
+            for f in chunk_facts(c):
+                if 0 <= f["span"] < len(self.span_text[i]):
+                    self.facts_by_span[(i, f["span"])].append(f)
         self.section_seq: dict[tuple[str, str], list[tuple[int, int]]] = defaultdict(list)
         part_no = [int((re.search(r"\(Teil (\d+)\)$", c["section"]) or [0, 1])[1]) for c in self.chunks]
         for i in sorted(range(len(self.chunks)), key=lambda x: (self.section_key[x], part_no[x], self.chunks[x]["id"])):
@@ -2138,6 +2146,7 @@ class Part:
     who: bool
     windows: list[list[tuple[int, int]]]
     norm: bool = False
+    contradiction: list[tuple[list[tuple[int, int]], dict[str, set[float]]]] | None = None
     coverage: float = 0.0
     answered: bool = False
     reason: str = ""
@@ -2195,6 +2204,21 @@ def window_ok(idx: "LexIndex", part: Part, w: list[tuple[int, int]]) -> bool:
     if part.who and not entities(text):
         return False
     return True
+
+
+def fact_chunks(idx: "LexIndex", view: RoleView, part: Part, limit: int = 6) -> list[int]:
+    """Exact fact lookup for value questions: spans that carry an extracted fact (table cell, value sentence), ranked by
+    key-term coverage over the whole allowed corpus — independent of the fused top-k."""
+    allowed = set(view.allowed)
+    scored = sorted((-coverage(part.qt, idx.span_terms[i][k], idx.ctx_terms[i]), idx.span_ids[i][k], i)
+                    for (i, k) in idx.facts_by_span if i in allowed and not idx.span_instr[i][k])
+    out: list[int] = []
+    for _, _, i in scored:
+        if i not in out:
+            out.append(i)
+        if len(out) >= limit:
+            break
+    return out
 
 
 def select_windows(idx: "LexIndex", view: RoleView, part: Part, ranked: list[int]) -> None:
@@ -2392,11 +2416,15 @@ def run_query(token: str | None, question: str) -> dict[str, Any]:
         bm = view.bm25(weights)
         dense = dense_scores(db, view, [ptext]) if dense_all is not None else None
         ranked = fuse(view, bm, dense)[:8]
+        if part.value:  # exact facts first: chunks with a matching fact join the candidates even outside the fused top-k
+            ranked += [i for i in fact_chunks(idx, view, part) if i not in ranked]
         candidate_docs += [idx.chunks[i]["docName"] for i in ranked]
         select_windows(idx, view, part, ranked)
         dense_top = max((dense.get(i, 0.0) for w in part.windows for i, _ in w), default=0.0) if dense else None
         best_dense = max(best_dense, dense_top or 0.0)
         part.answered = bool(part.windows) and part.coverage >= COV_MIN and (dense_top is None or dense_top >= PARAMS["ollama"]["min_score"])
+        if part.answered:
+            part.contradiction = find_contradiction(idx, view, part, ranked) or None
         if part.windows and not part.answered:
             part.reason = f"Abdeckung {part.coverage:.2f} < {COV_MIN}" if part.coverage < COV_MIN else "Dense-Score zu niedrig"
         parts.append(part)
@@ -2431,17 +2459,33 @@ def run_query(token: str | None, question: str) -> dict[str, Any]:
     t = time.perf_counter()
     ordered: list[tuple[str, str]] = []
     for p in answered:
+        if p.contradiction:
+            continue
         for w in p.windows:
             for i, k in w:
                 sid = idx.span_ids[i][k]
                 if sid not in dict(ordered):
                     ordered.append((sid, idx.span_text[i][k]))
-    use_llm = bool(OLLAMA.llm_model())
+    contradictions = [p for p in answered if p.contradiction]
+    use_llm = bool(OLLAMA.llm_model()) and not contradictions
     sentences, answer_by = compose_sentences(q, ordered, view.vocab, use_llm)
     lat["generation"] = int((time.perf_counter() - t) * 1000)
 
     span_chunk = {idx.span_ids[i][k]: i for i in range(len(idx.chunks)) for k in range(len(idx.span_ids[i]))}
     segments: list[dict[str, str]] = []
+    contradiction_values: list[dict[str, Any]] = []
+    for p in contradictions:
+        segments.append({"type": "text", "text": ("" if not segments else " ") + "Widerspruch im freigegebenen Bestand – die Dokumente nennen unterschiedliche Werte:"})
+        for w, vals in p.contradiction:
+            c = idx.chunks[w[-1][0]]
+            label = f"{c['docName']} {c['section'].split(' ')[0]}"
+            segments.append({"type": "text", "text": f" {label}: "})
+            for i, k in w:
+                sid = idx.span_ids[i][k]
+                ordered.append((sid, idx.span_text[i][k]))
+                segments.append({"type": "text", "text": display_span(idx.span_text[i][k]) + " "})
+                segments.append({"type": "cite", "chunkId": idx.chunks[i]["id"], "spanId": sid})
+            contradiction_values.append({"docName": c["docName"], "section": c["section"], "values": {d: sorted(v) for d, v in vals.items()}})
     for s in sentences:
         segments.append({"type": "text", "text": (" " if segments else "") + s.text + " "})
         for sid in s.spans:
@@ -2454,13 +2498,170 @@ def run_query(token: str | None, question: str) -> dict[str, Any]:
     spans_out = {sid: {"chunkId": idx.chunks[span_chunk[sid]]["id"], "text": text} for sid, text in ordered}
     cov = min(p.coverage for p in answered)
     trace.update({
-        "nliVerified": all(s.verified for s in sentences), "verification": "span-verifier", "answerBy": answer_by, "partial": bool(unanswered),
+        "nliVerified": all(s.verified for s in sentences), "verification": "span-verifier", "answerBy": answer_by if sentences else "verbatim", "partial": bool(unanswered),
+        "contradiction": bool(contradictions), "contradictionValues": contradiction_values,
         "confidence": round(cov, 2), "retrievalScore": round(best_dense if dense_all is not None else cov, 3), "topScore": round(best_dense if dense_all is not None else cov, 3),
         "lexicalSupport": round(cov, 2),
         "sentences": [{"text": s.text, "spans": s.spans, "source": s.source, "verified": s.verified, "problems": s.reasons or []} for s in sentences],
     })
     scores = {cid: round(max((p.coverage for p in answered), default=0.0), 3) for cid in cited_chunks}
     return done("answer", segments, {cid: by_id[cid] for cid in cited_chunks}, scores, spans_out)
+
+
+# ───────────────────────── Exact facts + unit-aware values (approval time) ─────────────────────────
+
+FACTS_VERSION = 1
+QTY_RE = re.compile(r"(?<![\w.,])(\d+(?:[.,]\d+)*)\s*(%|[A-Za-zÄÖÜäöüß]+\b)?")
+DURATION_MIN = {"s": 1 / 60, "min": 1.0, "h": 60.0, "d": 1440.0, "w": 10080.0, "mo": 43200.0, "y": 518400.0}  # month = 30 d, year = 12 months
+
+
+def _to_float(v: str) -> float | None:
+    try:
+        return float(_num(v))
+    except ValueError:
+        return None
+
+
+def _identifier_before(text: str, pos: int) -> bool:
+    """'Tier 1', 'Stufe 3', 'TLS 1.3', 'AES-256': a capitalised word or acronym (not a function word) directly before the number."""
+    m = re.search(r"([A-Za-zÄÖÜäöüß]+)(-|\s)$", text[max(0, pos - 40) : pos])
+    if not m:
+        return False
+    word = m.group(1)
+    return m.group(2) == "-" or (word[:1].isupper() and fold(word) not in R_STOP)
+
+
+def values_in(text: str) -> list[tuple[str, float, str]]:
+    """[(dimension, value in base unit, surface)] — durations in minutes ('time'), other units by name, bare numbers as 'num'.
+    Frequency words count as durations (jährlich = 12 Monate). Dates, version numbers and section numbers are skipped."""
+    out: list[tuple[str, float, str]] = []
+    for m in QTY_RE.finditer(text):
+        raw, word = m.group(1), m.group(2) or ""
+        if re.fullmatch(r"\d{1,2}\.\d{1,2}\.\d{2,4}", raw) or text[max(0, m.start() - 2) : m.start()].strip() in ("§", "v", "V"):
+            continue
+        v = _to_float(raw)
+        if v is None:
+            continue
+        unit = "pct" if word == "%" else UNIT_CANON.get(fold(word)) if word else None
+        if unit in DURATION_MIN:
+            out.append(("time", v * DURATION_MIN[unit], f"{raw} {word}"))
+        elif unit:
+            out.append((unit, v, f"{raw} {word}"))
+        elif _identifier_before(text, m.start()):
+            continue  # identifier number: "Tier 1", "TLS 1.3", "AES-256", "ISO 27001"
+        else:
+            out.append(("num", v, raw))
+    for w in _LEX.findall(fold(text)):
+        if w in FREQ_WORDS:
+            q = FREQ_WORDS[w]
+            n, u = re.match(r"(\d+)(\w+)", q).groups()
+            out.append(("time", float(n) * DURATION_MIN[u], w))
+    return out
+
+
+def extract_facts(content: str) -> list[dict[str, Any]]:
+    """Structured facts (span, subject, attribute, value, unit, surface): every quantity cell of a table row (subject = first
+    cell, attribute = column header) and every clear value sentence (≤ 2 distinct values; subject = the sentence itself)."""
+    facts: list[dict[str, Any]] = []
+    for k, span in enumerate(split_sentences(content) or [content]):
+        if span.startswith("Tabelle ["):
+            body = TABLE_LABEL.sub("", span).rstrip(".")
+            cells = [c.strip() for c in re.split(r"\s+\|\s+", body)]
+            pairs = [c.split(": ", 1) if ": " in c else ["", c] for c in cells]
+            subject = pairs[0][1] if pairs else ""
+            for attr, val in pairs[1:]:
+                for dim, base, surface in values_in(val):
+                    facts.append({"span": k, "subject": subject, "attribute": attr, "dim": dim, "value": round(base, 6), "surface": surface.strip()})
+            continue
+        vals = values_in(span)
+        if vals and len({(d, v) for d, v, _ in vals}) <= 2:
+            for dim, base, surface in vals:
+                facts.append({"span": k, "subject": "", "attribute": "", "dim": dim, "value": round(base, 6), "surface": surface.strip()})
+    return facts
+
+
+def chunk_facts(chunk: dict[str, Any]) -> list[dict[str, Any]]:
+    """Facts stored in the DB chunk record at approval time (Python); recomputed when missing (e.g. a Node-side approval)."""
+    if chunk.get("factsVersion") == FACTS_VERSION and isinstance(chunk.get("facts"), list):
+        return chunk["facts"]
+    return extract_facts(chunk["content"])
+
+
+# ───────────────────────── Contradictions between live documents (query time) ─────────────────────────
+
+def _cue_dims(cues: set[str]) -> set[str]:
+    return {"time" if c in DURATION_MIN or c == "mo" else c for c in cues}
+
+
+def window_values(idx: "LexIndex", part: "Part", w: list[tuple[int, int]]) -> dict[str, set[float]]:
+    """Values a window states for the asked quantity: for a table row the cells whose column header matches the question
+    (all quantity cells if none matches), for sentences every value; restricted to the question's unit dimension if it has one."""
+    dims = _cue_dims(part.qt.unit_cues)
+    out: dict[str, set[float]] = defaultdict(set)
+    for i, k in w:
+        row = [f for f in idx.facts_by_span.get((i, k), []) if f["attribute"]]
+        keys = set().union(*(a for kt in part.qt.keys for a in kt.alts))
+        hit_attrs = {f["attribute"] for f in idx.facts_by_span.get((i, k), [])} if row else set()
+        hit_attrs = {a for a in hit_attrs if set(analyze(a)) & keys}
+        if row and hit_attrs:  # the asked column ("RPO") decides which cell is the answer
+            vals = [(f["dim"], f["value"]) for f in row if f["attribute"] in hit_attrs]
+        elif not part.value:
+            vals = []  # no asked column and no value question: numbers in the window are not the answer
+        elif row:
+            vals = [(f["dim"], f["value"]) for f in row]
+        else:
+            vals = [(d, v) for d, v, _ in values_in(idx.span_text[i][k])]
+        for d, v in vals:
+            if not dims or d in dims:
+                out[d].add(round(v, 6))
+    return out
+
+
+CONTRA_OVERLAP = 0.25  # same threshold as the staging conflict rule (_rule_conflict); 0.15 measured: 3 false flags, no gain
+
+
+def find_contradiction(idx: "LexIndex", view: RoleView, part: "Part", ranked: list[int]) -> list[tuple[list[tuple[int, int]], dict[str, set[float]]]]:
+    """Unit-aware contradiction between live documents, built on the staging conflict rule (_rule_conflict): another
+    document's window answers the same question (key-term coverage ≥ max(0.4, best − 0.45), all identifiers such as 'tier1'
+    present), talks about the same thing as the selected window (topical overlap ≥ 0.25) and states values of the same
+    dimension that are disjoint from the selected ones. Returns [] or one window per document with its values."""
+    if not part.windows:
+        return []
+    best = part.windows[0]
+    best_text = " ".join(idx.span_text[i][k] for i, k in best)
+    best_vals = window_values(idx, part, best)
+    if not best_vals:
+        return []
+    idents = [kt.alts[0] for kt in part.qt.keys if kt.kind == "ident"]
+    best_terms, best_ctx = window_terms(idx, best), idx.ctx_terms[best[-1][0]]
+    # key terms found only in the selected document's title ("laut BCM-Matrix", "according to the BIA"): the question names
+    # that document, so another document cannot contradict the answer
+    doc_refs = [kt for kt in part.qt.keys if kt.weight > 0 and any(a <= best_ctx for a in kt.alts) and not any(a <= best_terms for a in kt.alts)]
+    floor = max(0.4, part.coverage - 0.45)
+    best_doc = idx.chunks[best[-1][0]]["docName"]
+    per_doc: dict[str, tuple[float, list[tuple[int, int]], dict[str, set[float]]]] = {}
+    for w in span_windows(idx, view, ranked):
+        doc = idx.chunks[w[-1][0]]["docName"]
+        if doc == best_doc or not window_ok(idx, part, w):
+            continue
+        terms = window_terms(idx, w)
+        cov = coverage(part.qt, terms, idx.ctx_terms[w[-1][0]])
+        if cov < floor or not all(a <= terms for a in idents):
+            continue
+        if any(not any(a <= terms | idx.ctx_terms[w[-1][0]] for a in kt.alts) for kt in doc_refs):
+            continue
+        if topical_overlap(best_text, " ".join(idx.span_text[i][k] for i, k in w)) < CONTRA_OVERLAP:
+            continue
+        vals = window_values(idx, part, w)
+        if not any(d in best_vals and best_vals[d] and not (vals[d] & best_vals[d]) for d in vals):
+            continue
+        prev = per_doc.get(doc)
+        if prev is None or cov > prev[0] + 1e-9:
+            per_doc[doc] = (cov, w, vals)
+    if not per_doc:
+        return []
+    others = sorted(per_doc.values(), key=lambda x: (-x[0], idx.span_ids[x[1][-1][0]][x[1][-1][1]]))[:4]
+    return [(best, best_vals)] + [(w, v) for _, w, v in others]
 
 
 # ───────────────────────── Health ─────────────────────────
