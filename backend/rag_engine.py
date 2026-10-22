@@ -2303,6 +2303,22 @@ def judge_answerable(question: str, spans: list[str]) -> bool | None:
     return None if out is None else fold(out).startswith("ja")
 
 
+PAIR_SYSTEM = (
+    "Du prüfst zwei Textstellen auf einen Widerspruch bei der gefragten Größe. Antworte nur mit JA oder NEIN. "
+    "JA: beide Stellen nennen einen Wert für die Größe, nach der die Frage fragt, und die Werte sind verschieden. "
+    "NEIN: gleiche Werte, oder eine Stelle behandelt eine andere Größe oder einen anderen Gegenstand."
+)
+CONTRADICTION_LABEL = "Mögliche Widersprüche im Bestand – nicht als Antwort bestätigt"
+
+
+def judge_pair(question: str, a: list[str], b: list[str]) -> bool:
+    """Pair judge for contradictions (temp 0, seed 7): do both windows give different values for the quantity asked about?
+    No reply = NEIN."""
+    out = OLLAMA.chat(PAIR_SYSTEM, "Frage: " + question + "\nStelle A: " + " ".join(a) + "\nStelle B: " + " ".join(b) + "\nAntwort (JA/NEIN):",
+                      timeout=LLM_TIMEOUT, max_tokens=3)
+    return out is not None and fold(out).startswith("ja")
+
+
 @dataclass
 class Sentence:
     text: str
@@ -2485,15 +2501,14 @@ def run_query(token: str | None, question: str) -> dict[str, Any]:
         if part.lexical_ok:
             # a contradiction is reported only when the judge confirms every listed window on its own (no new false flags)
             found = find_contradiction(idx, view, part, ranked) if use_llm else []
-            confirmed = [(w, v) for w, v in found if judge_answerable(ptext, [idx.span_text[i][k] for i, k in w]) is True]
-            if confirmed:  # only judge-confirmed windows are listed; the first one is the anchor the others must disagree with
-                anchor = confirmed[0][1]
-                confirmed = confirmed[:1] + [(w, v) for w, v in confirmed[1:] if any(d in anchor and not (v[d] & anchor[d]) for d in v)]
-            if len(confirmed) >= 2:
-                part.contradiction, part.features["judge"] = confirmed, True
-            elif use_llm:
+            if found:  # the pair judge must confirm each window against the selected one; a contradiction is never an answer
+                win_text = lambda w: [idx.span_text[i][k] for i, k in w]
+                confirmed = [(w, v) for w, v in found[1:] if judge_pair(ptext, win_text(found[0][0]), win_text(w))]
+                if confirmed:
+                    part.contradiction = [found[0]] + confirmed
+            if use_llm:
                 part.features["judge"] = judge_answerable(ptext, [idx.span_text[i][k] for w in part.windows for i, k in w][:4])
-        part.answered = part.lexical_ok and part.features.get("judge") is True
+        part.answered = part.lexical_ok and part.features.get("judge") is True and not part.contradiction
         if not part.answered and part.windows:
             part.reason = ("Abdeckung zu gering" if not part.lexical_ok else "Antwortbarkeitsprüfung: nein" if use_llm else "kein LLM: nur Fundstellen")
         parts.append(part)
@@ -2518,6 +2533,22 @@ def run_query(token: str | None, question: str) -> dict[str, Any]:
                 "answer": plain, "citations": list(citations.values()), "telemetry": telemetry}
 
     answered = [p for p in parts if p.answered]
+    conflicts = [p for p in parts if p.contradiction]
+    if conflicts:  # possible contradictions are shown as labelled search hits with every value and source, never as an answer
+        trace.update({"verification": "none", "answerBy": "search", "contradiction": True,
+                      "contradictionValues": [{"docName": idx.chunks[w[-1][0]]["docName"], "section": idx.chunks[w[-1][0]]["section"],
+                                               "values": {d: sorted(v) for d, v in vals.items()}} for p in conflicts for w, vals in p.contradiction]})
+        segments: list[dict[str, str]] = [{"type": "text", "text": CONTRADICTION_LABEL + ":"}]
+        hits = []
+        for p in conflicts:
+            for w, _ in p.contradiction:
+                c = idx.chunks[w[-1][0]]
+                text = " ".join(display_span(idx.span_text[i][k]) for i, k in w)
+                segments += [{"type": "text", "text": f" {c['docName']} {c['section'].split(' ')[0]}: {text} "}, {"type": "cite", "chunkId": c["id"]}]
+                hits.append({"chunkId": c["id"], "docName": c["docName"], "section": c["section"], "content": text})
+        out = done("search", segments, {h["chunkId"]: idx.chunks[[c["id"] for c in idx.chunks].index(h["chunkId"])] for h in hits}, {}, {})
+        out["result"]["hits"] = hits
+        return out
     if not answered:
         hidden = _restricted_match(db, role, q)
         if hidden:
@@ -2539,32 +2570,16 @@ def run_query(token: str | None, question: str) -> dict[str, Any]:
     t = time.perf_counter()
     ordered: list[tuple[str, str]] = []
     for p in answered:
-        if p.contradiction:
-            continue
         for w in p.windows:
             for i, k in w:
                 sid = idx.span_ids[i][k]
                 if sid not in dict(ordered):
                     ordered.append((sid, idx.span_text[i][k]))
-    contradictions = [p for p in answered if p.contradiction]
-    sentences, answer_by = compose_sentences(q, ordered, view.vocab, use_llm and not contradictions)
+    sentences, answer_by = compose_sentences(q, ordered, view.vocab, use_llm)
     lat["generation"] = int((time.perf_counter() - t) * 1000)
 
     span_chunk = {idx.span_ids[i][k]: i for i in range(len(idx.chunks)) for k in range(len(idx.span_ids[i]))}
     segments: list[dict[str, str]] = []
-    contradiction_values: list[dict[str, Any]] = []
-    for p in contradictions:
-        segments.append({"type": "text", "text": ("" if not segments else " ") + "Widerspruch im freigegebenen Bestand – die Dokumente nennen unterschiedliche Werte:"})
-        for w, vals in p.contradiction:
-            c = idx.chunks[w[-1][0]]
-            label = f"{c['docName']} {c['section'].split(' ')[0]}"
-            segments.append({"type": "text", "text": f" {label}: "})
-            for i, k in w:
-                sid = idx.span_ids[i][k]
-                ordered.append((sid, idx.span_text[i][k]))
-                segments.append({"type": "text", "text": display_span(idx.span_text[i][k]) + " "})
-                segments.append({"type": "cite", "chunkId": idx.chunks[i]["id"], "spanId": sid})
-            contradiction_values.append({"docName": c["docName"], "section": c["section"], "values": {d: sorted(v) for d, v in vals.items()}})
     for s in sentences:
         segments.append({"type": "text", "text": (" " if segments else "") + s.text + " "})
         for sid in s.spans:
@@ -2577,8 +2592,7 @@ def run_query(token: str | None, question: str) -> dict[str, Any]:
     spans_out = {sid: {"chunkId": idx.chunks[span_chunk[sid]]["id"], "text": text} for sid, text in ordered}
     cov = min(p.coverage for p in answered)
     trace.update({
-        "nliVerified": all(s.verified for s in sentences), "verification": "span-verifier", "answerBy": answer_by if sentences else "verbatim", "partial": bool(unanswered),
-        "contradiction": bool(contradictions), "contradictionValues": contradiction_values,
+        "nliVerified": all(s.verified for s in sentences), "verification": "span-verifier", "answerBy": answer_by, "partial": bool(unanswered),
         "confidence": round(cov, 2), "retrievalScore": round(best_dense if dense_all is not None else cov, 3), "topScore": round(best_dense if dense_all is not None else cov, 3),
         "lexicalSupport": round(cov, 2),
         "sentences": [{"text": s.text, "spans": s.spans, "source": s.source, "verified": s.verified, "problems": s.reasons or []} for s in sentences],

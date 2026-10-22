@@ -305,11 +305,11 @@ class Windows(unittest.TestCase):
 
 
 @contextmanager
-def stub_llm(judge: str | None = "JA"):
-    """Deterministic stand-in for Ollama: the answerability judge replies `judge` (None = no reply), phrasing never replies,
-    so answers stay verbatim."""
+def stub_llm(judge: str | None = "JA", pair: str | None = "JA"):
+    """Deterministic stand-in for Ollama: the answerability judge replies `judge`, the contradiction pair judge `pair`
+    (None = no reply), phrasing never replies, so answers stay verbatim."""
     def chat(system: str, user: str, **_: object) -> str | None:
-        return judge if system == rag.JUDGE_SYSTEM else None
+        return judge if system == rag.JUDGE_SYSTEM else pair if system == rag.PAIR_SYSTEM else None
     with mock.patch.object(rag.OLLAMA, "llm_model", return_value="stub"), mock.patch.object(rag.OLLAMA, "chat", side_effect=chat):
         yield
 
@@ -395,10 +395,18 @@ class FactsAndContradictions(unittest.TestCase):
         with stub_llm():
             res = rag.run_query(token("L2"), "Wie lange dauert die Reinigung der Halle 2?")
         tr = res["result"]["trace"]
+        self.assertEqual(res["result"]["kind"], "search")  # a contradiction is never an answer
+        self.assertTrue(res["answer"].startswith(rag.CONTRADICTION_LABEL))
         self.assertTrue(tr["contradiction"])
         self.assertIn("2 Stunden", res["answer"])
         self.assertIn("3 Stunden", res["answer"])
         self.assertEqual({v["docName"] for v in tr["contradictionValues"]}, {"Hallenordnung.md", "Reinigungsplan.md"})
+
+    def test_pair_judge_no_means_no_flag(self) -> None:
+        for pair in ("NEIN", None):
+            with stub_llm(pair=pair):
+                res = rag.run_query(token("L2"), "Wie lange dauert die Reinigung der Halle 2?")
+            self.assertFalse(res["result"]["trace"]["contradiction"])
 
     def test_document_named_in_question_is_not_contradicted(self) -> None:
         with stub_llm():

@@ -498,7 +498,7 @@ def metrics(mode: str, questions: list[dict[str, Any]], raw: dict[str, Any], pas
         "numeric_errors": err_counter.get("numeric", 0), "negation_errors": err_counter.get("negation", 0), "modality_errors": err_counter.get("modality", 0),
         "no_citation": err_counter.get("no-citation", 0),
         "citation_precision": round(statistics.mean(precisions), 3) if precisions else None,
-        "contradiction_n": len(contra), "contradiction_handled": sum(1 for s in contra if s["contradiction_flag"] and s["outcome"] == "correct"),
+        "contradiction_n": len(contra), "contradiction_handled": sum(1 for s in contra if s["contradiction_flag"] and s["outcome"] != "false_answer"),
         "false_contradiction_flags": sum(1 for s in scored if s["contradiction_flag"] and not s["contradiction_expected"]),
         "search_hit_at3": f"{sum(hits)}/{len(hits)}" if hits else None,
         # answerable questions split by what the user got: verified answer / search hits / plain "no answer"
