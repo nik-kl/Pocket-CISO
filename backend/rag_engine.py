@@ -691,11 +691,21 @@ def _join_cell(a: str, b: str) -> str:
     return a + b if re.search(r"\w-$", a) and b[:1].isalnum() else f"{a} {b}"  # "ERP-" + "Auftragsbearbeitung"
 
 
-def _layout_rows(block: list[str], starts: list[int]) -> list[str]:
+LAYOUT_TOL = 8  # max. distance (characters) between a cell and its column start; centred cells drift a few characters
+
+
+def _layout_rows(block: list[str], starts: list[int]) -> list[str] | None:
+    """Cells → columns. None when any assignment is uncertain (cell far from every column start, reaching into the next
+    column, or two cells of one line in the same column): the block is then treated as running text, never as a table
+    with values in the wrong column."""
     cols = [""] * len(starts)
     for line in block:
+        used: set[int] = set()
         for pos, text in _layout_cells(line):
-            k = min(range(len(starts)), key=lambda j: (abs(starts[j] - pos), j))  # nearest column start (cells may be centred)
+            k = min(range(len(starts)), key=lambda j: (abs(starts[j] - pos), j))
+            if abs(starts[k] - pos) > LAYOUT_TOL or k in used or (k + 1 < len(starts) and pos + len(text) > starts[k + 1] + 1):
+                return None
+            used.add(k)
             cols[k] = _join_cell(cols[k], text)
     return [c.replace("|", "\\|").strip() for c in cols]
 
@@ -735,15 +745,18 @@ def _pdf_page_text(page: Any) -> str:
                 rows.append(blocks[j])
                 j += 1
             starts = [p for p, _ in _layout_cells(widest)]
-            if rows:
-                out += ["", "| " + " | ".join(_layout_rows(head, starts)) + " |", "|" + "---|" * len(starts)]
-                out += ["| " + " | ".join(_layout_rows(r, starts)) + " |" for r in rows] + [""]
+            header = _layout_rows(head, starts) if rows else None
+            body = [_layout_rows(r, starts) for r in rows]
+            if header is not None and body and all(x is not None for x in body):
+                out += ["", "| " + " | ".join(header) + " |", "|" + "---|" * len(starts)]
+                out += ["| " + " | ".join(x) + " |" for x in body if x is not None] + [""]
                 i = j
                 continue
             if len(head) == 2:
                 vals, labels = (_layout_cells(head[0]), _layout_cells(head[1]))
                 letters = re.sub(r"[^A-Za-zÄÖÜäöüß]", "", head[1])
-                if len(vals) == len(labels) and letters and letters.isupper():
+                centred = all(lp - 2 <= vp + len(vt) / 2 <= lp + len(lt) + 2 for (vp, vt), (lp, lt) in zip(vals, labels))
+                if len(vals) == len(labels) and letters and letters.isupper() and centred:
                     out += ["", "| " + " | ".join(t for _, t in labels) + " |", "|" + "---|" * len(labels), "| " + " | ".join(t for _, t in vals) + " |", ""]
                     i += 1
                     continue

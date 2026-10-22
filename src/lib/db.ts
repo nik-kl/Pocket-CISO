@@ -1036,8 +1036,9 @@ export function chunkDocument(raw: string): { title: string | null; chunks: DocC
 /* ── Pipeline A core: chunk → align to series → diff → conflicts ── */
 
 // Unicode-aware (umlauts!) like Python's \w; names are NFC-normalised first because macOS hands out NFD file names.
-const DOC_NAME_RE = /^[\p{L}\p{N}_.\- ]{3,120}$/u;
-export const safeDocName = (name: string) => name.normalize("NFC").replace(/[^\p{L}\p{N}_.\- ]/gu, "_").slice(0, 120);
+// Same character rule as safe_doc_name in backend/rag_engine.py: letters, digits, space . _ - & , ( ) — everything else → "_".
+const DOC_NAME_RE = /^[\p{L}\p{N}_.\-&,() ]{3,120}$/u;
+export const safeDocName = (name: string) => name.normalize("NFC").replace(/[^\p{L}\p{N}_.\-&,() ]/gu, "_").slice(0, 120);
 
 interface StageInput {
   docName: string;
@@ -1062,7 +1063,7 @@ function stageInTx(db: Db, a: Actor, p: StageInput): R<{ diff: StagedDiff; stats
   const t0 = performance.now();
   if (!(p.minRole in ROLE_RANK)) return fail(400, "BAD_ROLE", "Ungültige Min-Role.");
   if (ROLE_RANK[p.minRole] > ROLE_RANK[a.role]) return fail(403, "FORBIDDEN", `Min-Role ${p.minRole} übersteigt Ihre Clearance (${a.role}).`);
-  if (!DOC_NAME_RE.test(p.docName)) return fail(400, "BAD_TARGET", "Dokumentname: 3–120 Zeichen (Buchstaben, Ziffern, . _ -).");
+  if (!DOC_NAME_RE.test(p.docName)) return fail(400, "BAD_TARGET", "Dokumentname: 3–120 Zeichen (Buchstaben, Ziffern, Leerzeichen, . _ - & , ( )).");
   if (p.text.length > 200_000) return fail(413, "TOO_LARGE", "Text zu groß.");
 
   const { title: docTitle, chunks } = chunkDocument(p.text);
@@ -1145,7 +1146,7 @@ export async function stagePolicy(token: string | null, p: { title: string; targ
   const title = String(p.title ?? "").trim();
   const text = String(p.newText ?? "").trim();
   if (title.length < 3 || title.length > 120) return fail(400, "BAD_TITLE", "Titel: 3–120 Zeichen.");
-  if (!DOC_NAME_RE.test(target)) return fail(400, "BAD_TARGET", "Zieldokument: 3–120 Zeichen (Buchstaben, Ziffern, . _ -).");
+  if (!DOC_NAME_RE.test(target)) return fail(400, "BAD_TARGET", "Zieldokument: 3–120 Zeichen (Buchstaben, Ziffern, Leerzeichen, . _ - & , ( )).");
   if (text.length < 10 || text.length > 2000) return fail(400, "BAD_TEXT", "Regeltext: 10–2000 Zeichen.");
   const existing = await transact((db) => db.live_chunks.find((c) => c.docName.toLowerCase() === target.toLowerCase())?.docName ?? null);
   return stageDocument(token, {
