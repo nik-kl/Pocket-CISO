@@ -12,7 +12,9 @@ import sys
 import tempfile
 import time
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
+from unittest import mock
 
 _TMP = tempfile.mkdtemp(prefix="pocket-ciso-test-")
 os.environ.update({
@@ -302,6 +304,71 @@ class Windows(unittest.TestCase):
         self.assertIn(["Der Koch plant das Menü.", "Er ist verantwortlich für die Allergenkennzeichnung."], self.texts(i))
 
 
+@contextmanager
+def stub_llm(judge: str | None = "JA"):
+    """Deterministic stand-in for Ollama: the answerability judge replies `judge` (None = no reply), phrasing never replies,
+    so answers stay verbatim."""
+    def chat(system: str, user: str, **_: object) -> str | None:
+        return judge if system == rag.JUDGE_SYSTEM else None
+    with mock.patch.object(rag.OLLAMA, "llm_model", return_value="stub"), mock.patch.object(rag.OLLAMA, "chat", side_effect=chat):
+        yield
+
+
+class AnswerGate(unittest.TestCase):
+    """Step-5 gate: lexical floor (GATE_COVERAGE / GATE_MISSING) + LLM answerability judge; without LLM only search hits."""
+    DOCS = [
+        ("Bibliotheksordnung.md", "§2 Ausleihe", "L2", "Bücher dürfen höchstens 4 Wochen ausgeliehen werden."),
+        ("Bibliotheksordnung.md", "§3 Lesesaal", "L2", "Im Lesesaal sind Getränke verboten."),
+    ]
+
+    def setUp(self) -> None:
+        fresh_db(self.DOCS)
+        rag._LEX_CACHE = None
+        rag.reset_query_caches()
+
+    def test_judge_yes_answers_verbatim(self) -> None:
+        with stub_llm("JA"):
+            res = rag.run_query(token("L2"), "Wie lange dürfen Bücher ausgeliehen werden?")
+        self.assertEqual(res["result"]["kind"], "answer")
+        self.assertIn("4 Wochen", res["answer"])
+        self.assertIs(res["result"]["trace"]["parts"][0]["features"]["judge"], True)
+
+    def test_judge_no_returns_unconfirmed_hits(self) -> None:
+        # a lexically supported span the judge rejects is never shown as an answer, only as a labelled search hit
+        with stub_llm("NEIN"):
+            res = rag.run_query(token("L2"), "Wie lange dürfen Bücher ausgeliehen werden?")
+        self.assertEqual(res["result"]["kind"], "search")
+        self.assertTrue(res["answer"].startswith(rag.UNCONFIRMED_LABEL))
+        self.assertIn("4 Wochen", res["result"]["hits"][0]["content"])
+
+    def test_judge_silent_fails_closed(self) -> None:
+        with stub_llm(None):
+            res = rag.run_query(token("L2"), "Wie lange dürfen Bücher ausgeliehen werden?")
+        self.assertEqual(res["result"]["kind"], "search")
+        self.assertFalse(res["result"]["trace"]["nliVerified"])
+
+    def test_lexical_floor_skips_judge(self) -> None:
+        # only one weak key term matches → below GATE_COVERAGE, the judge is never asked
+        with stub_llm("JA"):
+            res = rag.run_query(token("L2"), "Welche Gebühr kostet ein verlorener Benutzerausweis im Lesesaal?")
+        self.assertEqual(res["result"]["kind"], "fallback")
+        self.assertEqual(res["answer"], rag.NO_ANSWER)
+        self.assertNotIn("judge", res["result"]["trace"]["parts"][0]["features"] or {})
+
+    def test_without_llm_only_search_hits(self) -> None:
+        res = rag.run_query(token("L2"), "Wie lange dürfen Bücher ausgeliehen werden?")
+        self.assertEqual(res["result"]["kind"], "search")
+        self.assertTrue(res["answer"].startswith(rag.SEARCH_LABEL))
+        self.assertEqual(res["result"]["hits"][0]["docName"], "Bibliotheksordnung.md")
+        self.assertIn("4 Wochen", res["result"]["hits"][0]["content"])
+
+    def test_search_hits_respect_rbac(self) -> None:
+        fresh_db([("Tresorordnung.md", "§1 Code", "L3", "Der Tresor wird jeden Montag neu codiert.")])
+        res = rag.run_query(token("L2"), "Wann wird der Tresor neu codiert?")
+        self.assertEqual(res["result"]["kind"], "fallback")
+        self.assertNotIn("Tresor", json.dumps(res["result"]["segments"], ensure_ascii=False))
+
+
 class FactsAndContradictions(unittest.TestCase):
     DOCS = [
         ("Hallenordnung.md", "§1 Zeiten", "L2", "Tabelle [§1 Zeiten]: Bereich: Halle 2 | Öffnung: 11 Uhr | Reinigung: 2 Stunden. Tabelle [§1 Zeiten]: Bereich: Halle 3 | Öffnung: 12 Uhr | Reinigung: 4 Stunden."),
@@ -325,7 +392,8 @@ class FactsAndContradictions(unittest.TestCase):
         self.assertEqual(rag.values_in("1 year")[0][:2], rag.values_in("12 Monate")[0][:2])
 
     def test_contradiction_lists_both_values(self) -> None:
-        res = rag.run_query(token("L2"), "Wie lange dauert die Reinigung der Halle 2?")
+        with stub_llm():
+            res = rag.run_query(token("L2"), "Wie lange dauert die Reinigung der Halle 2?")
         tr = res["result"]["trace"]
         self.assertTrue(tr["contradiction"])
         self.assertIn("2 Stunden", res["answer"])
@@ -333,12 +401,14 @@ class FactsAndContradictions(unittest.TestCase):
         self.assertEqual({v["docName"] for v in tr["contradictionValues"]}, {"Hallenordnung.md", "Reinigungsplan.md"})
 
     def test_document_named_in_question_is_not_contradicted(self) -> None:
-        res = rag.run_query(token("L2"), "Wie lange dauert die Reinigung der Halle 2 laut Reinigungsplan?")
+        with stub_llm():
+            res = rag.run_query(token("L2"), "Wie lange dauert die Reinigung der Halle 2 laut Reinigungsplan?")
         self.assertFalse(res["result"]["trace"]["contradiction"])
         self.assertEqual([c["docName"] for c in res["citations"]], ["Reinigungsplan.md"])
 
     def test_other_column_values_are_not_compared(self) -> None:
-        res = rag.run_query(token("L2"), "Wann öffnet Halle 2?")
+        with stub_llm():
+            res = rag.run_query(token("L2"), "Wann öffnet Halle 2?")
         self.assertFalse(res["result"]["trace"].get("contradiction"))
 
     def test_approval_stores_facts_in_chunk_record(self) -> None:

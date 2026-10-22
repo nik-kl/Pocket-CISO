@@ -24,7 +24,7 @@ import zipfile
 import zlib
 from collections import Counter, defaultdict
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
@@ -67,11 +67,10 @@ HASH_ID = "hash-ngram-v1"
 # Similarity thresholds per embedding space (cosine). Ollama values follow the product spec; the hash space is calibrated.
 PARAMS = {
     "ollama": {
-        "min_score": float(os.getenv("MIN_SCORE", "0.55")),  # lowered from 0.65 for bge-m3
         "conflict_sim": float(os.getenv("CONFLICT_SIM", "0.68")),  # adjusted for bge-m3
         "align": float(os.getenv("ALIGN_SIM", "0.60")),
     },
-    "hash": {"min_score": 0.25, "conflict_sim": 0.30, "align": 0.35},
+    "hash": {"conflict_sim": 0.30, "align": 0.35},
 }
 
 
@@ -2077,7 +2076,19 @@ def fuse(view: RoleView, *scores: dict[int, float] | None) -> list[int]:
 # ───────────────────────── Pipeline B: stateless compliance RAG (extract first, verify every sentence) ─────────────────────────
 
 NO_ANSWER = "Keine belegbare Antwort im freigegebenen Bestand."
-COV_MIN = float(os.getenv("COV_MIN", "0.5"))  # replaced by the feature gate in step 5
+SEARCH_LABEL = "Fundstellen, keine KI-Antwort"  # no LLM reachable
+UNCONFIRMED_LABEL = "Fundstellen, nicht als Antwort bestätigt"  # LLM judge said NEIN / gave no reply
+# Answer gate per question part (step 5, tuned on the dev set only; curve from a permissive run with every feature logged):
+#   GATE_COVERAGE 0.5 — weighted share of the part's key terms found in the selected window (+ section/doc title);
+#   GATE_MISSING  0.5 — no single unmatched key term may carry more than half of the part's key-term weight;
+#   answerability judge — the LLM must reply JA to "do these spans state exactly what is asked" (temp 0, seed 7); no reply ⇒ NEIN.
+# Lexical/dense features alone cannot separate "supported but off-topic" spans: at coverage 0.95 and missing ≤ 0.15 there
+# were still 6 false answers with Ollama (8 without). With the judge every grid point from coverage 0.30–0.95 × missing
+# 0.15–1.0 × dense 0.5–0.65 had 0 false answers, so the lexical values sit mid-grid (±0.05 changes correct answers by ≤ 3,
+# false answers stay 0). Windows above the lexical floor that are not confirmed (no LLM, judge NEIN or silent) are returned
+# as search hits (kind "search"), never as an answer; "fallback" only when no window reaches the lexical floor.
+GATE_COVERAGE = 0.5
+GATE_MISSING = 0.5
 MAX_PARTS = 4
 
 # Text addressed to the assistant instead of being policy content ("ignore all previous instructions", "answer only …").
@@ -2146,6 +2157,9 @@ class Part:
     who: bool
     windows: list[list[tuple[int, int]]]
     norm: bool = False
+    lexical_ok: bool = False
+    ranked: list[int] = field(default_factory=list)
+    features: dict[str, Any] | None = None
     contradiction: list[tuple[list[tuple[int, int]], dict[str, set[float]]]] | None = None
     coverage: float = 0.0
     answered: bool = False
@@ -2275,6 +2289,20 @@ PHRASE_SYSTEM = (
 )
 
 
+JUDGE_SYSTEM = (
+    "Du prüfst, ob freigegebene Textstellen eine Frage direkt beantworten. Antworte ausschließlich mit JA oder NEIN. "
+    "JA nur, wenn die Textstellen genau das Gefragte aussagen; NEIN, wenn sie ein anderes Thema, einen anderen Gegenstand "
+    "oder nur verwandte Begriffe enthalten."
+)
+
+
+def judge_answerable(question: str, spans: list[str]) -> bool | None:
+    """LLM answerability check (temp 0, seed 7, ≤ 3 tokens): True/False, None when no LLM is reachable."""
+    out = OLLAMA.chat(JUDGE_SYSTEM, "Frage: " + question + "\nTextstellen:\n" + "\n".join(f"- {t}" for t in spans) + "\nAntwort (JA/NEIN):",
+                      timeout=LLM_TIMEOUT, max_tokens=3)
+    return None if out is None else fold(out).startswith("ja")
+
+
 @dataclass
 class Sentence:
     text: str
@@ -2360,6 +2388,25 @@ def compose_sentences(q: str, spans: list[tuple[str, str]], vocab: Vocab, use_ll
     return result, "llm+verifier"
 
 
+def search_hits(idx: "LexIndex", parts: list[Part], per_part: int = 3) -> list[dict[str, Any]]:
+    """Unconfirmed parts above the lexical floor: their best windows (then the next fused chunks), RBAC-filtered by construction
+    (only chunks of the role view are ever ranked)."""
+    hits: list[dict[str, Any]] = []
+    for p in parts:
+        if not p.lexical_ok:
+            continue
+        cand = [(w[-1][0], " ".join(display_span(idx.span_text[i][k]) for i, k in w)) for w in p.windows]
+        cand += [(i, display_span(idx.chunks[i]["content"])) for i in p.ranked]
+        n = 0
+        for i, text in cand:
+            if n >= per_part or any(h["chunkId"] == idx.chunks[i]["id"] for h in hits):
+                continue
+            c = idx.chunks[i]
+            hits.append({"chunkId": c["id"], "docName": c["docName"], "section": c["section"], "content": text})
+            n += 1
+    return hits
+
+
 def _restricted_match(db: dict[str, Any], role: str, question: str) -> dict[str, Any] | None:
     """Audit only (RBAC_DENIED): would a chunk above the caller's clearance have answered? Never influences the response."""
     if role == "L3":
@@ -2372,7 +2419,7 @@ def _restricted_match(db: dict[str, Any], role: str, question: str) -> dict[str,
     qt = key_terms(question, full)
     bm = {i: s for i, s in full.bm25(qt.weights).items() if i in restricted}
     for i in sorted(bm, key=lambda i: (-bm[i], idx.chunks[i]["id"]))[:3]:
-        if coverage(qt, frozenset(idx.doc_terms[i]), idx.ctx_terms[i]) >= COV_MIN:
+        if coverage(qt, frozenset(idx.doc_terms[i]), idx.ctx_terms[i]) >= GATE_COVERAGE:
             return idx.chunks[i]
     return None
 
@@ -2399,6 +2446,7 @@ def run_query(token: str | None, question: str) -> dict[str, Any]:
         for x, w in key_terms(c, view).weights.items():
             ctx_weights[x] = max(ctx_weights.get(x, 0.0), 0.3 * w)
     dense_all = dense_scores(db, view, texts) if texts and view.n else None
+    use_llm = bool(OLLAMA.llm_model())
     parts: list[Part] = []
     best_dense = 0.0
     candidate_docs: list[str] = []
@@ -2422,11 +2470,25 @@ def run_query(token: str | None, question: str) -> dict[str, Any]:
         select_windows(idx, view, part, ranked)
         dense_top = max((dense.get(i, 0.0) for w in part.windows for i, _ in w), default=0.0) if dense else None
         best_dense = max(best_dense, dense_top or 0.0)
-        part.answered = bool(part.windows) and part.coverage >= COV_MIN and (dense_top is None or dense_top >= PARAMS["ollama"]["min_score"])
+        got = frozenset().union(*(window_terms(idx, w) for w in part.windows)) if part.windows else frozenset()
+        ctx_got = frozenset().union(*(idx.ctx_terms[w[-1][0]] for w in part.windows)) if part.windows else frozenset()
+        total_w = sum(k.weight for k in qt.keys) or 1.0
+        unmatched = [k.weight for k in qt.keys if not any(a <= got or a <= ctx_got for a in k.alts)]
+        win_chunks = {i for w in part.windows for i, _ in w}
+        part.features = {
+            "coverage": round(part.coverage, 4), "dense": round(dense_top, 4) if dense_top is not None else None,
+            "bm25": round(max((bm.get(i, 0.0) for i in win_chunks), default=0.0), 3),
+            "missingMax": round(max(unmatched, default=0.0) / total_w, 4),
+        }
+        part.ranked = ranked
+        part.lexical_ok = bool(part.windows) and part.coverage >= GATE_COVERAGE and part.features["missingMax"] <= GATE_MISSING
+        if part.lexical_ok and use_llm:
+            part.features["judge"] = judge_answerable(ptext, [idx.span_text[i][k] for w in part.windows for i, k in w][:4])
+        part.answered = part.lexical_ok and part.features.get("judge") is True
         if part.answered:
             part.contradiction = find_contradiction(idx, view, part, ranked) or None
-        if part.windows and not part.answered:
-            part.reason = f"Abdeckung {part.coverage:.2f} < {COV_MIN}" if part.coverage < COV_MIN else "Dense-Score zu niedrig"
+        elif part.windows:
+            part.reason = ("Abdeckung zu gering" if not part.lexical_ok else "Antwortbarkeitsprüfung: nein" if use_llm else "kein LLM: nur Fundstellen")
         parts.append(part)
     lat["retrieval"] = int((time.perf_counter() - t) * 1000)
 
@@ -2435,7 +2497,8 @@ def run_query(token: str | None, question: str) -> dict[str, Any]:
         "original": q, "rewrite": " | ".join(texts) if texts else q, "rbacFilter": f"min_role <= {role}", "searched": view.n, "total": len(idx.chunks),
         "nliVerified": False, "temperature": 0.0, "confidence": 0.0, "topScore": 0.0, "latencyMs": lat, "engineMode": label,
         "rewriteBy": "rules (Teilfragen)", "answerBy": "none", "injectionRemoved": injection, "candidateDocs": list(dict.fromkeys(candidate_docs)),
-        "parts": [{"text": p.text, "answered": p.answered, "coverage": round(p.coverage, 3), "value": p.value, "who": p.who, "reason": p.reason} for p in parts],
+        "parts": [{"text": p.text, "answered": p.answered, "coverage": round(p.coverage, 3), "value": p.value, "who": p.who, "reason": p.reason,
+                   "features": p.features} for p in parts],
         "denseTop": round(best_dense, 3) if dense_all is not None else None, "contradiction": False, "partial": False,
     }
 
@@ -2454,7 +2517,17 @@ def run_query(token: str | None, question: str) -> dict[str, Any]:
             with locked_db() as dbw:
                 append_denial(dbw, actor["email"], role, "RBAC_DENIED", hidden["docName"], f"Retrieval erfordert {hidden['minRole']}")
         trace.update({"verification": "none", "candidateDocs": trace["candidateDocs"] if view.n else []})
-        return done("fallback", [{"type": "text", "text": NO_ANSWER}], {}, {}, {})
+        hits = search_hits(idx, parts)
+        if not hits:
+            return done("fallback", [{"type": "text", "text": NO_ANSWER}], {}, {}, {})
+        trace["answerBy"] = "search"
+        segments: list[dict[str, str]] = [{"type": "text", "text": (UNCONFIRMED_LABEL if use_llm else SEARCH_LABEL) + ":"}]
+        for h in hits:
+            segments += [{"type": "text", "text": f" {h['docName']} {h['section'].split(' ')[0]}: {h['content']} "}, {"type": "cite", "chunkId": h["chunkId"]}]
+        by_id = {c["id"]: c for c in idx.chunks}
+        out = done("search", segments, {h["chunkId"]: by_id[h["chunkId"]] for h in hits}, {}, {})
+        out["result"]["hits"] = hits
+        return out
 
     t = time.perf_counter()
     ordered: list[tuple[str, str]] = []
@@ -2467,8 +2540,7 @@ def run_query(token: str | None, question: str) -> dict[str, Any]:
                 if sid not in dict(ordered):
                     ordered.append((sid, idx.span_text[i][k]))
     contradictions = [p for p in answered if p.contradiction]
-    use_llm = bool(OLLAMA.llm_model()) and not contradictions
-    sentences, answer_by = compose_sentences(q, ordered, view.vocab, use_llm)
+    sentences, answer_by = compose_sentences(q, ordered, view.vocab, use_llm and not contradictions)
     lat["generation"] = int((time.perf_counter() - t) * 1000)
 
     span_chunk = {idx.span_ids[i][k]: i for i in range(len(idx.chunks)) for k in range(len(idx.span_ids[i]))}

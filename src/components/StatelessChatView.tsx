@@ -237,6 +237,7 @@ function ResultView(p: ResultProps) {
   const fmt = (n?: number) => (n === undefined ? "" : ` · ${n < 10 ? n.toFixed(1) : Math.round(n)} ms`);
   const grounded = result.kind === "answer";
   const denied = result.kind === "denied";
+  const search = result.kind === "search";
   const sources = Object.values(result.citations);
 
   return (
@@ -301,12 +302,14 @@ function ResultView(p: ResultProps) {
       ) : (
         <article className={`rounded-xl border bg-surface p-6 shadow-card ${grounded ? "border-line" : "border-warn/30"}`}>
           <div className="mb-4 flex items-center justify-between">
-            <span className="text-[10px] font-semibold uppercase tracking-[0.12em] text-faint">{grounded ? "Verified Compliance Answer" : "Compliance Answer"}</span>
+            <span className="text-[10px] font-semibold uppercase tracking-[0.12em] text-faint">{grounded ? "Verified Compliance Answer" : search ? "Fundstellen" : "Compliance Answer"}</span>
             {grounded ? (
               <span className="flex items-center gap-1.5">
                 {/^(Local|Rule-based)/.test(tr.engineMode ?? "") && <Badge tone="warn"><AlertTriangle size={11} /> Keyword-Modus · geringe Präzision</Badge>}
                 <Badge tone="ok"><Check size={11} /> Grounded · Retrieval {(tr.retrievalScore ?? tr.confidence).toFixed(2)}</Badge>
               </span>
+            ) : search ? (
+              <Badge><FileText size={11} /> Suchtreffer · nicht verifiziert</Badge>
             ) : (
               <Badge tone="warn"><AlertTriangle size={11} /> Keine belastbare Quelle</Badge>
             )}

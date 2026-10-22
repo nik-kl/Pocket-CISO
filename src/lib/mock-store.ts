@@ -159,9 +159,10 @@ export interface LatencyMs {
 }
 
 export interface QueryResult {
-  kind: "answer" | "fallback" | "denied";
+  kind: "answer" | "search" | "fallback" | "denied";
   requiredRole: Role | null;
   segments: AnswerSegment[];
+  hits?: { chunkId: string; docName: string; section: string; content: string }[]; // kind "search": no answer, RBAC-filtered spans
   citations: Record<string, LiveChunk>;
   scores?: Record<string, number>;
   trace: {

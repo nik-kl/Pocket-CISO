@@ -1,7 +1,7 @@
 """Pocket CISO — FastAPI service (port 8000). Thin HTTP layer over rag_engine.py.
 
 Run:  python main.py        (or: uvicorn main:app --host 127.0.0.1 --port 8000)
-Env:  OLLAMA_BASE_URL, LLM_MODEL, EMBED_MODEL, MIN_SCORE, CORS_ORIGINS, POCKET_CISO_DATA_DIR,
+Env:  OLLAMA_BASE_URL, LLM_MODEL, EMBED_MODEL, CORS_ORIGINS, POCKET_CISO_DATA_DIR,
       AUTO_SYNC=1 (watch backend/watched_inbox/ every AUTO_SYNC_SECONDS=30), WATCHED_INBOX_DIR
 """
 from __future__ import annotations

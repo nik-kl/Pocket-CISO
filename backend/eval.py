@@ -485,7 +485,8 @@ def metrics(mode: str, questions: list[dict[str, Any]], raw: dict[str, Any], pas
     for cat in sorted({s["category"] for s in scored}):
         group = [s for s in scored if s["category"] == cat]
         cc = Counter(s["outcome"] for s in group)
-        per_cat[cat] = {"n": len(group), **{k: cc.get(k, 0) for k in ("correct", "false_answer", "false_abstention", "incomplete")}}
+        per_cat[cat] = {"n": len(group), **{k: cc.get(k, 0) for k in ("correct", "false_answer", "false_abstention", "incomplete")},
+                        "search": sum(1 for s in group if s["kind"] == "search" and s["expect"] == "answer")}
     hits = [s["hit_ok"] for s in scored if s["hit_ok"] is not None]
     return {
         "mode": mode, "n": len(scored), "answerable": len(ans), "unanswerable": len(abst),
@@ -500,6 +501,11 @@ def metrics(mode: str, questions: list[dict[str, Any]], raw: dict[str, Any], pas
         "contradiction_n": len(contra), "contradiction_handled": sum(1 for s in contra if s["contradiction_flag"] and s["outcome"] == "correct"),
         "false_contradiction_flags": sum(1 for s in scored if s["contradiction_flag"] and not s["contradiction_expected"]),
         "search_hit_at3": f"{sum(hits)}/{len(hits)}" if hits else None,
+        # answerable questions split by what the user got: verified answer / search hits / plain "no answer"
+        "search_answerable": sum(1 for s in ans if s["kind"] == "search"),
+        "fallback_answerable": sum(1 for s in ans if s["kind"] in ("fallback", "denied", "error")),
+        "search_unanswerable": sum(1 for s in abst if s["kind"] == "search"),
+        "fallback_unanswerable": sum(1 for s in abst if s["kind"] in ("fallback", "denied")),
         "nondeterministic": nondet, "determinism_checked": passes > 1,
         "latency_p50_ms": round(quantile(lat, 0.5)), "latency_p95_ms": round(quantile(lat, 0.95)), "latency_max_ms": round(max(lat) if lat else 0),
         "per_category": per_cat, "scored": scored,
@@ -512,13 +518,14 @@ def summary_table(ms: list[dict[str, Any]]) -> str:
         ("correct abstentions", lambda m: f"{m['correct_abstain']}/{m['unanswerable']}"),
         ("false answers", lambda m: f"{m['false_answer']} ({pct(m['false_answer'], m['n'])})"),
         ("  of which on unanswerable", lambda m: str(m["false_answer_on_unanswerable"])),
-        ("false abstentions", lambda m: f"{m['false_abstention']} ({pct(m['false_abstention'], m['answerable'])})"),
+        ("answerable → search hits (hits@3)", lambda m: f"{m['search_answerable']} ({m['search_hit_at3'] or '–'})"),
+        ("answerable → real abstention", lambda m: str(m["fallback_answerable"])),
+        ("unanswerable → search hits / abstention", lambda m: f"{m['search_unanswerable']} / {m['fallback_unanswerable']}"),
         ("incomplete", lambda m: str(m["incomplete"])),
         ("leakage", lambda m: str(m["leakage"])),
         ("numeric / negation / modality errors", lambda m: f"{m['numeric_errors']} / {m['negation_errors']} / {m['modality_errors']}"),
         ("citation precision", lambda m: str(m["citation_precision"])),
         ("contradictions handled", lambda m: f"{m['contradiction_handled']}/{m['contradiction_n']} (false flags {m['false_contradiction_flags']})"),
-        ("search hits@3 (node)", lambda m: str(m["search_hit_at3"] or "–")),
         ("deterministic", lambda m: ("yes" if not m["nondeterministic"] else f"NO ({len(m['nondeterministic'])})") if m["determinism_checked"] else "not checked"),
         ("latency p50 / p95 ms", lambda m: f"{m['latency_p50_ms']} / {m['latency_p95_ms']}"),
     ]
@@ -528,14 +535,14 @@ def summary_table(ms: list[dict[str, Any]]) -> str:
 
 def category_table(ms: list[dict[str, Any]]) -> str:
     cats = sorted({c for m in ms for c in m["per_category"]})
-    head = "| category | n | " + " | ".join(f"{m['mode']} ok/false/abst/inc" for m in ms) + " |\n|---|---|" + "---|" * len(ms) + "\n"
+    head = "| category | n | " + " | ".join(f"{m['mode']} ok/false/search/abst/inc" for m in ms) + " |\n|---|---|" + "---|" * len(ms) + "\n"
     lines = []
     for cat in cats:
         n = next((m["per_category"][cat]["n"] for m in ms if cat in m["per_category"]), 0)
         cells = []
         for m in ms:
             x = m["per_category"].get(cat)
-            cells.append(f"{x['correct']}/{x['false_answer']}/{x['false_abstention']}/{x['incomplete']}" if x else "–")
+            cells.append(f"{x['correct']}/{x['false_answer']}/{x['search']}/{x['false_abstention'] - x['search']}/{x['incomplete']}" if x else "–")
         lines.append(f"| {cat} | {n} | " + " | ".join(cells) + " |")
     return head + "\n".join(lines)
 
