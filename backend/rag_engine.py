@@ -1953,6 +1953,7 @@ class KeyTerm:
     kind: str  # word | phrase | ident | qty | num
     alts: list[frozenset[str]]  # matched when ANY alternative is fully contained; alts[0] is the question's own form
     weight: float = 1.0
+    raw_weight: float | None = None  # weight before the df = 0 cap (DF0_CAP); None = not capped
 
 
 @dataclass
@@ -1960,6 +1961,9 @@ class QueryTerms:
     keys: list[KeyTerm]
     weights: dict[str, float]  # BM25 query term weights (own form 1.0, compound parts 0.8, glossary/typo alternatives 0.5)
     unit_cues: set[str]
+
+
+DF0_CAP = 0.25
 
 
 def key_terms(question: str, view: RoleView) -> QueryTerms:
@@ -2046,6 +2050,18 @@ def key_terms(question: str, view: RoleView) -> QueryTerms:
     for it in merged:
         own = it.alts[0]
         it.weight *= sum(view.idf(x) for x in own) / len(own)
+    # words found nowhere in the role's corpus (df = 0, also no glossary/typo alternative) get the highest idf and would
+    # dominate the coverage; colloquial words ("Firmenkarre") must not block a semantic hit — cap them at a quarter of the
+    # mean known-term weight and leave out-of-scope detection to the answerability judge. Numbers and identifiers keep
+    # their weight ('Tier 7' that does not exist must keep blocking).
+    known = [it.weight for it in merged if any(all(x in view.df for x in a) for a in it.alts)]
+    if known:
+        cap = DF0_CAP * sum(known) / len(known)
+        for it in merged:
+            if it.kind in ("word", "phrase") and not any(all(x in view.df for x in a) for a in it.alts) and it.weight > cap:
+                it.raw_weight, it.weight = it.weight, cap
+    for it in merged:
+        own = it.alts[0]
         for a_i, alt in enumerate(it.alts):
             w = (1.0 if a_i == 0 else 0.8 if (a_i == 1 and it.kind == "word" and len(alt) > 1) else 0.5) * (0.3 if it.surface in GENERIC_WORDS else 1.0)
             for x in alt:
@@ -2149,6 +2165,11 @@ UNCONFIRMED_LABEL = "Fundstellen, nicht als Antwort bestätigt"  # LLM judge sai
 # as search hits (kind "search"), never as an answer; "fallback" only when no window reaches the lexical floor.
 GATE_COVERAGE = 0.5
 GATE_MISSING = 0.5
+# Dense path (class 2): a part below the lexical floor still reaches the judge with the spans of its best dense chunk when
+# that cosine (bge-m3) is >= DENSE_GATE. Dev curve over question parts (top dense chunk from the expected source /
+# unanswerable parts): 0.58 → 168/203 · 2/26, 0.60 → 152 · 2, 0.62 → 131 · 0, 0.64 → 109 · 0, 0.68 → 75 · 0; highest
+# unanswerable part 0.6045 → 0.62 keeps a margin of 0.015 above it, the judge stays the second barrier.
+DENSE_GATE = 0.62
 MAX_PARTS = 4
 
 # Text addressed to the assistant instead of being policy content ("ignore all previous instructions", "answer only …").
@@ -2218,6 +2239,8 @@ class Part:
     windows: list[list[tuple[int, int]]]
     norm: bool = False
     lexical_ok: bool = False
+    capped_only: bool = False
+    dense_ok: bool = False
     ranked: list[int] = field(default_factory=list)
     features: dict[str, Any] | None = None
     contradiction: list[tuple[list[tuple[int, int]], dict[str, set[float]]]] | None = None
@@ -2278,6 +2301,20 @@ def window_ok(idx: "LexIndex", part: Part, w: list[tuple[int, int]]) -> bool:
     if part.who and not entities(text):
         return False
     return True
+
+
+def dense_window(idx: "LexIndex", view: RoleView, part: Part, dense: dict[int, float]) -> tuple[list[tuple[int, int]], float] | None:
+    """Window for the dense path: the best dense chunk (>= DENSE_GATE) — its spans sharing a key term with the part (≤ 3),
+    or the whole chunk when it has ≤ 2 spans and none shares one; must pass window_ok (value/role present)."""
+    if not dense:
+        return None
+    i = min(dense, key=lambda j: (-dense[j], idx.chunks[j]["id"]))
+    if dense[i] < DENSE_GATE:
+        return None
+    ks = [k for k in range(len(idx.span_text[i])) if not idx.span_instr[i][k]]
+    hit = [k for k in ks if coverage(part.qt, idx.span_terms[i][k]) > 0][:3]
+    w = [(i, k) for k in (hit or (ks if len(ks) <= 2 else []))]
+    return (w, dense[i]) if w and window_ok(idx, part, w) else None
 
 
 def fact_chunks(idx: "LexIndex", view: RoleView, part: Part, limit: int = 6) -> list[int]:
@@ -2465,11 +2502,11 @@ def compose_sentences(q: str, spans: list[tuple[str, str]], vocab: Vocab, use_ll
 
 
 def search_hits(idx: "LexIndex", parts: list[Part], per_part: int = 3) -> list[dict[str, Any]]:
-    """Unconfirmed parts above the lexical floor: their best windows (then the next fused chunks), RBAC-filtered by construction
+    """Unconfirmed parts above the lexical floor or the dense gate: their best windows (then the next fused chunks), RBAC-filtered by construction
     (only chunks of the role view are ever ranked)."""
     hits: list[dict[str, Any]] = []
     for p in parts:
-        if not p.lexical_ok:
+        if not ((p.lexical_ok and not p.capped_only) or p.dense_ok):
             continue
         cand = [(w[-1][0], " ".join(display_span(idx.span_text[i][k]) for i, k in w)) for w in p.windows]
         cand += [(i, display_span(idx.chunks[i]["content"])) for i in p.ranked]
@@ -2558,6 +2595,10 @@ def run_query(token: str | None, question: str) -> dict[str, Any]:
         }
         part.ranked = ranked
         part.lexical_ok = bool(part.windows) and part.coverage >= GATE_COVERAGE and part.features["missingMax"] <= GATE_MISSING
+        # the floor reached only because unknown words were capped: the judge decides, but a NEIN yields no search hits
+        # ("Wie ist das Wetter in Wien?" must not list policy sentences)
+        raw_total = sum(k.raw_weight or k.weight for k in qt.keys)
+        part.capped_only = part.lexical_ok and raw_total > total_w and (total_w - sum(unmatched)) < GATE_COVERAGE * raw_total
         if part.lexical_ok:
             # a contradiction is reported only when the judge confirms every listed window on its own (no new false flags)
             found = find_contradiction(idx, view, part, ranked) if use_llm else []
@@ -2568,9 +2609,20 @@ def run_query(token: str | None, question: str) -> dict[str, Any]:
                     part.contradiction = [found[0]] + confirmed
             if use_llm:
                 part.features["judge"] = judge_answerable(ptext, [idx.span_text[i][k] for w in part.windows for i, k in w][:4])
-        part.answered = part.lexical_ok and part.features.get("judge") is True and not part.contradiction
+        # dense path: below the lexical floor, or the judge rejected the lexical window and the best dense chunk is another one
+        lex_rejected = part.lexical_ok and part.features.get("judge") is False and not part.contradiction
+        if dense and (not part.lexical_ok or lex_rejected):
+            dw = dense_window(idx, view, part, dense)
+            if dw and lex_rejected and dw[0][0][0] in win_chunks:
+                dw = None
+            if dw:
+                part.dense_ok, part.windows = True, [dw[0]]
+                part.features["densePath"] = round(dw[1], 4)
+                if use_llm:
+                    part.features["judge"] = judge_answerable(ptext, [idx.span_text[i][k] for i, k in dw[0]])
+        part.answered = (part.lexical_ok or part.dense_ok) and part.features.get("judge") is True and not part.contradiction
         if not part.answered and part.windows:
-            part.reason = ("Abdeckung zu gering" if not part.lexical_ok else "Antwortbarkeitsprüfung: nein" if use_llm else "kein LLM: nur Fundstellen")
+            part.reason = ("Abdeckung zu gering" if not (part.lexical_ok or part.dense_ok) else "Antwortbarkeitsprüfung: nein" if use_llm else "kein LLM: nur Fundstellen")
         parts.append(part)
     lat["retrieval"] = int((time.perf_counter() - t) * 1000)
 

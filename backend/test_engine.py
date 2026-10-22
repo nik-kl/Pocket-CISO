@@ -327,6 +327,33 @@ class AnswerGate(unittest.TestCase):
         rag._LEX_CACHE = None
         rag.reset_query_caches()
 
+    def test_unknown_words_are_capped_numbers_are_not(self) -> None:
+        view = rag.lexical_index(rag.read_db()).view("L2")
+        qt = rag.key_terms("Wie lange darf man Schmöker ausleihen?", view)
+        w = {k.surface: k.weight for k in qt.keys}
+        self.assertLessEqual(w["schmoker"], rag.DF0_CAP * w["ausleihen"] + 1e-9)  # df = 0, colloquial → capped
+        qn = rag.key_terms("Wie lange gilt Stufe 9 für Bücher?", view)
+        self.assertGreater(next(k.weight for k in qn.keys if k.kind == "ident"), next(k.weight for k in qn.keys if k.surface == "bucher"))
+
+    def _dense(self, score: float):
+        db = rag.read_db()
+        idx = rag.lexical_index(db)
+        target = next(i for i, c in enumerate(idx.chunks) if c["section"] == "§2 Ausleihe")
+        return mock.patch.object(rag, "dense_scores", side_effect=lambda _db, view, _t: {i: (score if i == target else 0.1) for i in view.allowed})
+
+    def test_dense_path_reaches_judge_below_lexical_floor(self) -> None:
+        q = "Wie lange kann ich Schmöker mitnehmen?"  # colloquial: no key term of the policy sentence
+        with self._dense(rag.DENSE_GATE + 0.05), stub_llm("JA"):
+            res = rag.run_query(token("L2"), q)
+        self.assertEqual(res["result"]["kind"], "answer")
+        self.assertIn("4 Wochen", res["answer"])
+        with self._dense(rag.DENSE_GATE + 0.05), stub_llm("NEIN"):
+            self.assertEqual(rag.run_query(token("L2"), q)["result"]["kind"], "search")  # judge NEIN → never an answer
+        with self._dense(rag.DENSE_GATE - 0.05), stub_llm("JA"):
+            self.assertEqual(rag.run_query(token("L2"), q)["result"]["kind"], "fallback")  # below the dense gate: judge not asked
+        with self._dense(rag.DENSE_GATE + 0.05), stub_llm("JA"):
+            self.assertEqual(rag.run_query(token("L1"), q)["result"]["kind"], "fallback")  # RBAC: L1 sees no L2 chunk
+
     def test_judge_yes_answers_verbatim(self) -> None:
         with stub_llm("JA"):
             res = rag.run_query(token("L2"), "Wie lange dürfen Bücher ausgeliehen werden?")
@@ -349,12 +376,20 @@ class AnswerGate(unittest.TestCase):
         self.assertFalse(res["result"]["trace"]["nliVerified"])
 
     def test_lexical_floor_skips_judge(self) -> None:
-        # only one weak key term matches → below GATE_COVERAGE, the judge is never asked
+        # no key term of the corpus matches → below GATE_COVERAGE, the judge is never asked
         with stub_llm("JA"):
-            res = rag.run_query(token("L2"), "Welche Gebühr kostet ein verlorener Benutzerausweis im Lesesaal?")
+            res = rag.run_query(token("L2"), "Wann schließt die Kantine?")
         self.assertEqual(res["result"]["kind"], "fallback")
         self.assertEqual(res["answer"], rag.NO_ANSWER)
         self.assertNotIn("judge", res["result"]["trace"]["parts"][0]["features"] or {})
+
+    def test_unknown_words_leave_out_of_scope_to_the_judge(self) -> None:
+        # "Gebühr", "verlorener", "Benutzerausweis" occur nowhere (df = 0): capped, so "Lesesaal" reaches the judge; NEIN → no
+        # answer and, since the floor was reached only through the cap, no search hits either
+        with stub_llm("NEIN"):
+            res = rag.run_query(token("L2"), "Welche Gebühr kostet ein verlorener Benutzerausweis im Lesesaal?")
+        self.assertEqual(res["result"]["kind"], "fallback")
+        self.assertIs(res["result"]["trace"]["parts"][0]["features"]["judge"], False)
 
     def test_without_llm_only_search_hits(self) -> None:
         res = rag.run_query(token("L2"), "Wie lange dürfen Bücher ausgeliehen werden?")
