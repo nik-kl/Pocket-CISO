@@ -2236,8 +2236,24 @@ EN_HINTS = frozenset("the is are what who how where when and of for to with must
 
 
 def display_span(text: str) -> str:
-    """Span as shown in an answer: the generated 'Tabelle [§…]:' prefix is a chunker label, not document text."""
-    return TABLE_LABEL.sub("", text)
+    """Span as shown to the user: the generated 'Tabelle [§…]:' prefix is a chunker label, not document text, and a table
+    row reads as a 'Spalte: Wert; Spalte: Wert' list."""
+    return TABLE_LABEL.sub("", text).replace(" | ", "; ") if TABLE_LABEL.match(text) else text
+
+
+def related_spans(idx: "LexIndex", part: Part, w: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    """Spans of a window shown to the user: the answering (last) span, a preceding span only when it contributes a key term
+    that the answering span and its section/document title lack, and the antecedent of an anaphoric next span — no
+    neighbouring sentence without relation to the question."""
+    li, lk = w[-1]
+    known = idx.span_terms[li][lk] | idx.ctx_terms[li]
+    keep = []
+    for n, (i, k) in enumerate(w):
+        nxt = w[n + 1] if n + 1 < len(w) else None
+        adds = any(any(a <= idx.span_terms[i][k] for a in kt.alts) and not any(a <= known for a in kt.alts) for kt in part.qt.keys)
+        if nxt is None or adds or ANAPHOR.match(idx.span_text[nxt[0]][nxt[1]]):
+            keep.append((i, k))
+    return keep
 
 
 def modal_classes(text: str) -> frozenset[str]:
@@ -2534,7 +2550,8 @@ def compose_sentences(q: str, spans: list[tuple[str, str]], vocab: Vocab, use_ll
     if not use_llm or not spans:
         return verbatim, "verbatim"
     text_of = dict(spans)
-    prompt = "Frage: " + q + "\nTextstellen:\n" + "\n".join(f"[S{k + 1}] {display_span(t)}" for k, (_, t) in enumerate(spans)) + "\nAntwort:"
+    # the model keeps the 'Spalte: Wert | Spalte: Wert' row form (with '; ' it picked single cells of the wrong column)
+    prompt = "Frage: " + q + "\nTextstellen:\n" + "\n".join(f"[S{k + 1}] {TABLE_LABEL.sub('', t)}" for k, (_, t) in enumerate(spans)) + "\nAntwort:"
     out = OLLAMA.chat(PHRASE_SYSTEM, prompt, timeout=LLM_TIMEOUT, max_tokens=220)
     if not out:
         return verbatim, "verbatim (LLM nicht verfügbar)"
@@ -2560,8 +2577,11 @@ def search_hits(idx: "LexIndex", parts: list[Part], per_part: int = 3) -> list[d
     for p in parts:
         if not ((p.lexical_ok and not p.capped_only) or p.dense_ok):
             continue
-        cand = [(w[-1][0], " ".join(display_span(idx.span_text[i][k]) for i, k in w)) for w in p.windows]
-        cand += [(i, display_span(idx.chunks[i]["content"])) for i in p.ranked]
+        cand = [(w[-1][0], " ".join(display_span(idx.span_text[i][k]) for i, k in related_spans(idx, p, w))) for w in p.windows]
+        for i in p.ranked:  # further chunks: only their sentences that share a key term (whole chunk when none does)
+            best = max((coverage(p.qt, terms) for terms in idx.span_terms[i]), default=0.0)
+            rel = [display_span(t) for t, terms in zip(idx.span_text[i], idx.span_terms[i]) if best > 0 and coverage(p.qt, terms) >= 0.5 * best]
+            cand.append((i, " ".join(rel) or display_span(idx.chunks[i]["content"])))
         n = 0
         for i, text in cand:
             if n >= per_part or any(h["chunkId"] == idx.chunks[i]["id"] for h in hits):
@@ -2699,6 +2719,10 @@ def run_query(token: str | None, question: str) -> dict[str, Any]:
                    "features": p.features} for p in parts],
         "denseTop": round(best_dense, 3) if dense_all is not None else None, "contradiction": False, "partial": False,
     }
+    # retrieval score for every kind (answer, search, fallback): best dense cosine of the selected windows, else lexical coverage
+    best_cov = max((p.coverage for p in parts), default=0.0)
+    trace["retrievalScore"] = trace["topScore"] = round(best_dense if dense_all is not None else best_cov, 3)
+    trace["lexicalSupport"] = round(best_cov, 2)
 
     def done(kind: str, segments: list[dict[str, str]], citations: dict[str, Any], scores: dict[str, float], spans: dict[str, Any]) -> dict[str, Any]:
         lat["total"] = int((time.perf_counter() - t_all) * 1000)
@@ -2720,7 +2744,9 @@ def run_query(token: str | None, question: str) -> dict[str, Any]:
             for w, vals in p.contradiction:
                 c = idx.chunks[w[-1][0]]
                 text = " ".join(display_span(idx.span_text[i][k]) for i, k in w)
-                shown = list(dict.fromkeys(sf.strip() for d, v, sf in values_in(text) if round(v, 6) in vals.get(d, set())))
+                words = {fold(x): x for x in re.findall(r"[\wÄÖÜäöüß]+", text)}  # 'halbjahrlich' → 'halbjährlich'
+                shown = list(dict.fromkeys(words.get(sf.strip(), sf.strip()) for d, v, sf in values_in(text)
+                                           if round(v, 6) in vals.get(d, set()) or round(v, 6) in vals.get("freq", set())))
                 value = f" (Wert: {', '.join(shown)})" if shown else ""
                 segments += [{"type": "text", "text": f" {c['docName']} {c['section'].split(' ')[0]}: {text}{value} "}, {"type": "cite", "chunkId": c["id"]}]
                 hits.append({"chunkId": c["id"], "docName": c["docName"], "section": c["section"], "content": text, "values": shown})
@@ -2749,7 +2775,7 @@ def run_query(token: str | None, question: str) -> dict[str, Any]:
     ordered: list[tuple[str, str]] = []
     for p in answered:
         for w in p.windows:
-            for i, k in w:
+            for i, k in related_spans(idx, p, w):
                 sid = idx.span_ids[i][k]
                 if sid not in dict(ordered):
                     ordered.append((sid, idx.span_text[i][k]))

@@ -151,7 +151,7 @@ export default function StatelessChatView({ session, snap, notify, onElevate }: 
             </div>
             <div className="overflow-hidden rounded-lg border border-line bg-surface">
               <div className="border-b border-line px-3 py-1.5 font-mono text-[11px] text-faint">chunk_id: {chunk.id}</div>
-              <blockquote className="border-l-2 border-brand px-4 py-3 text-[13px] leading-6 text-fg">{chunk.content}</blockquote>
+              <blockquote className="whitespace-pre-line border-l-2 border-brand px-4 py-3 text-[13px] leading-6 text-fg">{readableChunk(chunk.content)}</blockquote>
             </div>
             <dl className="divide-y divide-line overflow-hidden rounded-lg border border-line text-xs">
               <Prov label="Similarity score" value={score !== undefined ? score.toFixed(3) : "—"} hint={local ? "Term-Coverage (lokale Engine)" : "Cosine (Embedding)"} />
@@ -265,7 +265,7 @@ function ResultView(p: ResultProps) {
           <Arrow />
           <Step ok={result.kind === "answer"} label={`3. Retrieval-Score ${(tr.retrievalScore ?? tr.confidence).toFixed(2)}${fmt(lat?.retrieval)}`} />
           <Arrow />
-          <Step ok={tr.nliVerified || tr.verification === "extractive"} label={`4. ${tr.verification === "extractive" ? "Wörtlicher Auszug (kein NLI)" : `NLI Grounded: ${tr.nliVerified ? "PASS" : "FAIL"}`}${fmt(lat && (lat.generation ?? 0) + (lat.nli ?? 0) || undefined)}`} />
+          <Step ok={tr.nliVerified || tr.verification === "extractive"} label={`4. ${grounding(result.kind, tr)}${fmt(lat && (lat.generation ?? 0) + (lat.nli ?? 0) || undefined)}`} />
           <button onClick={p.onToggleTelemetry} aria-expanded={p.telemetryOpen} className="ml-auto inline-flex items-center gap-1 text-[11px] text-faint hover:text-fg">
             Under the Hood {p.telemetryOpen ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
           </button>
@@ -275,9 +275,9 @@ function ResultView(p: ResultProps) {
             <Cell label="1 · Original User Input" value={tr.original} />
             <Cell label={`2 · Query Rewrite (${tr.rewriteBy ?? "rules"})`} value={tr.rewrite} />
             <Cell label="3 · RBAC Filter Applied" value={`${tr.rbacFilter}  →  ${tr.searched} von ${tr.total} Chunks durchsuchbar`} mono />
-            <Cell label="4 · Grounding Check Status" value={`${tr.verification === "extractive" ? "Verification: extractive (verbatim chunk text, no NLI)" : `NLI Verified: ${tr.nliVerified ? "TRUE" : "FALSE"}`} | Temp: ${tr.temperature.toFixed(1)} | retrieval: ${(tr.retrievalScore ?? tr.topScore ?? 0).toFixed(3)}${tr.lexicalSupport !== undefined ? ` | lexical: ${tr.lexicalSupport.toFixed(2)}` : ""}`} mono />
+            <Cell label="4 · Grounding Check Status" value={`${result.kind === "answer" ? (tr.verification === "extractive" ? "Verification: extractive (verbatim chunk text, no NLI)" : `NLI Verified: ${tr.nliVerified ? "TRUE" : "FALSE"}`) : "nicht verifiziert (keine Antwort)"} | Temp: ${tr.temperature.toFixed(1)} | retrieval: ${(tr.retrievalScore ?? tr.topScore ?? 0).toFixed(3)}${tr.lexicalSupport !== undefined ? ` | lexical: ${tr.lexicalSupport.toFixed(2)}` : ""}`} mono />
             <Cell label="Engine" value={`${tr.engineMode ?? "—"}${tr.answerBy && tr.answerBy !== "none" ? ` · Antwort: ${tr.answerBy}` : ""}`} mono />
-            <Cell label="Latenz (ms)" value={lat ? `rewrite ${lat.rewrite} · rbac ${lat.rbac} · retrieval ${lat.retrieval} · generation ${lat.generation ?? 0} · nli ${lat.nli ?? 0} · Σ ${lat.total}` : "—"} mono />
+            <Cell label="Latenz (ms)" value={lat ? (["rewrite", "rbac", "retrieval", "generation", "nli"] as const).filter((k) => lat[k] !== undefined).map((k) => `${k} ${lat[k]}`).concat(`Σ ${lat.total}`).join(" · ") : "—"} mono />
           </dl>
         )}
       </div>
@@ -366,6 +366,21 @@ function TicketControl({ ticket, ticketBusy, onCreateTicket, label }: ResultProp
       {ticketBusy ? <Loader2 size={14} className="animate-spin" /> : <TicketIcon size={14} />} {label}
     </Button>
   );
+}
+
+/** Step 4 label: a search hit or fallback was never verified as an answer, so it shows no NLI verdict. */
+function grounding(kind: string, tr: { verification?: string; nliVerified: boolean }): string {
+  if (kind !== "answer") return "nicht verifiziert";
+  return tr.verification === "extractive" ? "Wörtlicher Auszug (kein NLI)" : `NLI Grounded: ${tr.nliVerified ? "PASS" : "FAIL"}`;
+}
+
+/** Chunk text for people: the chunker's "Tabelle [§…]:" row label is dropped, every row becomes a "Spalte: Wert" list. */
+function readableChunk(content: string): string {
+  return content
+    .split(/\s*Tabelle \[[^\]]*\]:\s*/)
+    .map((part, i) => (i === 0 ? part : part.split(" | ").join("\n")))
+    .filter((part) => part.trim())
+    .join("\n\n");
 }
 
 function Step({ ok, label }: { ok: boolean; label: string }) {

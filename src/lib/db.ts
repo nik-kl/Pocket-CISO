@@ -665,12 +665,14 @@ export function runQuery(token: string | null, question: string): Promise<R<{ re
       const segments: AnswerSegment[] = [{ type: "text", text: `${SEARCH_LABEL}:` }];
       const citations: Record<string, LiveChunk> = {};
       const scores: Record<string, number> = {};
+      // table rows as the Python engine shows them: no "Tabelle [§…]:" chunker label, "Spalte: Wert; Spalte: Wert"
+      const readable = (t: string) => t.replace(/Tabelle \[[^\]]*\]:\s*/g, "").split(" | ").join("; ");
       top.forEach((s) => {
-        segments.push({ type: "text", text: ` ${s.c.docName} ${s.c.section.split(" ")[0]}: ${s.c.content} ` }, { type: "cite", chunkId: s.c.id });
+        segments.push({ type: "text", text: ` ${s.c.docName} ${s.c.section.split(" ")[0]}: ${readable(s.c.content)} ` }, { type: "cite", chunkId: s.c.id });
         citations[s.c.id] = s.c;
         scores[s.c.id] = Math.round(s.cov * 100) / 100;
       });
-      const hits = top.map((s) => ({ chunkId: s.c.id, docName: s.c.docName, section: s.c.section, content: s.c.content }));
+      const hits = top.map((s) => ({ chunkId: s.c.id, docName: s.c.docName, section: s.c.section, content: readable(s.c.content) }));
       const tGen = ms(t4);
       return { ok: true as const, result: { kind: "search" as const, requiredRole: null, segments, citations, scores, hits, trace: { ...base, nliVerified: false, verification: "none" as const, confidence: Math.round(best.cov * 100) / 100, retrievalScore: Math.round(best.cov * 100) / 100, lexicalSupport: Math.round(best.cov * 100) / 100, answerBy: "search", latencyMs: lat(tGen, 0) } } };
     }

@@ -541,6 +541,25 @@ class EvidenceAcrossSections(unittest.TestCase):
         self.assertNotIn("Fräse", res["answer"])
 
 
+class Display(unittest.TestCase):
+    def test_table_row_reads_as_column_value_list(self) -> None:
+        self.assertEqual(rag.display_span("Tabelle [§1 Geräte]: Gerät: Presse | Wartung: 2 Monate."), "Gerät: Presse; Wartung: 2 Monate.")
+        self.assertEqual(rag.display_span("Text mit | Strich."), "Text mit | Strich.")
+
+    def test_answer_has_no_unrelated_neighbour_sentence_and_scores_are_filled(self) -> None:
+        fresh_db([("Werkstattordnung.md", "§3 Werkzeug", "L2", "Die Werkstatt ist werktags geöffnet. Der Drehmomentschlüssel wird "
+                   "jährlich kalibriert.")])
+        rag._LEX_CACHE = None
+        with stub_llm("JA"):
+            res = rag.run_query(token("L2"), "Wie oft wird der Drehmomentschlüssel in der Werkstatt kalibriert?")
+        self.assertEqual(res["result"]["kind"], "answer")
+        self.assertNotIn("geöffnet", res["answer"])
+        for q in ("Wie oft wird der Drehmomentschlüssel in der Werkstatt kalibriert?", "Wann schließt die Kantine?"):
+            tr = rag.run_query(token("L2"), q)["result"]["trace"]  # search / fallback without LLM
+            self.assertIsInstance(tr["retrievalScore"], float)
+        self.assertGreater(rag.run_query(token("L2"), "Wie oft wird der Drehmomentschlüssel kalibriert?")["result"]["trace"]["retrievalScore"], 0)
+
+
 class QuestionHandling(unittest.TestCase):
     def test_parts_and_context(self) -> None:
         parts, ctx, inj = rag.question_parts("Wir planen eine Migration. Wer genehmigt das und wie lange dauert die Prüfung?")

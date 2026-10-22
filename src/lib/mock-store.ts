@@ -150,7 +150,7 @@ export interface Snapshot {
 export type AnswerSegment = { type: "text"; text: string } | { type: "note"; text: string } | { type: "cite"; chunkId: string; spanId?: string };
 
 export interface LatencyMs {
-  rewrite: number;
+  rewrite?: number; // local engine only; the Python engine splits questions by rules (no rewrite stage)
   rbac: number;
   retrieval: number;
   generation?: number;
