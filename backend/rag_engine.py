@@ -242,6 +242,8 @@ class OllamaClient:
         }
         if json_mode:
             payload["format"] = "json"
+        if model.startswith("qwen3"):  # thinking model: no reasoning trace (3-token judge budget, latency); other models get no think field
+            payload["think"] = False
         try:
             r = httpx.post(f"{OLLAMA_BASE_URL}/api/chat", json=payload, timeout=timeout)
             r.raise_for_status()

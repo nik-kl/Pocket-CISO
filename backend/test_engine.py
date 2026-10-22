@@ -541,6 +541,15 @@ class EvidenceAcrossSections(unittest.TestCase):
         self.assertNotIn("Fräse", res["answer"])
 
 
+class OllamaPayload(unittest.TestCase):
+    def test_think_off_only_for_qwen3(self) -> None:
+        for model, think in (("qwen3:14b", False), ("qwen2.5:7b", None)):
+            with mock.patch.object(rag.OLLAMA, "llm_model", return_value=model), mock.patch.object(rag.httpx, "post") as post:
+                post.return_value.json.return_value = {"message": {"content": "JA"}}
+                self.assertEqual(rag.OLLAMA.chat("s", "u"), "JA")
+                self.assertEqual(post.call_args.kwargs["json"].get("think"), think)
+
+
 class Display(unittest.TestCase):
     def test_table_row_reads_as_column_value_list(self) -> None:
         self.assertEqual(rag.display_span("Tabelle [§1 Geräte]: Gerät: Presse | Wartung: 2 Monate."), "Gerät: Presse; Wartung: 2 Monate.")
