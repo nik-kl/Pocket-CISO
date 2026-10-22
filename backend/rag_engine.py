@@ -46,7 +46,6 @@ DEMO_MODE = not IS_PRODUCTION and (os.getenv("POCKET_CISO_DEMO") == "1" or os.ge
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/")
 LLM_MODEL = os.getenv("LLM_MODEL", "qwen2.5:7b")
 EMBED_MODEL = os.getenv("EMBED_MODEL", "bge-m3")
-REWRITE_TIMEOUT = float(os.getenv("REWRITE_TIMEOUT", "8"))
 LLM_TIMEOUT = float(os.getenv("LLM_TIMEOUT", "14"))
 EMBED_TIMEOUT = float(os.getenv("EMBED_TIMEOUT", "20"))
 EMBED_TOTAL_BUDGET = float(os.getenv("EMBED_TOTAL_BUDGET", "100"))  # whole embed() call; staging stays below the gateway timeout (180 s)
@@ -1587,6 +1586,7 @@ def cistem(w: str) -> str:
     """CISTEM stemmer (Weißweiler & Fraser 2017), case-insensitive variant; input is already folded."""
     if len(w) <= 3:
         return w
+    participle = (w.startswith("ge") and len(w) >= 6) or w.endswith("et")
     w = re.sub(r"^ge(.{4,})", r"\1", w)
     w = w.replace("sch", "$").replace("ei", "%").replace("ie", "&")
     w = re.sub(r"(.)\1", r"\1*", w)
@@ -1598,14 +1598,17 @@ def cistem(w: str) -> str:
             if w2 != w:
                 w = w2
                 continue
-        w2 = re.sub(r"t$", "", w)
+        w2 = w
+        if participle:  # case-insensitive variant: only participles lose their final -t (gemeldet ~ melden), once
+            w2, participle = re.sub(r"t$", "", w), False
         if w2 == w:
             w2 = re.sub(r"[esn]$", "", w)
         if w2 == w:
             break
         w = w2
     w = re.sub(r"(.)\*", r"\1\1", w)
-    return w.replace("$", "sch").replace("%", "ei").replace("&", "ie")
+    w = w.replace("$", "sch").replace("%", "ei").replace("&", "ie")
+    return w[:-3] if w.endswith("ung") and len(w) >= 7 else w  # Meldung ~ melden, Leitung ~ leitet
 
 
 class Vocab:
@@ -1614,6 +1617,7 @@ class Vocab:
 
     def __init__(self, words: Iterable[str]) -> None:
         self.words = frozenset(w for w in words if len(w) >= 4 and w not in R_STOP)
+        self.stems = frozenset(cistem(w) for w in self.words)
         self._memo: dict[str, list[str]] = {}
 
     def split(self, w: str) -> list[str]:
@@ -1641,6 +1645,10 @@ class Vocab:
                         return [head] + sub
             if fallback is None and len(rest) >= 5:
                 fallback = [head, rest]
+        if fallback is None and depth == 0:  # unknown head, known (inflected) tail: "firmenlaptop" → firmen + laptop
+            for i in range(4, len(w) - 3):
+                if cistem(w[i:]) in self.stems and w[i:] not in R_STOP:
+                    return [w[:i], w[i:]]
         return fallback or [w]
 
 
@@ -1727,7 +1735,7 @@ GLOSSARY = Glossary(GLOSSARY_PATH)
 
 # ───────────────────────── Lexical index (built at approval time, persisted next to the vectors) ─────────────────────────
 
-INDEX_VERSION = "lex-1"
+INDEX_VERSION = "lex-3"
 BM25_K1, BM25_B = 1.2, 0.75
 RRF_K = 60
 
@@ -1769,6 +1777,15 @@ class LexIndex:
                 self.span_terms.append([frozenset(analyze(s, vocab)) for s in spans])
                 self.ctx_terms.append(frozenset(analyze(ctx, vocab)))
         self.pos = {c["id"]: i for i, c in enumerate(self.chunks)}
+        # spans: stable ids "<chunk id>:<k>", instruction-like text flagged (never used in answers), section sequences across
+        # neighbouring chunks ("§2 X" and "§2 X (Teil 2)") for context windows
+        self.span_ids = [[f"{c['id']}:{k}" for k in range(len(self.span_text[i]))] for i, c in enumerate(self.chunks)]
+        self.span_instr = [[bool(INSTRUCTION_RE.search(fold(t))) for t in spans] for spans in self.span_text]
+        self.section_key = [(c["docName"], section_title(c["section"])) for c in self.chunks]
+        self.section_seq: dict[tuple[str, str], list[tuple[int, int]]] = defaultdict(list)
+        part_no = [int((re.search(r"\(Teil (\d+)\)$", c["section"]) or [0, 1])[1]) for c in self.chunks]
+        for i in sorted(range(len(self.chunks)), key=lambda x: (self.section_key[x], part_no[x], self.chunks[x]["id"])):
+            self.section_seq[self.section_key[i]] += [(i, k) for k in range(len(self.span_text[i]))]
         self.tf = [Counter(t) for t in self.doc_terms]
         self.dl = [len(t) for t in self.doc_terms]
         self._views: dict[str, RoleView] = {}
@@ -1880,6 +1897,13 @@ class QueryTerms:
 
 def key_terms(question: str, view: RoleView) -> QueryTerms:
     toks = _LEX.findall(fold(question))
+    # German capitalises nouns: when the question uses casing, lower-case words after the first one (verbs, adjectives)
+    # count half; an all-lower-case question keeps equal weights.
+    words_cs = re.findall(r"[A-Za-zÄÖÜäöüß]+", question)
+    folded_words = [fold(w) for w in words_cs]
+    german = sum(w in DE_HINTS for w in folded_words) > sum(w in EN_HINTS for w in folded_words)
+    cased = german and any(w[:1].isupper() for w in words_cs[1:])
+    lower = {fold(w) for w in words_cs[1:] if w[:1].islower()} if cased else set()
     items: list[KeyTerm] = []
     cues: set[str] = set()
     i, n = 0, len(toks)
@@ -1919,7 +1943,7 @@ def key_terms(question: str, view: RoleView) -> QueryTerms:
                     parts = view.vocab.split(w)
                     if parts:
                         alts.append(frozenset(cistem(p) for p in parts))
-                items.append(KeyTerm(t, "word", alts, 0.3 if w in GENERIC_WORDS else 1.0))
+                items.append(KeyTerm(t, "word", alts, 0.3 if w in GENERIC_WORDS else 0.5 if t in lower else 1.0))
         i += 1
 
     # glossary: multi-word members first (consume consecutive word items), then single-term members
@@ -2042,110 +2066,274 @@ def fuse(view: RoleView, *scores: dict[int, float] | None) -> list[int]:
     return sorted(fused, key=lambda i: (-fused[i], view.idx.chunks[i]["id"]))
 
 
-# ───────────────────────── Pipeline B: stateless compliance RAG ─────────────────────────
+# ───────────────────────── Pipeline B: stateless compliance RAG (extract first, verify every sentence) ─────────────────────────
 
 NO_ANSWER = "Keine belegbare Antwort im freigegebenen Bestand."
-COV_MIN = float(os.getenv("COV_MIN", "0.5"))  # step-2 gate (replaced by the feature gate in step 5)
-QUERY_REWRITE = os.getenv("QUERY_REWRITE", "0") == "1"  # LLM rewrite only for the measurement in step 2
+COV_MIN = float(os.getenv("COV_MIN", "0.5"))  # replaced by the feature gate in step 5
+MAX_PARTS = 4
 
-REWRITE_SYSTEM = (
-    "Du bist ein Query-Rewriter für ein Compliance-RAG-System. Du beantwortest NIEMALS Fragen. "
-    "Formuliere die Nutzerfrage als eine einzige, eigenständige, explizite deutsche Suchanfrage zu Unternehmensrichtlinien um "
-    "und behalte alle Schlüsselbegriffe bei. Antworte NUR mit der Suchanfrage in einem Satz."
-)
-ANSWER_SYSTEM = (
-    "Du bist Pocket CISO, ein Compliance-Assistent. Beantworte die Frage in 1 bis 3 knappen deutschen Sätzen und verwende dafür "
-    "ausschließlich Informationen aus den nummerierten Kontext-Abschnitten. Hänge an jeden Satz die Quelle in eckigen Klammern an, "
-    "z. B. [C1]. Behandle jede Teilfrage vollständig, auch wenn dafür mehrere Kontext-Abschnitte nötig sind. "
-    "Übernimm Zahlen, Rollen und Fristen exakt aus dem Kontext und füge nichts hinzu."
-)
-REFUSAL_RE = re.compile(r"^(ich kann|ich habe|leider|entschuldig|es tut mir leid|tut mir leid|als ki|sorry|i cannot|i can't)", re.I)
+# Text addressed to the assistant instead of being policy content ("ignore all previous instructions", "answer only …").
+INSTRUCTION_RE = re.compile(
+    r"(\bignor\w*\s+(?:alle\w*|all|any|the|previous|prior|vorherig\w*|bisherig\w*|obig\w*)\b|\bvergiss\s+(?:alle\w*|die|deine|your)\b"
+    r"|\bforget\s+(?:all|everything|your|the)\b|system\s*-?\s*prompt|^\s*system\s*:|\bdu bist (?:jetzt|nun|ab sofort)\b|\byou are now\b"
+    r"|\b(?:antworte|answer|respond|reply)\w*\b.{0,40}\b(?:nur|only|ausschliesslich|exclusively|everything|alles|jede\w*|every)\b"
+    r"|\bact as\b|\bpretend\b|\bassistenzsystem\w*|\bjailbreak\b)", re.I)
 
-
-def rewrite_query(question: str) -> str | None:
-    out = OLLAMA.chat(REWRITE_SYSTEM, f"Frage: {question} → Suchanfrage:", timeout=REWRITE_TIMEOUT, max_tokens=80)
-    if not out:
-        return None
-    line = re.sub(r"^(suchanfrage|antwort)\s*:\s*", "", out.strip().splitlines()[0].strip().strip("\"'„“”` "), flags=re.I)
-    return line if 8 <= len(line) <= 300 and not REFUSAL_RE.match(line) else None
-
-
-def extractive_answer(question: str, ranked: list[dict[str, Any]]) -> list[dict[str, str]]:
-    q = set(content_stems(question))
-    segs: list[dict[str, str]] = []
-    for i, c in enumerate(ranked[:2]):
-        text = c["content"]
-        if len(text) > 320:
-            sents = split_sentences(text)
-            order = sorted(range(len(sents)), key=lambda k: -len(q & set(content_stems(sents[k]))))[:2]
-            text = " ".join(sents[k] for k in sorted(order))
-        segs.append({"type": "text", "text": (" " if i else "") + text + " "})
-        segs.append({"type": "cite", "chunkId": c["id"]})
-    return segs
-
-
-CITE_RE = re.compile(r"\[\s*((?:C\d+\s*[,;]?\s*)+)\]")
-
-
-def parse_llm_answer(text: str, ctx: list[dict[str, Any]]) -> list[dict[str, str]] | None:
-    cleaned = re.sub(r"\[[^\]]*§[^\]]*\]", "", text).strip()
-    segs: list[dict[str, str]] = []
-    pos = 0
-    for m in CITE_RE.finditer(cleaned):
-        chunk_text = cleaned[pos : m.start()]
-        if chunk_text.strip():
-            segs.append({"type": "text", "text": chunk_text.rstrip() + " "})
-        for n in re.findall(r"C(\d+)", m.group(1)):
-            k = int(n) - 1
-            if 0 <= k < len(ctx) and not any(s.get("chunkId") == ctx[k]["id"] for s in segs[-2:]):
-                segs.append({"type": "cite", "chunkId": ctx[k]["id"]})
-        pos = m.end()
-    tail = cleaned[pos:].strip()
-    if tail:
-        segs.append({"type": "text", "text": (" " if segs else "") + tail})
-    if not any(s["type"] == "text" for s in segs) or not any(s["type"] == "cite" for s in segs):
-        return None
-    return segs
+INTERROG = (r"(?:wie|wer|wem|wen|was|wo|wohin|woher|wann|welche\w*|warum|wieso|weshalb|ob|darf|durfen|muss|mussen|ist|sind|gibt|gilt|kann|"
+            r"konnen|soll|sollen|braucht|brauchen|bis|ab|innerhalb|binnen|nach|how|who|whom|what|where|when|which|why|whether|is|are|do|does|"
+            r"did|can|could|must|may|should|shall|will|within)")
+PART_SPLIT = re.compile(r"(?<=[?!.;:])\s+|,?\s+(?:und|sowie|oder|and|or)\s+(?=" + INTERROG + r"\b)|,\s+(?=(?:wie|wer|was|wo|wann|welche\w*|darf|durfen|muss|mussen|how|who|what|where|when|which)\b)")
+QUESTION_START = re.compile(r"^\s*(?:und\s+|and\s+)?" + INTERROG + r"\b")
+VALUE_Q = re.compile(r"\b(?:wie (?:lange?|viele?\w*|oft|schnell|hoch|gross|fruh)|bis wann|ab wann|ab welche\w*|bis zu welche\w*|innerhalb welche\w*|"
+                     r"binnen welche\w*|in welche\w* (?:frist|zeit|intervall)|welche\w* (?:frist|intervall|wert|hohe|dauer|zeit|lange|mindestlange|gultigkeit)|"
+                     r"nach wie viel\w*|wieviele?|how (?:long|many|much|often|quickly|soon|fast)|within how|what is the (?:maximum|minimum|deadline|sla|interval)|"
+                     r"which (?:deadline|interval|sla)|frist|deadline|intervall|interval)\b")
+WHO_Q = re.compile(r"\b(?:wer|wem|wen|who|whom)\b")
+# yes/no questions about permission or obligation are answered by a normative sentence (muss, darf, verboten, …)
+NORM_Q = re.compile(r"^(?:brauche\w*|can|am i|is it|are we|do i|do we)\b|\b(?:darf|durfen|muss|mussen|soll|sollen|may|must|erlaubt|zulassig|gestattet|verboten|untersagt|allowed|permitted|prohibited|forbidden|pflicht\w*|mandatory|required)\b")
+PROHIBITION_RE = re.compile(r"\b(?:untersagt\w*|verbot\w*|unzulassig\w*|prohibit\w*|forbidden|never|nie|niemals)\b")
+ANAPHOR = re.compile(r"^(?:er|sie|es|dies\w*|dabei|dazu|hierbei|this|these|it|they|he|she)\b", re.I)
+# Named roles and bodies: acronyms (CISO, BSI, SOC) and role nouns, also as the tail of a compound ("Küchenleitung", "CISO-Office")
+ENTITY_RE = re.compile(r"\b(?:[A-ZÄÖÜ]{2,}[A-Za-z0-9]*(?:-[A-Za-zÄÖÜäöü]+)*|[\wÄÖÜäöüß-]*(?i:office|team|owner|leiter\w*|leitung|lead|admin\w*|beauftragte\w*|"
+                       r"commander|desk|führung|vorstand|vorgesetzte\w*|behörde\w*|counsel|betrieb|mitarbeit\w+|dienstleister\w*|führungskräfte|"
+                       r"benutzer\w*|nutzer\w*|employee\w*|staff|personal))\b")
+NEG_RE = re.compile(r"\b(?:nicht|kein\w*|nie|niemals|ohne|untersagt\w*|verbot\w*|unzulassig\w*|ausgeschlossen|not|no|never|without|prohibit\w*|forbidden|cannot)\b")
+MODAL_CLASSES = {
+    "obligation": re.compile(r"\b(?:muss|mussen|musst|zwingend|verpflichtend\w*|verpflichtet|pflicht\w*|erforderlich|notwendig|must|shall|mandatory|required|requires|obligatory)\b"),
+    "permission": re.compile(r"\b(?:darf|durfen|erlaubt|gestattet|zulassig|may|allowed|permitted|permits|authorized)\b"),
+    "recommendation": re.compile(r"\b(?:soll|sollen|sollte|sollten|empfohlen|empfiehlt|should|recommended)\b"),
+    "possibility": re.compile(r"\b(?:kann|konnen|can|could)\b"),
+}
+TABLE_LABEL = re.compile(r"^Tabelle \[[^\]]*\]:\s*")
+YES_NO = re.compile(r"^\s*(?:ja|nein|yes|no)\b")
+# German question detection for the noun-casing weight (English nouns are lower case): German vs English function words
+DE_HINTS = frozenset("der die das den dem des und ist sind wie wer was wo wann ich wir nicht muss mussen darf durfen fur mit von bei welche welcher welches nach im ein eine einen".split())
+EN_HINTS = frozenset("the is are what who how where when and of for to with must may can does do which an a in on".split())
 
 
-NEGATION_RE = re.compile(r"\b(nicht|kein\w*|niemals|nie|ohne|untersagt|verboten|unzulässig|ausgeschlossen|not|never|prohibited|forbidden)\b", re.I)
-OBLIGATION_RE = re.compile(r"\b(muss|müssen|zwingend|verpflichtend|verpflichtet|erforderlich|must|shall|mandatory)\b", re.I)
-PERMISSION_RE = re.compile(r"\b(darf|dürfen|kann|können|erlaubt|zulässig|gestattet|may|allowed|permitted)\b", re.I)
+def display_span(text: str) -> str:
+    """Span as shown in an answer: the generated 'Tabelle [§…]:' prefix is a chunker label, not document text."""
+    return TABLE_LABEL.sub("", text)
 
 
-def claim_mismatches(answer: str, sources: list[str]) -> list[str]:
-    src_sents = [x for t in sources for x in split_sentences(t)]
-    src_q: dict[str, set[str]] = {}
-    for t in sources:
-        for unit, vals in quantities(t).items():
-            src_q.setdefault(unit, set()).update(vals)
-    problems: list[str] = []
-    for sent in split_sentences(answer):
-        stems = set(content_stems(sent))
-        best = max(src_sents, key=lambda x: len(stems & set(content_stems(x))), default="")
-        if len(stems) < 2 or len(stems & set(content_stems(best))) / len(stems) < 0.3:
+def modal_classes(text: str) -> frozenset[str]:
+    f = fold(text)
+    return frozenset(k for k, rx in MODAL_CLASSES.items() if rx.search(f))
+
+
+def entities(text: str) -> set[str]:
+    return {e.strip("-") for e in ENTITY_RE.findall(text) if len(e.strip("-")) >= 2}
+
+
+def numeric_terms(terms: Iterable[str]) -> set[str]:
+    """Numbers, quantities ('24h') and identifiers ('tier2', 'tls1.3') — must be reproduced exactly."""
+    return {t for t in terms if t[:1].isdigit() or re.fullmatch(r"[a-z]+\d[\d.]*", t)}
+
+
+@dataclass
+class Part:
+    text: str
+    qt: QueryTerms
+    value: bool
+    who: bool
+    windows: list[list[tuple[int, int]]]
+    norm: bool = False
+    coverage: float = 0.0
+    answered: bool = False
+    reason: str = ""
+
+
+def question_parts(question: str) -> tuple[list[str], list[str], bool]:
+    """→ (question parts, context sentences, injection_removed). Instructions to the assistant are dropped before analysis."""
+    pieces = [p.strip(" ,;:") for p in PART_SPLIT.split(question) if p and p.strip(" ,;:")]
+    clean = [p for p in pieces if not INSTRUCTION_RE.search(fold(p))]
+    removed = len(clean) < len(pieces)
+    parts = [p for p in clean if QUESTION_START.match(fold(p)) or p.rstrip().endswith("?")]
+    context = [p for p in clean if p not in parts]
+    if not parts and context:
+        parts, context = context, []
+    return parts[:MAX_PARTS], context, removed
+
+
+def span_windows(idx: "LexIndex", view: RoleView, chunk_ids: list[int]) -> list[list[tuple[int, int]]]:
+    """Candidate windows: one span, or a span with up to two preceding spans of the same section (neighbouring chunks included)."""
+    seen: set[tuple[tuple[int, int], ...]] = set()
+    out: list[list[tuple[int, int]]] = []
+    allowed = set(view.allowed)
+    for i in chunk_ids:
+        seq = [s for s in idx.section_seq[idx.section_key[i]] if s[0] in allowed and not idx.span_instr[s[0]][s[1]]]
+        for pos, anchor in enumerate(seq):
+            if anchor[0] != i:
+                continue
+            if pos + 1 < len(seq) and ANAPHOR.match(idx.span_text[seq[pos + 1][0]][seq[pos + 1][1]]) and \
+                    not idx.span_text[anchor[0]][anchor[1]].startswith("Tabelle ["):
+                fw = (anchor, seq[pos + 1])
+                if fw not in seen:
+                    seen.add(fw)
+                    out.append(list(fw))
+            for back in range(0, 3):
+                if pos - back < 0:
+                    break
+                w = tuple(seq[pos - back : pos + 1])
+                if back and any(idx.span_text[x][y].startswith("Tabelle [") for x, y in w):
+                    break  # table rows are self-contained statements; context windows are for running text only
+                if w not in seen:
+                    seen.add(w)
+                    out.append(list(w))
+    return out
+
+
+def window_terms(idx: "LexIndex", w: list[tuple[int, int]]) -> frozenset[str]:
+    return frozenset().union(*(idx.span_terms[i][k] for i, k in w))
+
+
+def window_ok(idx: "LexIndex", part: Part, w: list[tuple[int, int]]) -> bool:
+    """A value question needs a number/quantity in the window, a 'who' question a named role or body."""
+    text = " ".join(idx.span_text[i][k] for i, k in w)
+    if part.value and not numeric_terms(window_terms(idx, w)) and not any(x in FREQ_WORDS for x in _LEX.findall(fold(text))):
+        return False
+    if part.who and not entities(text):
+        return False
+    return True
+
+
+def select_windows(idx: "LexIndex", view: RoleView, part: Part, ranked: list[int]) -> None:
+    rank_of = {i: r for r, i in enumerate(ranked)}
+    cands = span_windows(idx, view, ranked)
+
+    def key(w: list[tuple[int, int]]) -> tuple[float, float, int, int, str]:
+        cov = coverage(part.qt, window_terms(idx, w), idx.ctx_terms[w[-1][0]])
+        rank = min(rank_of.get(i, len(ranked)) for i, _ in w)
+        text = fold(" ".join(idx.span_text[i][k] for i, k in w))
+        normative = 0.08 if part.norm and (modal_classes(text) or PROHIBITION_RE.search(text)) else 0.0
+        # coverage first (+ small bonuses: better fused rank, normative sentence for yes/no questions), then shorter
+        # window, rank, span id (deterministic)
+        return (-(cov + 0.1 / (1 + rank) + normative), -cov, len(w), rank, idx.span_ids[w[-1][0]][w[-1][1]])
+
+    scored = []
+    for w in cands:
+        alone = coverage(part.qt, idx.span_terms[w[-1][0]][w[-1][1]], idx.ctx_terms[w[-1][0]])
+        if alone <= 0:
+            continue  # the answering span itself must match the question
+        if len(w) > 1 and coverage(part.qt, window_terms(idx, w), idx.ctx_terms[w[-1][0]]) < alone + 0.1:
+            continue  # a preceding span must add coverage, otherwise the shorter window wins
+        scored.append((key(w), w))
+    scored.sort(key=lambda x: x[0])
+    good = [w for _, w in scored if window_ok(idx, part, w)]
+    if not good:
+        part.reason = "kein Wert/keine Rolle in den Fundstellen" if scored else "keine Fundstelle"
+        return
+    first = good[0]
+    chosen = [first]
+    got = window_terms(idx, first)
+    base = coverage(part.qt, got, idx.ctx_terms[first[-1][0]])
+    for w in good[1:]:
+        if set(w) & set(first):
             continue
-        if bool(NEGATION_RE.search(sent)) != bool(NEGATION_RE.search(best)):
-            problems.append("Negation")
-        elif (PERMISSION_RE.search(sent) and OBLIGATION_RE.search(best) and not PERMISSION_RE.search(best)) or (
-            OBLIGATION_RE.search(sent) and PERMISSION_RE.search(best) and not OBLIGATION_RE.search(best)
-        ):
-            problems.append("Modalität")
-    problems += [f"Wert/Einheit {u}" for u, vals in quantities(answer).items() if vals - src_q.get(u, set())]
+        gain = coverage(part.qt, got | window_terms(idx, w)) - coverage(part.qt, got)
+        close = idx.section_key[w[-1][0]] != idx.section_key[first[-1][0]] and \
+            coverage(part.qt, window_terms(idx, w), idx.ctx_terms[w[-1][0]]) >= 0.9 * base
+        if gain >= 0.2 or close:  # complementary statement, or an equally good one from another section
+            chosen.append(w)
+            got = got | window_terms(idx, w)
+            break
+    part.windows = chosen
+    part.coverage = max(base, coverage(part.qt, got, idx.ctx_terms[first[-1][0]]))
+
+
+# ── answer sentences + verifier ──
+
+PHRASE_SYSTEM = (
+    "Du formulierst eine Antwort ausschließlich aus nummerierten, freigegebenen Textstellen. Regeln: höchstens drei Sätze; "
+    "jeder Satz endet mit den Nummern der verwendeten Textstellen, z. B. [S1] oder [S1][S2]; Zahlen mit Einheiten, Verneinungen "
+    "(nicht, kein, verboten), Modalverben (muss, darf, soll, kann) und Rollen oder Stellen (z. B. CISO, Geschäftsführung, BSI) "
+    "werden wörtlich übernommen; nichts hinzufügen, was nicht in den Textstellen steht; Sprache der Textstellen verwenden."
+)
+
+
+@dataclass
+class Sentence:
+    text: str
+    spans: list[str]  # span ids
+    source: str  # llm | verbatim
+    verified: bool = True
+    reasons: list[str] | None = None
+
+
+def verify_sentence(text: str, spans: list[str], vocab: Vocab) -> list[str]:
+    """Empty list = supported. Every number with its unit and every identifier must appear identically, negation polarity and
+    modality must match the best-matching cited span, named roles/bodies must appear in the cited spans, ≥ 70 % of the
+    content terms must be supported."""
+    if not spans:
+        return ["keine Quelle"]
+    st = set(analyze(text, vocab))
+    src_terms = [set(analyze(s, vocab)) for s in spans]
+    union = set().union(*src_terms)
+    problems: list[str] = []
+    missing_nums = numeric_terms(st) - numeric_terms(union)
+    if missing_nums:
+        problems.append("Zahl/Einheit: " + ", ".join(sorted(missing_nums)))
+    words = {t for t in st if t.isalpha() and len(t) >= 3}
+    expanded = set(union)
+    for t in union:
+        for gi in GLOSSARY.single.get(t, []):
+            for m in GLOSSARY.groups[gi]:
+                expanded |= m
+    # every content word must come from the cited spans (or a glossary equivalent); one word of slack for inflection noise
+    if len(words - expanded) > 1:
+        problems.append("Inhalt nicht belegt: " + ", ".join(sorted(words - expanded)))
+    if YES_NO.match(fold(text)):  # "Ja, …" / "No, …" is a verdict drawn by the model, not text of the source
+        problems.append("Ja/Nein-Urteil")
+    best = max(range(len(spans)), key=lambda k: (len(st & src_terms[k]), -k))
+    f_text, f_best = fold(text), fold(spans[best])
+    if bool(NEG_RE.search(f_text)) != bool(NEG_RE.search(f_best)):
+        problems.append("Verneinung")
+    if modal_classes(text) != modal_classes(spans[best]):
+        problems.append("Modalität")
+    src = fold(" ".join(spans))
+    for e in entities(text):
+        if fold(e) not in src:
+            problems.append(f"Rolle/Stelle: {e}")
     return problems
 
 
-def nli_check(segments: list[dict[str, str]], chunks: dict[str, dict[str, Any]]) -> dict[str, Any]:
-    answer = re.sub(r"§\s*\d+(?:\.\d+)*", "", " ".join(s["text"] for s in segments if s["type"] == "text"))
-    cited_chunks = [chunks[s["chunkId"]] for s in segments if s["type"] == "cite" and s["chunkId"] in chunks]
-    cited = [c["content"] for c in cited_chunks]
-    ctx = " ".join(cited + [f"{c['docName']} {c['section']}" for c in cited_chunks])
-    unsupported = sorted(numbers_of(answer) - numbers_of(ctx))
-    a_stems, c_stems = content_stems(answer), set(content_stems(ctx))
-    cov = (sum(1 for s in a_stems if s in c_stems) / len(a_stems)) if a_stems else 1.0
-    mismatches = claim_mismatches(answer, cited) if cited else []
-    return {"verified": bool(cited) and len(a_stems) >= 2 and not unsupported and not mismatches and cov >= 0.6,
-            "unsupportedNumbers": unsupported, "mismatches": mismatches, "coverage": round(cov, 2)}
+def parse_phrased(out: str, span_ids: list[str]) -> list[Sentence]:
+    sents: list[Sentence] = []
+    for raw in split_sentences(out.replace("\n", " ")):
+        refs = [int(n) for n in re.findall(r"S(\d+)", " ".join(re.findall(r"\[([^\]]*)\]", raw)))]
+        text = re.sub(r"\s*\[[^\]]*\]", "", raw).strip()
+        if not text:
+            if sents and refs:  # citation block after the sentence end
+                sents[-1].spans += [span_ids[r - 1] for r in refs if 0 < r <= len(span_ids) and span_ids[r - 1] not in sents[-1].spans]
+            continue
+        sents.append(Sentence(text, list(dict.fromkeys(span_ids[r - 1] for r in refs if 0 < r <= len(span_ids))), "llm"))
+    return sents
+
+
+def compose_sentences(q: str, spans: list[tuple[str, str]], vocab: Vocab, use_llm: bool) -> tuple[list[Sentence], str]:
+    """spans = [(span_id, text)] in answer order. Verbatim by default; the LLM may only combine/rephrase them (≤ 3 sentences),
+    and every LLM sentence that fails the verifier is replaced by the verbatim spans it cited."""
+    verbatim = [Sentence(display_span(t), [sid], "verbatim") for sid, t in spans]
+    if not use_llm or not spans:
+        return verbatim, "verbatim"
+    text_of = dict(spans)
+    prompt = "Frage: " + q + "\nTextstellen:\n" + "\n".join(f"[S{k + 1}] {display_span(t)}" for k, (_, t) in enumerate(spans)) + "\nAntwort:"
+    out = OLLAMA.chat(PHRASE_SYSTEM, prompt, timeout=LLM_TIMEOUT, max_tokens=220)
+    if not out:
+        return verbatim, "verbatim (LLM nicht verfügbar)"
+    ids = [sid for sid, _ in spans]
+    result: list[Sentence] = []
+    for s in parse_phrased(out, ids)[:3]:
+        used = [sid for sid in s.spans if set(analyze(s.text, vocab)) & set(analyze(text_of[sid], vocab))]
+        problems = verify_sentence(s.text, [text_of[sid] for sid in used], vocab)
+        if problems:
+            result += [Sentence(display_span(text_of[sid]), [sid], "verbatim", False, problems) for sid in (used or []) if not any(sid in r.spans for r in result)]
+            continue
+        result.append(Sentence(s.text, used, "llm", True, []))
+    for sid, t in spans:  # every selected span must be represented; nothing the verifier could not check is shown
+        if not any(sid in r.spans for r in result):
+            result.append(Sentence(display_span(t), [sid], "verbatim"))
+    return result, "llm+verifier"
 
 
 def _restricted_match(db: dict[str, Any], role: str, question: str) -> dict[str, Any] | None:
@@ -2176,77 +2364,103 @@ def run_query(token: str | None, question: str) -> dict[str, Any]:
     role = actor["role"]
 
     t = time.perf_counter()
-    rewrite = rewrite_query(q) if QUERY_REWRITE and OLLAMA.llm_model() else None
-    lat["rewrite"] = int((time.perf_counter() - t) * 1000)
-
-    t = time.perf_counter()
     idx = lexical_index(db)
     view = idx.view(role)  # RBAC pre-filter before any scoring
+    texts, context, injection = question_parts(q)
     lat["rbac"] = int((time.perf_counter() - t) * 1000)
 
     t = time.perf_counter()
-    qt = key_terms(q, view)
-    weights = dict(qt.weights)
-    if rewrite:
-        for x, w in key_terms(rewrite, view).weights.items():
-            weights[x] = max(weights.get(x, 0.0), 0.5 * w)
-    bm = view.bm25(weights)
-    dense = dense_scores(db, view, [q] + ([rewrite] if rewrite else []))
-    ranked = fuse(view, bm, dense)[:8]
-    covs = {i: coverage(qt, frozenset(idx.doc_terms[i]), idx.ctx_terms[i]) for i in ranked}
-    top = ranked[:4]
-    best_cov = max((covs[i] for i in top), default=0.0)
-    dense_top = max((dense[i] for i in top), default=0.0) if dense else None
+    ctx_weights: dict[str, float] = {}
+    for c in context:
+        for x, w in key_terms(c, view).weights.items():
+            ctx_weights[x] = max(ctx_weights.get(x, 0.0), 0.3 * w)
+    dense_all = dense_scores(db, view, texts) if texts and view.n else None
+    parts: list[Part] = []
+    best_dense = 0.0
+    candidate_docs: list[str] = []
+    for ptext in texts:
+        qt = key_terms(ptext, view)
+        f = fold(ptext)
+        part = Part(ptext, qt, bool(VALUE_Q.search(f) or qt.unit_cues), bool(WHO_Q.search(f)), [], bool(NORM_Q.search(f)))
+        if not qt.keys or not view.n:
+            part.reason = "keine Suchbegriffe" if view.n else "keine Fundstelle"
+            parts.append(part)
+            continue
+        weights = dict(ctx_weights)
+        for x, w in qt.weights.items():
+            weights[x] = max(weights.get(x, 0.0), w)
+        bm = view.bm25(weights)
+        dense = dense_scores(db, view, [ptext]) if dense_all is not None else None
+        ranked = fuse(view, bm, dense)[:8]
+        candidate_docs += [idx.chunks[i]["docName"] for i in ranked]
+        select_windows(idx, view, part, ranked)
+        dense_top = max((dense.get(i, 0.0) for w in part.windows for i, _ in w), default=0.0) if dense else None
+        best_dense = max(best_dense, dense_top or 0.0)
+        part.answered = bool(part.windows) and part.coverage >= COV_MIN and (dense_top is None or dense_top >= PARAMS["ollama"]["min_score"])
+        if part.windows and not part.answered:
+            part.reason = f"Abdeckung {part.coverage:.2f} < {COV_MIN}" if part.coverage < COV_MIN else "Dense-Score zu niedrig"
+        parts.append(part)
     lat["retrieval"] = int((time.perf_counter() - t) * 1000)
+
     label = engine_label()
     trace: dict[str, Any] = {
-        "original": q, "rewrite": rewrite or q, "rbacFilter": f"min_role <= {role}", "searched": view.n, "total": len(idx.chunks),
+        "original": q, "rewrite": " | ".join(texts) if texts else q, "rbacFilter": f"min_role <= {role}", "searched": view.n, "total": len(idx.chunks),
         "nliVerified": False, "temperature": 0.0, "confidence": 0.0, "topScore": 0.0, "latencyMs": lat, "engineMode": label,
-        "rewriteBy": "llm" if rewrite else "none", "answerBy": "none", "coverage": round(best_cov, 3),
-        "denseTop": round(dense_top, 3) if dense_top is not None else None, "bm25Top": round(max((bm[i] for i in top if i in bm), default=0.0), 3),
-        "candidateDocs": [idx.chunks[i]["docName"] for i in ranked],
+        "rewriteBy": "rules (Teilfragen)", "answerBy": "none", "injectionRemoved": injection, "candidateDocs": list(dict.fromkeys(candidate_docs)),
+        "parts": [{"text": p.text, "answered": p.answered, "coverage": round(p.coverage, 3), "value": p.value, "who": p.who, "reason": p.reason} for p in parts],
+        "denseTop": round(best_dense, 3) if dense_all is not None else None, "contradiction": False, "partial": False,
     }
 
-    def done(kind: str, segments: list[dict[str, str]], citations: dict[str, Any], scores: dict[str, float]) -> dict[str, Any]:
+    def done(kind: str, segments: list[dict[str, str]], citations: dict[str, Any], scores: dict[str, float], spans: dict[str, Any]) -> dict[str, Any]:
         lat["total"] = int((time.perf_counter() - t_all) * 1000)
-        plain = " ".join(s["text"].strip() for s in segments if s["type"] == "text")
+        plain = " ".join(s["text"].strip() for s in segments if s["type"] in ("text", "note"))
         telemetry = {"rewrittenQuery": trace["rewrite"], "rbacFilter": trace["rbacFilter"], "topScore": trace["topScore"], "nliVerified": trace["nliVerified"],
                      "latencyMs": lat, "engineMode": label, "rbacDenied": False, "requiredRole": None}
-        return {"ok": True, "result": {"kind": kind, "requiredRole": None, "segments": segments, "citations": citations, "scores": scores, "trace": trace},
+        return {"ok": True, "result": {"kind": kind, "requiredRole": None, "segments": segments, "citations": citations, "scores": scores, "spans": spans, "trace": trace},
                 "answer": plain, "citations": list(citations.values()), "telemetry": telemetry}
 
-    answerable = bool(top) and best_cov >= COV_MIN and (dense_top is None or dense_top >= PARAMS["ollama"]["min_score"])
-    if not answerable:
+    answered = [p for p in parts if p.answered]
+    if not answered:
         hidden = _restricted_match(db, role, q)
         if hidden:
             with locked_db() as dbw:
                 append_denial(dbw, actor["email"], role, "RBAC_DENIED", hidden["docName"], f"Retrieval erfordert {hidden['minRole']}")
         trace.update({"verification": "none", "candidateDocs": trace["candidateDocs"] if view.n else []})
-        return done("fallback", [{"type": "text", "text": NO_ANSWER}], {}, {})
+        return done("fallback", [{"type": "text", "text": NO_ANSWER}], {}, {}, {})
 
     t = time.perf_counter()
-    ctx = [idx.chunks[i] for i in top if covs[i] >= COV_MIN * 0.6]
-    segments: list[dict[str, str]] | None = None
-    answer_by = "rules"
-    llm_out = None
-    if OLLAMA.llm_model():
-        prompt = "Kontext:\n" + "\n".join(f"[C{k + 1}] {c['docName']} {c['section']}: {c['content']}" for k, c in enumerate(ctx)) + f"\n\nFrage: {q}\nAntwort:"
-        llm_out = OLLAMA.chat(ANSWER_SYSTEM, prompt, timeout=LLM_TIMEOUT, max_tokens=260)
-        if llm_out:
-            segments, answer_by = parse_llm_answer(llm_out, ctx), "llm"
+    ordered: list[tuple[str, str]] = []
+    for p in answered:
+        for w in p.windows:
+            for i, k in w:
+                sid = idx.span_ids[i][k]
+                if sid not in dict(ordered):
+                    ordered.append((sid, idx.span_text[i][k]))
+    use_llm = bool(OLLAMA.llm_model())
+    sentences, answer_by = compose_sentences(q, ordered, view.vocab, use_llm)
     lat["generation"] = int((time.perf_counter() - t) * 1000)
-    t = time.perf_counter()
-    by_id = {c["id"]: c for c in ctx}
-    nli = nli_check(segments, by_id) if segments else {"verified": False}
-    if not nli["verified"]:
-        segments, answer_by = extractive_answer(q, ctx), "rules" if not llm_out else "rules (NLI-Fallback)"
-        nli = nli_check(segments, by_id)
-    lat["nli"] = int((time.perf_counter() - t) * 1000)
-    cited_ids = list(dict.fromkeys(s["chunkId"] for s in segments if s["type"] == "cite"))
-    score_of = {idx.chunks[i]["id"]: (dense[i] if dense else covs[i]) for i in top}
-    trace.update({"nliVerified": bool(nli["verified"]), "confidence": round(best_cov, 2), "retrievalScore": round(dense_top if dense_top is not None else best_cov, 3),
-                  "topScore": round(dense_top if dense_top is not None else best_cov, 3), "lexicalSupport": round(best_cov, 2), "verification": "lexical-nli", "answerBy": answer_by})
-    return done("answer", segments, {i: by_id[i] for i in cited_ids if i in by_id}, {i: round(score_of.get(i, 0.0), 3) for i in cited_ids})
+
+    span_chunk = {idx.span_ids[i][k]: i for i in range(len(idx.chunks)) for k in range(len(idx.span_ids[i]))}
+    segments: list[dict[str, str]] = []
+    for s in sentences:
+        segments.append({"type": "text", "text": (" " if segments else "") + s.text + " "})
+        for sid in s.spans:
+            segments.append({"type": "cite", "chunkId": idx.chunks[span_chunk[sid]]["id"], "spanId": sid})
+    unanswered = [p for p in parts if not p.answered]
+    for p in unanswered:
+        segments.append({"type": "note", "text": f"Zu „{p.text}“ enthält der freigegebene Bestand keine belegbare Aussage."})
+    cited_chunks = list(dict.fromkeys(s["chunkId"] for s in segments if s["type"] == "cite"))
+    by_id = {c["id"]: c for c in idx.chunks}
+    spans_out = {sid: {"chunkId": idx.chunks[span_chunk[sid]]["id"], "text": text} for sid, text in ordered}
+    cov = min(p.coverage for p in answered)
+    trace.update({
+        "nliVerified": all(s.verified for s in sentences), "verification": "span-verifier", "answerBy": answer_by, "partial": bool(unanswered),
+        "confidence": round(cov, 2), "retrievalScore": round(best_dense if dense_all is not None else cov, 3), "topScore": round(best_dense if dense_all is not None else cov, 3),
+        "lexicalSupport": round(cov, 2),
+        "sentences": [{"text": s.text, "spans": s.spans, "source": s.source, "verified": s.verified, "problems": s.reasons or []} for s in sentences],
+    })
+    scores = {cid: round(max((p.coverage for p in answered), default=0.0), 3) for cid in cited_chunks}
+    return done("answer", segments, {cid: by_id[cid] for cid in cited_chunks}, scores, spans_out)
 
 
 # ───────────────────────── Health ─────────────────────────

@@ -116,7 +116,7 @@ def worker(args: argparse.Namespace) -> None:
         print(f"  [{args.worker}] {msg}", flush=True)
 
     if not args.skip_build:
-        build_corpus(rag, workdir, args.injection_doc, say)
+        build_corpus(rag, workdir, args.injection_doc, say, args.corpus)
     if args.build_only:
         return
 
@@ -167,7 +167,9 @@ def approve_pending(rag: Any, say: Any) -> None:
         say(f"approved {d['docName']}: {out['merged']} chunk(s), {len(d['conflicts'])} conflict(s){' (override)' if override else ''}")
 
 
-def build_corpus(rag: Any, workdir: Path, injection_doc: bool, say: Any) -> None:
+def build_corpus(rag: Any, workdir: Path, injection_doc: bool, say: Any, corpus: str = "") -> None:
+    """Default corpus: watched_inbox (connector) + seed_policies (stage_document). --corpus DIR: every pdf/docx/md/txt of DIR
+    through the watched-inbox connector (same import path, minRole L2)."""
     data, inbox = workdir / "data", workdir / "inbox"
     shutil.rmtree(data, ignore_errors=True)
     shutil.rmtree(inbox, ignore_errors=True)
@@ -175,8 +177,8 @@ def build_corpus(rag: Any, workdir: Path, injection_doc: bool, say: Any) -> None
     inbox.mkdir(parents=True)
     t0 = time.time()
     init_db(rag)
-    for src in sorted((BACKEND / "watched_inbox").iterdir()):
-        if src.is_file() and not src.name.startswith("."):
+    for src in sorted((Path(corpus) if corpus else BACKEND / "watched_inbox").iterdir()):
+        if src.is_file() and not src.name.startswith(".") and src.suffix.lower() in (".pdf", ".docx", ".md", ".txt"):
             shutil.copy2(src, inbox / src.name)
     l2 = sign_token("L2")
     report = rag.sync_watched_inbox(l2)["report"]
@@ -184,6 +186,10 @@ def build_corpus(rag: Any, workdir: Path, injection_doc: bool, say: Any) -> None
     if report["failed"]:
         raise SystemExit(f"inbox ingestion failed: {report['failed']}")
     approve_pending(rag, say)
+    if corpus:
+        db = rag.read_db()
+        say(f"corpus ready in {time.time() - t0:.0f} s: {len(db['live_chunks'])} chunks, {len({c['docName'] for c in db['live_chunks']})} documents")
+        return
     seeds = [(p.name, p.read_bytes()) for p in sorted((BACKEND / "seed_policies").iterdir()) if p.is_file() and not p.name.startswith(".")]
     if injection_doc:
         seeds.append((INJECTION_DOC[0], INJECTION_DOC[1].encode("utf-8")))
@@ -326,7 +332,10 @@ def independent_errors(answer: str, spans: list[str]) -> list[str]:
     for v, u in NUM_UNIT.findall(answer):
         if canon_qty(v, u) not in src_q:
             errs.append(f"numeric:{v} {u}")
+    flat = re.sub(r"\s+", " ", src.lower())
     for sent in re.split(r"(?<=[.!?])\s+|\n+", answer):
+        if re.sub(r"\s+", " ", sent.lower()).strip() in flat:
+            continue  # verbatim quote of a cited span cannot change number, polarity or modality
         ws = words(sent)
         if len(ws) < 3:
             continue
@@ -344,7 +353,7 @@ def independent_errors(answer: str, spans: list[str]) -> list[str]:
 def extract(res: dict[str, Any]) -> dict[str, Any]:
     r = res.get("result") or {}
     segs = r.get("segments") or []
-    answer = " ".join(s["text"].strip() for s in segs if s.get("type") == "text").strip()
+    answer = " ".join(s["text"].strip() for s in segs if s.get("type") == "text").strip()  # notes are not claims
     cites = r.get("citations") or {}
     spans_map = r.get("spans") or {}
     cited_ids = [s.get("chunkId") for s in segs if s.get("type") == "cite"]
@@ -533,9 +542,11 @@ def category_table(ms: list[dict[str, Any]]) -> str:
 
 # ───────────────────────── orchestration ─────────────────────────
 
-def run_python_mode(mode: str, workdir: Path, qfile: Path, passes: int, injection_doc: bool, skip_build: bool) -> dict[str, Any]:
+def run_python_mode(mode: str, workdir: Path, qfile: Path, passes: int, injection_doc: bool, skip_build: bool, corpus: str = "") -> dict[str, Any]:
     out = workdir / "raw.json"
     cmd = [sys.executable, str(Path(__file__).resolve()), "--_worker", mode, "--workdir", str(workdir), "--questions", str(qfile), "--out", str(out), "--passes", str(passes)]
+    if corpus:
+        cmd += ["--corpus", corpus]
     if injection_doc:
         cmd.append("--injection-doc")
     if skip_build:
@@ -544,8 +555,10 @@ def run_python_mode(mode: str, workdir: Path, qfile: Path, passes: int, injectio
     return json.loads(out.read_text(encoding="utf-8"))
 
 
-def build_only(mode: str, workdir: Path, injection_doc: bool) -> None:
+def build_only(mode: str, workdir: Path, injection_doc: bool, corpus: str = "") -> None:
     cmd = [sys.executable, str(Path(__file__).resolve()), "--_worker", mode, "--workdir", str(workdir), "--build-only"]
+    if corpus:
+        cmd += ["--corpus", corpus]
     if injection_doc:
         cmd.append("--injection-doc")
     subprocess.run(cmd, env=base_env(workdir, mode), check=True)
@@ -579,6 +592,7 @@ def main() -> None:
     ap.add_argument("--categories", default="")
     ap.add_argument("--passes", type=int, default=2, help="2 = determinism check (second pass with cleared caches)")
     ap.add_argument("--label", default=time.strftime("%Y%m%d-%H%M%S"))
+    ap.add_argument("--corpus", default="", help="directory with pdf/docx/md/txt used instead of watched_inbox + seed_policies")
     ap.add_argument("--reuse-corpus", action="store_true", help="skip the corpus build when the mode's workdir already has one")
     ap.add_argument("--no-smoke", action="store_true")
     ap.add_argument("--show-failures", type=int, default=60)
@@ -607,30 +621,33 @@ def main() -> None:
     if args.categories:
         cats = set(args.categories.split(","))
         questions = [q for q in questions if q["category"] in cats]
-    label = ("holdout-" if holdout else "") + args.label
+    label = ("holdout-" if holdout else "") + ("corpus-" if args.corpus else "") + args.label
     resdir = SCRATCH / "results" / label
     resdir.mkdir(parents=True, exist_ok=True)
     qfile = resdir / "questions.jsonl"
     qfile.write_text("".join(json.dumps(q, ensure_ascii=False) + "\n" for q in questions), encoding="utf-8")
-    injection_doc = not holdout
+    corpus = str(Path(args.corpus).resolve()) if args.corpus else ""
+    if corpus and not Path(corpus).is_dir():
+        raise SystemExit(f"corpus directory not found: {corpus}")
+    injection_doc = not holdout and not corpus
     modes = [m for m in args.modes.split(",") if m]
     print(f"{len(questions)} questions from {qpath.name if not holdout else '<holdout>'} · modes {modes} · results {resdir}", flush=True)
 
     all_metrics = []
     smoke_result = None
     for mode in modes:
-        workdir = SCRATCH / "work" / ("holdout-" if holdout else "") / mode
+        workdir = SCRATCH / "work" / (("holdout-" if holdout else "") + ("corpus-" if args.corpus else "") + mode)
         workdir.mkdir(parents=True, exist_ok=True)
         reuse = args.reuse_corpus and (workdir / "data" / "pocket-ciso-db.json").exists()
         t0 = time.time()
         if mode == "node":
             if not reuse:
-                build_only("noollama", workdir, injection_doc)
+                build_only("noollama", workdir, injection_doc, corpus)
             raw = run_gateway(workdir, "node", questions, args.passes, None)
             db = json.loads((workdir / "data" / "pocket-ciso-db.json").read_text(encoding="utf-8"))
             raw["meta"] = {"chunks": [{k: c[k] for k in ("id", "docName", "section", "minRole", "content")} for c in db["live_chunks"]]}
         else:
-            raw = run_python_mode(mode, workdir, qfile, args.passes, injection_doc, reuse)
+            raw = run_python_mode(mode, workdir, qfile, args.passes, injection_doc, reuse, corpus)
             if mode == "ollama" and not args.no_smoke and not holdout:
                 pick = [q for q in questions if q["role"] != "L1"][:6] + [q for q in questions if q["role"] == "L1"][:2]
                 smoke_result = smoke(workdir, pick, raw)

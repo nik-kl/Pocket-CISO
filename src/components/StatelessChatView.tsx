@@ -315,6 +315,8 @@ function ResultView(p: ResultProps) {
             {result.segments.map((s, i) =>
               s.type === "text" ? (
                 <span key={i}>{s.text}</span>
+              ) : s.type === "note" ? (
+                <span key={i} className="block pt-2 text-sm italic text-muted">{s.text}</span>
               ) : (
                 <button
                   key={i}

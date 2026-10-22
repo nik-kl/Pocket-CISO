@@ -134,7 +134,8 @@ export interface Snapshot {
   backend: BackendStatus;
 }
 
-export type AnswerSegment = { type: "text"; text: string } | { type: "cite"; chunkId: string };
+// "note" = statement about the answer itself (e.g. an unanswered part), never a claim from the documents.
+export type AnswerSegment = { type: "text"; text: string } | { type: "note"; text: string } | { type: "cite"; chunkId: string; spanId?: string };
 
 export interface LatencyMs {
   rewrite: number;
