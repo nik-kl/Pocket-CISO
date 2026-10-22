@@ -2678,12 +2678,10 @@ def run_query(token: str | None, question: str) -> dict[str, Any]:
             part.contradiction = find_contradiction(idx, view, part, ranked) or None
             if use_llm and not part.contradiction:
                 part.features["judge"] = judge_answerable(ptext + ctx_note, [idx.span_text[i][k] for w in part.windows for i, k in w][:6])
-        # dense path: below the lexical floor, or the judge rejected the lexical window and the best dense chunk is another one
-        lex_rejected = part.lexical_ok and part.features.get("judge") is False and not part.contradiction
-        if dense and (not part.lexical_ok or lex_rejected):
+        # dense path only below the lexical floor: a second judge call after a NEIN on the lexical window gave the 7B judge a
+        # second chance to say JA and produced 2 false answers on the dev set (I-1, R-10) → never retried
+        if dense and not part.lexical_ok:
             dw = dense_window(idx, view, part, dense)
-            if dw and lex_rejected and dw[0][0][0] in win_chunks:
-                dw = None
             if dw:
                 part.dense_ok, part.windows = True, [dw[0]]
                 part.features["densePath"] = round(dw[1], 4)
