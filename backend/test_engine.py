@@ -94,6 +94,51 @@ class Chunker(unittest.TestCase):
         self.assertIn("Tier: Tier 2 | RTO: 12 Stunden", text)
 
 
+    def test_headings_and_bullets(self) -> None:
+        title, chunks = rag.chunk_document("# Titel\n## §1 Zweck\nDieser Text beschreibt den Zweck.\n## §2 Regeln\n- erste Regel\n- zweite Regel\n")
+        self.assertEqual(title, "Titel")
+        self.assertEqual([c["section"] for c in chunks], ["§1 Zweck", "§2 Regeln"])
+        self.assertIn("erste Regel. zweite Regel.", chunks[1]["content"])
+
+    def test_chunking_is_deterministic(self) -> None:
+        text = (Path(__file__).resolve().parent / "seed_policies" / "Passwort_Richtlinie_v4.md").read_text(encoding="utf-8")
+        self.assertEqual(rag.chunk_document(text), rag.chunk_document(text))
+
+
+class Approval(unittest.TestCase):
+    DOC = "## §1 Zweck\nDiese Richtlinie regelt Backups.\n\n## §2 Fristen\nBackups werden täglich erstellt.\n\n## §3 Aufbewahrung\nBackups werden 30 Tage aufbewahrt.\n"
+
+    def setUp(self) -> None:
+        fresh_db([])
+        rag.VECTORS.__init__()
+        rag.stage_document(token("L2"), doc_name="Backup_Richtlinie.md", text=self.DOC, min_role="L2")
+        diff = rag.read_db()["staged_diffs"][0]
+        rag.approve_diff(token("L3"), diff["id"])
+
+    def sections(self) -> list[str]:
+        return sorted(c["section"] for c in rag.read_db()["live_chunks"])
+
+    def test_partial_paste_removes_nothing(self) -> None:
+        out = rag.stage_text(token("L2"), title="Fristen neu", target_doc="Backup_Richtlinie.md", new_text="## §2 Fristen\nBackups werden stündlich erstellt.", min_role="L2")
+        self.assertEqual(out["diff"]["removedChunkIds"], [])
+        rag.approve_diff(token("L3"), out["diff"]["id"])
+        self.assertEqual(self.sections(), ["§1 Zweck", "§2 Fristen", "§3 Aufbewahrung"])
+        self.assertTrue(any("stündlich" in c["content"] for c in rag.read_db()["live_chunks"]))
+
+    def test_full_upload_lists_and_removes_dropped_clauses(self) -> None:
+        text = "## §1 Zweck\nDiese Richtlinie regelt Backups.\n\n## §2 Fristen\nBackups werden stündlich erstellt.\n"
+        out = rag.stage_document(token("L2"), doc_name="Backup_Richtlinie_v2.md", text=text, min_role="L2")
+        removed = out["diff"]["removedChunkIds"]
+        live = {c["id"]: c for c in rag.read_db()["live_chunks"]}
+        self.assertEqual([live[i]["section"] for i in removed], ["§3 Aufbewahrung"])
+        rag.approve_diff(token("L3"), out["diff"]["id"])
+        self.assertEqual(self.sections(), ["§1 Zweck", "§2 Fristen"])
+
+    def test_approval_requires_l3(self) -> None:
+        out = rag.stage_text(token("L2"), title="Fristen neu", target_doc="Backup_Richtlinie.md", new_text="## §2 Fristen\nBackups werden wöchentlich erstellt.", min_role="L2")
+        with self.assertRaises(rag.ApiError) as ctx:
+            rag.approve_diff(token("L2"), out["diff"]["id"])
+        self.assertEqual(ctx.exception.status, 403)
 
 
 class Rbac(unittest.TestCase):
