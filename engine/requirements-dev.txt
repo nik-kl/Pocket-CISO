@@ -1,0 +1,3 @@
+# development / test only (not needed to run the engine)
+-r requirements.txt
+reportlab==5.1.0

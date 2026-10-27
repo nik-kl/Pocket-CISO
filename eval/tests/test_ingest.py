@@ -119,6 +119,98 @@ class PdfLayoutTables(unittest.TestCase):
         self.assertNotIn("|", rag.parse_document("t.pdf", shifted))  # a value not under its label → running text
 
 
+def ruled_pdf(story_of) -> bytes:
+    """Realistically typeset PDF via reportlab (dev dependency, engine/requirements-dev.txt): story_of(styles) → flowables."""
+    import io
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import getSampleStyleSheet
+    from reportlab.platypus import SimpleDocTemplate
+
+    buf = io.BytesIO()
+    SimpleDocTemplate(buf, pagesize=A4).build(story_of(getSampleStyleSheet()))
+    return buf.getvalue()
+
+
+def _grid(data, widths, repeat=1, spans=()):
+    from reportlab.lib import colors
+    from reportlab.platypus import Table, TableStyle
+
+    t = Table(data, colWidths=widths, repeatRows=repeat)
+    t.setStyle(TableStyle([("GRID", (0, 0), (-1, -1), 0.5, colors.black), ("VALIGN", (0, 0), (-1, -1), "TOP")] +
+                          [("SPAN", a, b) for a, b in spans]))
+    return t
+
+
+try:
+    import reportlab  # noqa: F401
+    HAVE_REPORTLAB = True
+except ImportError:
+    HAVE_REPORTLAB = False
+
+
+@unittest.skipUnless(HAVE_REPORTLAB, "reportlab (engine/requirements-dev.txt) not installed")
+class PdfRuledTables(unittest.TestCase):
+    """pdfplumber on ruled tables (class b): every row on its own with the right columns (invented content)."""
+
+    @staticmethod
+    def rows(pdf: bytes) -> list[dict[str, str]]:
+        """Data rows of the parsed Markdown tables as {header: cell}."""
+        out, header = [], None
+        for ln in rag.parse_document("Test.pdf", pdf).splitlines():
+            if ln.startswith("|---"):
+                continue
+            if not ln.startswith("| "):
+                header = None
+                continue
+            cells = [c.strip() for c in ln.strip("| ").split(" | ")]
+            if header is None:
+                header = cells
+            else:
+                out.append(dict(zip(header, cells)))
+        return out
+
+    def test_wrapped_cells_and_header_with_running_text(self) -> None:
+        def story(st):
+            from reportlab.platypus import Paragraph as P, Spacer
+            cell = st["BodyText"]
+            rows = [[P("Futterart", cell), P("Fütterungs&shy;intervall laut Tierarzt", cell), P("Zuständige Pflegekraft", cell)],
+                    [P("Frischfisch für Pinguine und Seehunde aus dem Kühlhaus", cell), P("2 Mal täglich", cell), P("Revier Nord mit Vertretung", cell)],
+                    [P("Heu", cell), P("alle 3 Tage nach Sichtprüfung des Lagers", cell), P("Revier Süd", cell)],
+                    [P("Insekten", cell), P("wöchentlich", cell), P("Terrarienteam", cell)]]
+            return [P("§ 1 Fütterung", st["Heading2"]), P("Die folgende Übersicht regelt die Fütterung im Tierpark. Abweichungen "
+                    "genehmigt die Zooleitung schriftlich.", cell), Spacer(1, 8), _grid(rows, [170, 150, 140]), Spacer(1, 8),
+                    P("Nach jeder Fütterung wird das Futterbuch abgezeichnet.", cell)]
+        h = ("Futterart", "Fütterungsintervall laut Tierarzt", "Zuständige Pflegekraft")  # wrapped header cells joined
+        self.assertEqual(self.rows(ruled_pdf(story)), [
+            dict(zip(h, ("Frischfisch für Pinguine und Seehunde aus dem Kühlhaus", "2 Mal täglich", "Revier Nord mit Vertretung"))),
+            dict(zip(h, ("Heu", "alle 3 Tage nach Sichtprüfung des Lagers", "Revier Süd"))),
+            dict(zip(h, ("Insekten", "wöchentlich", "Terrarienteam")))])
+        text = rag.parse_document("Test.pdf", ruled_pdf(story))
+        flat = " ".join(text.split())
+        self.assertIn("Abweichungen genehmigt die Zooleitung schriftlich.", flat)  # running text around the table stays
+        self.assertIn("Nach jeder Fütterung wird das Futterbuch abgezeichnet.", flat)
+        _, chunks = rag.chunk_document(text)  # → self-contained statements in the existing row format
+        self.assertIn("Tabelle [§1 Fütterung]: Futterart: Heu | Fütterungsintervall laut Tierarzt: alle 3 Tage nach Sichtprüfung des "
+                      "Lagers | Zuständige Pflegekraft: Revier Süd.", " ".join(c["content"] for c in chunks))
+
+    def test_table_across_page_break(self) -> None:
+        for repeat in (1, 0):  # header repeated on the next page, or not
+            def story(st, repeat=repeat):
+                from reportlab.platypus import Paragraph as P, Spacer
+                rows = [["Gehege", "Reinigung", "Kontrolle"]] + [[f"Gehege {n}", f"{n} Tage", f"Team {n}"] for n in range(1, 61)]
+                return [P("§ 2 Reinigung", st["Heading2"]), P("Einleitender Text zur Reinigung.", st["BodyText"]), Spacer(1, 300),
+                        _grid(rows, [150, 150, 150], repeat=repeat)]
+            rows = self.rows(ruled_pdf(story))
+            self.assertEqual(rows, [{"Gehege": f"Gehege {n}", "Reinigung": f"{n} Tage", "Kontrolle": f"Team {n}"} for n in range(1, 61)], repeat)
+
+    def test_two_row_header_and_row_span(self) -> None:
+        def story(st):
+            rows = [["Artikel", "Preis", ""], ["", "netto", "brutto"], ["Brezel", "1 EUR", "1,07 EUR"], ["Semmel", "2 EUR", "2,14 EUR"]]
+            return [_grid(rows, [150, 150, 150], repeat=2, spans=[((1, 0), (2, 0)), ((0, 0), (0, 1))])]
+        self.assertEqual(self.rows(ruled_pdf(story)), [{"Artikel": "Brezel", "Preis netto": "1 EUR", "Preis brutto": "1,07 EUR"},
+                                                       {"Artikel": "Semmel", "Preis netto": "2 EUR", "Preis brutto": "2,14 EUR"}])
+
+
 class DocumentNames(unittest.TestCase):
     def test_same_rule_as_node(self) -> None:
         # src/lib/db/staging.ts safeDocName keeps the same characters: letters, digits, space . _ - & , ( )

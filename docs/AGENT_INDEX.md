@@ -13,7 +13,7 @@ export POCKET_CISO_ENV=production POCKET_CISO_SECRET='<32+ random chars>' POCKET
 npm run engine                                                              # terminal 1
 npm run build && npm run start                                              # terminal 2 (NODE_ENV=production)
 ```
-First-time setup: `npm install` · `python3 -m venv engine/.venv && engine/.venv/bin/pip install -r engine/requirements.txt` · demo inbox: `mkdir -p data/inbox && cp eval/corpus/inbox/* data/inbox/` · optional `ollama pull qwen2.5:7b && ollama pull bge-m3`.
+First-time setup: `npm install` · `python3 -m venv engine/.venv && engine/.venv/bin/pip install -r engine/requirements.txt` (tests: `requirements-dev.txt`, adds reportlab) · demo inbox: `mkdir -p data/inbox && cp eval/corpus/inbox/* data/inbox/` · optional `ollama pull qwen2.5:7b && ollama pull bge-m3`.
 **Always `rm -f tsconfig.tsbuildinfo` before `npx tsc --noEmit`.** Static checks: `engine/.venv/bin/python -m compileall -q engine eval`.
 
 ## Environment variables
