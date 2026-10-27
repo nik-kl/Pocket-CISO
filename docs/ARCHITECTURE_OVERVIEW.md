@@ -83,4 +83,11 @@ Everything below was executed against running servers, not just read: `tsc`, `ne
 | Python without Ollama | 0 (search hits only) | 0 | 175 (159) | 13 | 14, 0 false flags |
 | Local engine | 0 (search hits only) | 0 | 152 (133) | 36 | — |
 All 35 unanswerable questions refused in every mode, 0 leakage, 0 number/negation/modality errors, deterministic over two passes; p50/p95 619/3144 ms with Ollama. 21 `robust_*` questions on invented documents (tables without blank lines, colloquial wording, multi-part, cross-section, contradictions next to a dominating document): 4/17 correct, 0 false. A stronger judge (`qwen3:14b`) answered 144/188 but gave 9 false answers and p95 10.5 s, so it is not used. Tried and removed again (P2c–P2e, judge replay): a judge with evidence duty (names the answering span + answer-type check), a focus-word veto and a thinking 14B arbiter for 7B/14B disagreements — none reached 0 wrong confirmations (7B with evidence duty: 2 false answers on the dev set; 14B: 10, 10 and 6 wrong confirmations; arbiter p95 23 s).
+**Second dev corpus `dummy-data/comp_2_nordwind-logistics` (dev2, 14 documents in PDF/DOCX/MD/TXT with format traps, 40 questions, 30 answerable; document roles from `doc_roles.json`, measurement only) — baseline, 1 pass:**
+| State | Mode | correct (of 30) | false answers | search hits (hits@3) | abstentions | injection marker | contradictions (of 4) |
+|---|---|---|---|---|---|---|---|
+| pre-P5c (4f538f7) | Python + Ollama | 8 | 1 (D2-09) | 18 (14) | 2 | 1 (D2-26, search hit) | 1 |
+| pre-P5c (4f538f7) | without Ollama | 0 | 0 | 25 (19) | 5 | 1 | 1 |
+| P5c (c5214fa) | Python + Ollama | 8 | 1 (D2-09) | 17 (12) | 3 | 1 | 1 |
+| P5c (c5214fa) | without Ollama / Local engine | 0 / 0 | 0 / 0 | 25 (18) / 21 (13) | 5 / 9 | 1 / 1 | 1 / 0 |
 **Known RAG limits:** the 7B judge rejects many correct windows (most remaining misses: combined sections, colloquial questions, multi-part pools); who-questions need a recognised role noun ("Werkschutz", "Facility Management" are not); contradictions S-5, R-3, I-17 are not found; dev numbers are tuned on the dev set — the holdout run is still open.
