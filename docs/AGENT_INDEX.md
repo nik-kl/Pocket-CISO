@@ -1,20 +1,20 @@
 # AGENT_INDEX — lookup table (read this FIRST, update on every change)
 
-Stack: Next.js 16 (App Router, TS, Tailwind v4, lucide-react) **+ optional Python FastAPI/Ollama backend** in `backend/`. Hybrid: the UI always works; Python only upgrades the engine. Repo layout is flat on purpose (no new files/modules without need).
+Stack: Next.js 16 (App Router, TS, Tailwind v4, lucide-react) **+ optional Python FastAPI/Ollama engine** in `engine/`. Hybrid: the UI always works; Python only upgrades the engine. Layout: `engine/` (Python), `src/` (Next.js), `eval/` (eval + tests + sample corpus), `docs/`, `data/` (runtime, gitignored).
 
 ## Start (exactly 2 terminals)
 Demo mode (seed data, demo logins `admin2026` / `ciso2026`, Reset Demo enabled):
-1. `cd backend && export POCKET_CISO_DEMO=1 && source .venv/bin/activate && python main.py`
+1. `POCKET_CISO_DEMO=1 npm run engine` (= `engine/.venv/bin/python -m engine.api`, from the repository root)
 2. `POCKET_CISO_DEMO=1 npm run dev` → http://localhost:3000
 
 Production mode (`next build` first; **both** processes need identical values):
 ```bash
 export POCKET_CISO_ENV=production POCKET_CISO_SECRET='<32+ random chars>' POCKET_CISO_L2_PASSWORD='<14+ chars>' POCKET_CISO_L3_PASSWORD='<14+ chars>'
-cd backend && source .venv/bin/activate && python main.py                  # terminal 1
+npm run engine                                                              # terminal 1
 npm run build && npm run start                                              # terminal 2 (NODE_ENV=production)
 ```
-First-time setup: `npm install` · `cd backend && python3 -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt` · optional `ollama pull qwen2.5:7b && ollama pull bge-m3`.
-**Always `rm -f tsconfig.tsbuildinfo` before `npx tsc --noEmit`.** Static checks: `backend/.venv/bin/python -m py_compile backend/main.py backend/rag_engine.py`.
+First-time setup: `npm install` · `python3 -m venv engine/.venv && engine/.venv/bin/pip install -r engine/requirements.txt` · demo inbox: `mkdir -p data/inbox && cp eval/corpus/inbox/* data/inbox/` · optional `ollama pull qwen2.5:7b && ollama pull bge-m3`.
+**Always `rm -f tsconfig.tsbuildinfo` before `npx tsc --noEmit`.** Static checks: `engine/.venv/bin/python -m compileall -q engine eval`.
 
 ## Environment variables
 | Variable | Used by | Meaning |
@@ -24,13 +24,13 @@ First-time setup: `npm install` · `cd backend && python3 -m venv .venv && sourc
 | `POCKET_CISO_SECRET` | Node, Python | HMAC secret for session tokens **and** the audit head anchor; ≥ 32 chars; required outside demo; never stored in the DB |
 | `POCKET_CISO_L2_PASSWORD`, `POCKET_CISO_L3_PASSWORD` | Node | Role passwords; ≥ 14 chars outside demo; hashed with scrypt + per-process salt in memory only |
 | `POCKET_CISO_DATA_DIR` | Node, Python | Data dir (default `./data`): `pocket-ciso-db.json`, `vectors.json`, `.db.lock/` |
-| `WATCHED_INBOX_DIR` | Node, Python | Connector folder (default `backend/watched_inbox`) |
+| `WATCHED_INBOX_DIR` | Node, Python | Connector folder (default `data/inbox`) |
 | `PYTHON_BACKEND_URL` | Node | default `http://127.0.0.1:8000` |
 | `TRUST_PROXY=1` | Node | Trust `X-Forwarded-For` for per-client rate limits. **Only behind a reverse proxy that overwrites the header** (otherwise clients can forge it); without it all callers share one `direct` bucket whose limits are ×10 and whose login limit is the account ceiling (30 per 15 min) |
 | `POCKET_CISO_RATE_LIMIT_MULT` | Node | Multiplier for the gateway rate limits (QA/load tests only) |
 | `OLLAMA_BASE_URL`, `LLM_MODEL` (qwen2.5:7b), `EMBED_MODEL` (bge-m3) | Python | Judge/phrasing model and embeddings; changing the embedding model rebuilds `data/vectors.json`; `qwen3*` models get `think: false` |
 | `LLM_NUM_CTX` (4096), `LLM_KEEP_ALIVE` (30m) | Python | Chat context size and model residency in Ollama (7B: 4.8 GB) |
-| `CONFLICT_SIM` (0.68), `ALIGN_SIM` (0.60) | Python | Staging conflict / series alignment thresholds (query gate values are constants in `rag_engine.py`, see Pipelines) |
+| `CONFLICT_SIM` (0.68), `ALIGN_SIM` (0.60) | Python | Staging conflict / series alignment thresholds (query gate values are constants in `engine/answer/gate.py`, see Pipelines) |
 | `LLM_TIMEOUT` (14 s), `EMBED_TIMEOUT`, `EMBED_TOTAL_BUDGET` (100 s), `CONFLICT_LLM_TIMEOUT` | Python | Timeouts; staging ≤ 100 s embeddings + ≤ 55 s conflicts < gateway 180 s |
 | `AUTO_SYNC=1`, `AUTO_SYNC_SECONDS` (30) | Python | Background inbox scan |
 | `MAX_UPLOAD_MB` (10), `CORS_ORIGINS`, `HOST`, `PORT` | Python | |
@@ -38,12 +38,12 @@ First-time setup: `npm install` · `cd backend && python3 -m venv .venv && sourc
 ## Hybrid architecture
 ```
 Browser ─► /api/v1 (route.ts gateway) ─┬─► Python FastAPI :8000  (query · stage-file · sync-inbox · approve) ─► Ollama :11434
-                                       └─► src/lib/db.ts (local TS engine, ALWAYS available)
+                                       └─► src/lib/db/ (local TS engine, ALWAYS available)
 Both engines read/write the same data/pocket-ciso-db.json (+ data/vectors.json for Python) under a cross-process mkdir lock (data/.db.lock/, owner token, safe steal).
 ```
 - Routing: `stage_policy`, `stage_file`, `sync_inbox`, `approve`, `query` → Python whenever it is up, else local. Without Ollama, Python answers queries with labelled search hits only (BM25, no LLM); the local engine (Python down) also returns search hits only, never composed answers. Timeout/5xx on **mutations are not replayed locally** (504/502); re-submitting a pending identical diff is idempotent. Everything else (`authenticate`, `logout`, `create_ticket`, `create_sync_ticket`, `resolve_ticket`, `reject`, `reset_demo`, `export_report`, snapshot) is always local.
 - Gateway protections (`route.ts`): per-client/per-action sliding-window rate limits (query 20/min, authenticate 10/min, create_ticket 5/10 min, stage 20/min, sync 10/min, snapshot 180/min, other 60/min → 429 + `Retry-After`); multipart needs `Content-Length` (411) ≤ 10.25 MB (413) and an L2 token **before** `formData()` is read; JSON bodies are read with a hard 256 KB cap (413, also without/with a wrong `Content-Length`); non-object JSON bodies → 400; config errors → generic 503 (env names only in the server log); held DB lock → 503 `DB_LOCKED`.
-- Python re-checks size/auth before parsing (`main.py /stage-file`: 411/413, `check_role` L2, then `request.form()`); DOCX is size-checked as ZIP (64 MB uncompressed) before parsing.
+- Python re-checks size/auth before parsing (`engine/api.py /stage-file`: 411/413, `check_role` L2, then `request.form()`); DOCX is size-checked as ZIP (64 MB uncompressed) before parsing.
 - Backend status: `GET /api/v1` → `backend` (cached 4 s; `POST health` ≥ 1 s). Sidebar `data-testid="backend-status"` (`data-mode=python|fallback`): `Python FastAPI + Ollama (Connected)` · `Python FastAPI · Rule Engine (Ollama offline)` · `Local Fallback Engine (Active)`.
 - Responses carry `served: "python"|"local"`.
 
@@ -51,7 +51,7 @@ Both engines read/write the same data/pocket-ciso-db.json (+ data/vectors.json f
 | File | Purpose |
 |---|---|
 | `README.md` | Pitch, setup, startup commands, feature overview |
-| `ARCHITECTURE_OVERVIEW.md` | Human architecture + security model + limitations/RAG proposals |
+| `docs/ARCHITECTURE_OVERVIEW.md` | Human architecture + security model + limitations/RAG proposals |
 | `next.config.mjs` | Security headers (CSP in production, XFO, nosniff, Referrer-Policy, Permissions-Policy, COOP, HSTS in production), `agentRules:false` (valid in Next 16.4) |
 | `src/app/page.tsx`, `layout.tsx`, `globals.css` | Shell, RBAC switcher (OIDC group labels), status box, theme tokens |
 | `src/app/api/v1/route.ts` | Hybrid gateway (above) |
@@ -60,15 +60,19 @@ Both engines read/write the same data/pocket-ciso-db.json (+ data/vectors.json f
 | `src/components/KnowledgeAndAuditView.tsx` | Chunks, hash-chained audit log (last 200 shown, total in tab), tickets + webhook inspector + resolve, JSON/CSV export (incl. tickets, `hashVersion`, recomputed content hashes), printable attestation |
 | `src/components/ui-primitives.tsx` | Button, Badge, Modal, SidePanel, ThemeSwitcher, Toast, ElevationModal |
 | `src/lib/mock-store.ts` | Shared types (`Snapshot.auditTotal`, `AuditLog.v`, `QueryResult.trace.retrievalScore/lexicalSupport/verification`, `StagedDiff.removedChunkIds`, `AuditReport.activePolicies[].contentHash`), `callApi*` |
-| `src/lib/db.ts` | Local TS engine: DB + lock, auth (scrypt, HMAC), demo seed / empty prod init, keyword retrieval, chunker, staging, conflicts (unit-aware, mirrors Python), approval, tickets, audit chain v2 + anchor, export, inbox sync |
-| `backend/main.py` | FastAPI HTTP layer (size/auth pre-checks, 422 for malformed JSON) |
-| `backend/rag_engine.py` | Ollama client, hash-ngram fallback embeddings, vector store (+ stash), parser/chunker, Pipelines A/B, inbox connector, NLI check, conflict detector, DB lock/audit/token code |
-| `backend/requirements.txt` | fastapi, uvicorn, pydantic, httpx, numpy, pypdf, python-docx, python-multipart |
-| `backend/glossary.json` | Bilingual term groups used for query expansion and the sentence verifier |
-| `backend/test_engine.py` | Unit tests (stdlib only, no Ollama; LLM stubbed; synthetic documents incl. generated PDFs) |
-| `backend/eval.py`, `backend/eval_dev.jsonl` | Eval harness (modes ollama/noollama/node, determinism, gateway smoke) + 244 dev questions (223 dev, 21 `robust_*` on invented dev-only documents built by `robust_docs()`) |
-| `backend/watched_inbox/` | Connector folder (user documents + `BCM_Wiederanlauf_Matrix_2026.md`); connector stages as `minRole L2` |
-| `backend/seed_policies/` | Upload samples (`Passwort_Richtlinie_v4.md`, `NIS2_Incident_Playbook.md`, `KI_Nutzungsrichtlinie_2026.md`) |
+| `src/lib/db/` | Local TS engine (`index.ts` = API for the gateway): `types`, `credentials` (env passwords, HMAC secret), `audit` (hash chain + anchor), `store` (seed / empty prod DB, migration, lock, transactions), `auth` (tokens, RBAC, login backoff), `search` (keyword search hits), `tickets`, `staging` (series, conflicts, approve/reject), `chunk` (md/txt chunker), `inbox`, `report` (snapshot, export, demo reset) |
+| `engine/api.py` | FastAPI HTTP layer (size/auth pre-checks, 422 for malformed JSON, `/health`) — run `python -m engine.api` |
+| `engine/__init__.py` | Public interface of the engine package (used by api, eval, tests) |
+| `engine/config.py`, `llm.py`, `store.py` | Env/config + ApiError · Ollama client, hash embeddings, engine label · JSON DB + lock, vector store (+ stash), audit, tokens, RBAC |
+| `engine/ingest/parse.py`, `chunk.py` | PDF (layout tables) / DOCX / text parsing · heading-based chunker with table row statements |
+| `engine/search/normalize.py`, `facts.py`, `lexical.py`, `dense.py` | Folding, CISTEM, compounds, glossary, instruction spans · facts and unit-aware values · lexical index, role views, key terms, coverage · bge-m3 dense scores, RRF, diversified candidates |
+| `engine/answer/gate.py`, `judge.py`, `verify.py`, `compose.py`, `contradictions.py`, `pipeline.py` | Parts, windows, gate · LLM judge · sentence verifier · phrasing + search hits · contradiction rule · `run_query` |
+| `engine/staging.py`, `inbox.py` | Pipeline A staging/approval · watched-inbox connector |
+| `engine/requirements.txt` | fastapi, uvicorn, pydantic, httpx, numpy, pypdf, python-docx, python-multipart |
+| `engine/glossary.json` | Bilingual term groups used for query expansion and the sentence verifier (Python and Node) |
+| `eval/tests/` | Unit tests (stdlib only, no Ollama; LLM stubbed; synthetic documents incl. generated PDFs): `helpers.py` + `test_ingest`, `test_store_staging`, `test_search`, `test_answer` |
+| `eval/eval.py`, `eval/eval_dev.jsonl` | Eval harness (modes ollama/noollama/node, determinism, gateway smoke) + 244 dev questions (223 dev, 21 `robust_*` on invented dev-only documents built by `robust_docs()`) |
+| `eval/corpus/inbox/`, `eval/corpus/seed/` | Eval/demo corpus: connector documents (incl. `BCM_Wiederanlauf_Matrix_2026.md`) and upload samples (`Passwort_Richtlinie_v4.md`, `NIS2_Incident_Playbook.md`, `KI_Nutzungsrichtlinie_2026.md`) |
 
 ## Python endpoints (`http://127.0.0.1:8000`; `Authorization: Bearer <token>` optional → L1)
 | Endpoint | Role | Notes |
@@ -101,8 +105,8 @@ Errors: `{ok:false, code, error}`.
 **A (stage):** parse → table-aware chunking (KPI lines such as `2 Stunden` are content, not headings) → embeddings → series alignment → hunks + removed chunks → conflict scan (rules: same unit/different value on shared topic; Python additionally cosine ≥ `CONFLICT_SIM` and optional LLM verdict, both with `verifiedBy`) → pending diff (author = verified session; a client-supplied name is shown as "angegeben: …").
 
 ## Tests / eval
-- `backend/.venv/bin/python -m unittest backend/test_engine.py` (73 tests, no Ollama needed)
-- `backend/.venv/bin/python backend/eval.py --label X [--modes ollama,noollama,node] [--categories a,b] [--ids ..] [--passes N] [--no-smoke] [--reuse-corpus] [--corpus DIR] [--holdout PATH]` → `/tmp/pocket-ciso-rag/results/X/summary.md` (node mode needs `npm run build`). Every mode builds its corpus in a temp data dir through the real staging/approval path; `data/` is never touched.
+- `npm run test:engine` (= `engine/.venv/bin/python -m unittest discover -s eval/tests`; 73 tests, no Ollama needed)
+- `engine/.venv/bin/python eval/eval.py --label X [--modes ollama,noollama,node] [--categories a,b] [--ids ..] [--passes N] [--no-smoke] [--reuse-corpus] [--corpus DIR] [--holdout PATH]` → `/tmp/pocket-ciso-rag/results/X/summary.md` (node mode needs `npm run build`). Every mode builds its corpus in a temp data dir through the real staging/approval path; `data/` is never touched.
 - Latest dev result (2026-10-22, `qwen2.5:7b` digest 845dbda0ea48 + `bge-m3`): 223 dev questions — 92/188 correct, **0 false answers**, 84 search hits (hits@3 73), 8 abstentions, 35/35 unanswerable refused, contradictions 14/17 with 0 false flags, 0 leakage, deterministic, p50/p95 619/3144 ms; robust_* 4/17 correct, 0 false. noollama/node: 0 false answers, search hits only. `qwen3:14b` (bdbd181c33f2) as judge: 144/188 correct but 9 false answers, p95 10.5 s → not used.
 
 ## Behaviour contracts / gotchas
@@ -111,4 +115,4 @@ Errors: `{ok:false, code, error}`.
 - Node and Python must be started with the same mode variables (`POCKET_CISO_ENV` / `POCKET_CISO_DEMO`) and the same `POCKET_CISO_SECRET`; `next start` forces `NODE_ENV=production` for Node only.
 - Theme: `localStorage["pocket-ciso-theme"]`; session: `sessionStorage["pocket-ciso-session"]`.
 - Dashboard selects a newly staged diff after `refresh()`.
-- `data/`, `backend/.venv/`, `__pycache__/` are gitignored.
+- Gitignored: `data/` (incl. `data/inbox/`), `.env*`, `.venv/`, `__pycache__/`, `node_modules/`, `.next/`, `*.tsbuildinfo`, `*.log`, `.DS_Store`, `eval_holdout.jsonl`.

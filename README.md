@@ -6,7 +6,7 @@ The prototype is designed for a controlled enterprise demo:
 
 - **Pipeline B — Ask Pocket CISO:** stateless, RBAC-filtered retrieval with German and English query support, grounded answers, citations, telemetry, and a hard fallback when evidence is insufficient.
 - **Pipeline A — Policy Diff & Sign-Off:** PDF, DOCX, Markdown, and TXT ingestion; semantic red/green diffs; table-aware chunking; conflict detection; ticket-backed approval; and merge to the live policy collection.
-- **Zero-touch ingestion:** the flat `backend/watched_inbox/` folder acts as a SharePoint/SMB connector stand-in. Manual sync or an optional polling cycle stages changed files for CISO review.
+- **Zero-touch ingestion:** the `data/inbox/` folder (gitignored; sample documents in `eval/corpus/inbox/`) acts as a SharePoint/SMB connector stand-in. Manual sync or an optional polling cycle stages changed files for CISO review.
 - **Closed-loop governance:** Jira/ServiceNow-style webhook payload previews, ticket resolution, hash-chained audit logs, JSON/CSV export, and a printable executive summary.
 - **Hybrid resilience:** the browser uses Python first when available and falls back to the local TypeScript engine when Python or Ollama is offline.
 
@@ -18,11 +18,8 @@ The prototype is designed for a controlled enterprise demo:
 
 ```bash
 npm install
-cd backend
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-cd ..
+python3 -m venv engine/.venv
+engine/.venv/bin/pip install -r engine/requirements.txt
 ```
 
 For the full local AI path, install Ollama and download the configured models:
@@ -38,13 +35,10 @@ The UI and Python rule engine can still run when Ollama is unavailable.
 
 Use two terminals from the repository root:
 
-**Terminal 1 — FastAPI backend**
+**Terminal 1 — FastAPI engine**
 
 ```bash
-cd backend
-export POCKET_CISO_DEMO=1
-source .venv/bin/activate
-python main.py
+POCKET_CISO_DEMO=1 npm run engine          # = engine/.venv/bin/python -m engine.api
 ```
 
 **Terminal 2 — Next.js frontend**
@@ -68,14 +62,10 @@ These credentials are available only when an explicit demo flag is set. `POCKET_
 The UI’s **Sync Inbox** action is always available. To also poll the inbox every 30 seconds:
 
 ```bash
-cd backend
-export POCKET_CISO_DEMO=1
-export AUTO_SYNC=1
-source .venv/bin/activate
-python main.py
+POCKET_CISO_DEMO=1 AUTO_SYNC=1 npm run engine
 ```
 
-Place `.pdf`, `.docx`, `.md`, or `.txt` files in `backend/watched_inbox/`. Files are SHA-256 deduplicated and staged with L2 connector clearance; the CISO must still approve them.
+Place `.pdf`, `.docx`, `.md`, or `.txt` files in `data/inbox/` (or set `WATCHED_INBOX_DIR`); for the demo copy the samples with `mkdir -p data/inbox && cp eval/corpus/inbox/* data/inbox/`. Files are SHA-256 deduplicated and staged with L2 connector clearance; the CISO must still approve them.
 
 ## Production configuration
 
@@ -88,7 +78,7 @@ export POCKET_CISO_L2_PASSWORD='at-least-14-characters'
 export POCKET_CISO_L3_PASSWORD='at-least-14-characters'
 
 # terminal 1
-cd backend && source .venv/bin/activate && python main.py
+npm run engine
 # terminal 2
 npm run build && npm run start
 ```
@@ -180,28 +170,20 @@ The FastAPI service exposes:
 
 The Next.js gateway also exposes local actions for authentication, tickets, rejection, audit export, snapshots, and demo reset.
 
-## Flat repository layout
-
-Documentation and operational entry points stay at the repository root. Application code remains in the compact existing `src/` layout, and backend runtime code stays flat in `backend/`:
+## Repository layout
 
 ```text
 README.md
-AGENT_INDEX.md
-ARCHITECTURE_OVERVIEW.md
-backend/
-  main.py
-  rag_engine.py
-  requirements.txt
-  seed_policies/
-  watched_inbox/
-src/
-  app/
-  components/
-  lib/
-data/                         # runtime state; gitignored
+docs/                 AGENT_INDEX.md (lookup table), ARCHITECTURE_OVERVIEW.md
+engine/               Python engine: api.py (FastAPI), config, llm, store, staging, inbox,
+                      ingest/ (parse, chunk), search/ (normalize, facts, lexical, dense),
+                      answer/ (gate, judge, verify, compose, contradictions, pipeline), glossary.json
+eval/                 eval.py, eval_dev.jsonl, tests/, corpus/ (inbox/ + seed/ sample documents)
+src/                  Next.js: app/ (UI + /api/v1 gateway), components/, lib/ (db/ = local TS engine)
+data/                 runtime state incl. data/inbox/; gitignored
 ```
 
-See [AGENT_INDEX.md](./AGENT_INDEX.md) for the file-to-symbol lookup and [ARCHITECTURE_OVERVIEW.md](./ARCHITECTURE_OVERVIEW.md) for the detailed pipeline and governance model.
+See [docs/AGENT_INDEX.md](./docs/AGENT_INDEX.md) for the file-to-symbol lookup and [docs/ARCHITECTURE_OVERVIEW.md](./docs/ARCHITECTURE_OVERVIEW.md) for the detailed pipeline and governance model.
 
 ## Verification
 
@@ -209,16 +191,16 @@ Run the mandated static checks:
 
 ```bash
 rm -f tsconfig.tsbuildinfo && npx tsc --noEmit && npm run build
-backend/.venv/bin/python -m py_compile backend/*.py
-backend/.venv/bin/python -m unittest backend/test_engine.py          # 73 tests, no Ollama needed
-backend/.venv/bin/python backend/eval.py --label X --modes ollama,noollama,node   # dev eval → /tmp/pocket-ciso-rag/results/X
+engine/.venv/bin/python -m compileall -q engine eval
+npm run test:engine                      # 73 tests, no Ollama needed
+engine/.venv/bin/python eval/eval.py --label X --modes ollama,noollama,node   # dev eval → /tmp/pocket-ciso-rag/results/X
 ```
 
-Model switch only via `LLM_MODEL` (default `qwen2.5:7b`); `LLM_NUM_CTX` (4096) and `LLM_KEEP_ALIVE` (30m) tune Ollama. Latest dev numbers (0 false answers, 92/188 correct with Ollama) are in `ARCHITECTURE_OVERVIEW.md`. Behavioural checks (RBAC matrix, dynamic proof, inbox scenarios, hostile uploads, concurrency) were run against live servers during the QA pass; see *Verification performed* in `ARCHITECTURE_OVERVIEW.md`.
+Model switch only via `LLM_MODEL` (default `qwen2.5:7b`); `LLM_NUM_CTX` (4096) and `LLM_KEEP_ALIVE` (30m) tune Ollama. Latest dev numbers (0 false answers, 92/188 correct with Ollama) are in `docs/ARCHITECTURE_OVERVIEW.md`. Behavioural checks (RBAC matrix, dynamic proof, inbox scenarios, hostile uploads, concurrency) were run against live servers during the QA pass; see *Verification performed* in `ARCHITECTURE_OVERVIEW.md`.
 
 ## Current limitations and roadmap
 
-This is a local MVP, not a production certification platform. See [ARCHITECTURE_OVERVIEW.md](./ARCHITECTURE_OVERVIEW.md) → *Known limitations and RAG proposals* for measured numbers. In short:
+This is a local MVP, not a production certification platform. See [docs/ARCHITECTURE_OVERVIEW.md](./docs/ARCHITECTURE_OVERVIEW.md) → *Known limitations and RAG proposals* for measured numbers. In short:
 
 - role-level identity only (shared accounts) — OIDC/Entra ID SSO and individual actors are the next step;
 - tamper-evident (hash chain + HMAC anchor), not append-only: PostgreSQL / an external anchor or signing service is needed for stronger guarantees;

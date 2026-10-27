@@ -5,7 +5,9 @@
   "scripts": {
     "dev": "next dev",
     "build": "next build",
-    "start": "next start"
+    "start": "next start",
+    "engine": "engine/.venv/bin/python -m engine.api",
+    "test:engine": "engine/.venv/bin/python -m unittest discover -s eval/tests"
   },
   "dependencies": {
     "lucide-react": "^1.60.0",
