@@ -162,6 +162,35 @@ class StableOrder(unittest.TestCase):
         self.assertEqual(self.answers(), first)
 
 
+class DefinitionPreference(unittest.TestCase):
+    """A span that defines AND explains the term beats a passing mention in another document (invented examples)."""
+
+    def run_def(self, docs: list[tuple[str, str, str, str]]) -> dict:
+        fresh_db(docs)
+        lexical._LEX_CACHE = None
+        rag.reset_query_caches()
+        with stub_llm("NEIN"):
+            return rag.run_query(token("L2"), "Was bedeutet ZFA?")
+
+    def test_glossary_row_beats_passing_mention(self) -> None:
+        res = self.run_def([("A Fundordnung.md", "§3 Abläufe", "L2", "Bei Ausfall der Zentralen Fundsachen-Annahme (ZFA) übernimmt der Empfang."),
+                            ("B Glossar.md", "§9 Begriffe", "L2", "Tabelle [§9 Begriffe]: Begriff: ZFA | Bedeutung: Zentrale Fundsachen-Annahme, "
+                             "Annahmestelle für alle im Gebäude gefundenen Gegenstände.")])  # chunker statement of a glossary row
+        self.assertEqual(res["result"]["kind"], "answer")
+        self.assertIn("Annahmestelle für alle im Gebäude gefundenen Gegenstände", res["answer"])  # the explanation, not only the long form
+        self.assertNotIn("Empfang", res["answer"])
+
+    def test_defining_sentence_beats_passing_mention(self) -> None:
+        res = self.run_def([("A Fundordnung.md", "§3 Abläufe", "L2", "Bei Ausfall der Zentralen Fundsachen-Annahme (ZFA) übernimmt der Empfang."),
+                            ("B Fundordnung.md", "§1 Zweck", "L2", "Die ZFA ist die zentrale Annahmestelle für Fundsachen im Werk.")])
+        self.assertIn("zentrale Annahmestelle für Fundsachen", res["answer"])
+
+    def test_passing_mention_only_when_nothing_explains(self) -> None:
+        res = self.run_def([("A Fundordnung.md", "§3 Abläufe", "L2", "Bei Ausfall der Zentralen Fundsachen-Annahme (ZFA) übernimmt der Empfang."),
+                            ("B Fundordnung.md", "§4 Zeiten", "L2", "Die ZFA ist bei Betriebsurlaub geschlossen.")])  # no explanation
+        self.assertIn("Zentralen Fundsachen-Annahme (ZFA)", res["answer"])
+
+
 class AnswerGate(unittest.TestCase):
     """Step-5 gate: lexical floor (GATE_COVERAGE / GATE_MISSING) + LLM answerability judge; without LLM only search hits."""
     DOCS = [

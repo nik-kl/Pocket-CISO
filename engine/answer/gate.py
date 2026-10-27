@@ -297,12 +297,33 @@ def defines(span: str, term: str) -> bool:
     return False
 
 
+GLOSSARY_SECTION = re.compile(r"glossar|begriff|abkurzung|definition|glossary|abbreviation|terms|terminolog")
+# "X ist ein/eine/der …", "X bezeichnet …", "X stands for …": a defining sentence that explains, not a passing mention
+EXPLAINS = r"(?:\s*\([^)]*\))?\s+(?:bezeichnet|bedeutet|meint|steht fur|umfasst|is defined as|means|refers to|stands for|denotes|describes|" \
+           r"(?:ist|sind|is|are)\s+(?:ein|eine|einer|der|die|das|a|an|the)\b)\s+\S+(?:\s+\S+){2,}"
+
+
+def definition_rank(idx: "LexIndex", i: int, k: int, term: str) -> int | None:
+    """0 = defines and explains the term (glossary table row, span in a glossary/abbreviation section, 'X ist ein …'),
+    1 = spells it out in passing ('… die Langform (X) …'), None = no definition."""
+    text = idx.span_text[i][k]
+    explains = bool(re.search(r"\b" + re.escape(fold(term)) + EXPLAINS, fold(text)))
+    if not (explains or defines(text, term)):
+        return None
+    glossary = text.startswith("Tabelle [") or bool(GLOSSARY_SECTION.search(fold(idx.chunks[i]["section"])))
+    return 0 if explains or glossary else 1
+
+
 def definition_window(idx: "LexIndex", view: RoleView, ranked: list[int], term: str) -> list[tuple[int, int]] | None:
-    """First span (fused rank, then the rest of the allowed corpus that contains the term) that defines `term`."""
+    """Best span for a definition question: an explaining definition anywhere in the role's allowed chunks before a
+    passing mention; within a rank, fused order first, then the stable chunk order. A passing mention is used only when
+    nothing explains the term."""
     folded = fold(term)
     rest = [i for i in view.allowed if i not in ranked and folded in fold(idx.chunks[i]["content"])]
-    for i in list(ranked) + sorted(rest):
-        for k, text in enumerate(idx.span_text[i]):
-            if not idx.span_instr[i][k] and defines(text, term):
-                return [(i, k)]
-    return None
+    best: tuple[int, int, tuple[int, int]] | None = None
+    for n, i in enumerate(list(ranked) + sorted(rest)):
+        for k in range(len(idx.span_text[i])):
+            r = None if idx.span_instr[i][k] else definition_rank(idx, i, k, term)
+            if r is not None and (best is None or (r, n) < best[:2]):
+                best = (r, n, (i, k))
+    return [best[2]] if best else None
