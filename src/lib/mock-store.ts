@@ -6,7 +6,6 @@
 export type Role = "L1" | "L2" | "L3";
 
 export const ROLE_RANK: Record<Role, number> = { L1: 1, L2: 2, L3: 3 };
-export const hasRole = (have: Role, need: Role) => ROLE_RANK[have] >= ROLE_RANK[need];
 
 // `group` = Enterprise Directory group (Entra ID / OIDC) that maps to the RBAC level in a production SSO setup.
 export const ROLE_META: Record<Role, { id: string; sub: string; label: string; needsPassword: boolean; group: string }> = {
