@@ -30,7 +30,7 @@ class Chunker(unittest.TestCase):
         self.assertEqual([c["section"] for c in chunks], ["§1 Ablauf", "§2 Fristen"])
 
     def test_chunking_is_deterministic(self) -> None:
-        text = (ROOT / "eval" / "corpus" / "seed" / "Passwort_Richtlinie_v4.md").read_text(encoding="utf-8")
+        text = (ROOT / "dummy-data" / "comp_1_policy-samples" / "docs" / "Passwort_Richtlinie_v4.md").read_text(encoding="utf-8")
         self.assertEqual(rag.chunk_document(text), rag.chunk_document(text))
 
 

@@ -1,0 +1,10 @@
+# dev-only documents: imported for the dev questions, left out of --holdout runs on this company's corpus
+Besucherrichtlinie_2026.md
+Prüfplan Arbeitsmittel 2026.pdf
+Schlüsselverwaltung.pdf
+Fuhrparkrichtlinie 2026.md
+Richtlinie Fremdfirmen 2026.md
+Notstromkonzept Rechenzentrum.md
+Zutrittskonzept Rechenzentrum.md
+Löschkonzept 2026.md
+Kranbetriebsanweisung.md
