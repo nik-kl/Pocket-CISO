@@ -16,7 +16,8 @@ UNCONFIRMED_LABEL = "Fundstellen, nicht als Antwort bestätigt"  # LLM judge sai
 # Answer gate per question part (step 5, tuned on the dev set only; curve from a permissive run with every feature logged):
 #   GATE_COVERAGE 0.5 — weighted share of the part's key terms found in the selected window (+ section/doc title);
 #   GATE_MISSING  0.5 — no single unmatched key term may carry more than half of the part's key-term weight;
-#   answerability judge — the LLM must reply JA to "do these spans state exactly what is asked" (temp 0, seed 7); no reply ⇒ NEIN.
+#   answerability judge — the LLM must reply JA to "do these spans state exactly what is asked" (temp 0, seed 7); no reply ⇒ NEIN
+#   (JUDGE_EVIDENCE=1: it names the answering span, which must pass verify.answer_type_problem).
 # Lexical/dense features alone cannot separate "supported but off-topic" spans: at coverage 0.95 and missing ≤ 0.15 there
 # were still 6 false answers with Ollama (8 without). With the judge every grid point from coverage 0.30–0.95 × missing
 # 0.15–1.0 × dense 0.5–0.65 had 0 false answers, so the lexical values sit mid-grid (±0.05 changes correct answers by ≤ 3,
@@ -64,6 +65,7 @@ class Part:
     lexical_ok: bool = False
     capped_only: bool = False
     pooled: bool = False  # judged against the windows of the answered parts
+    evidence: tuple[int, int] | None = None  # JUDGE_EVIDENCE: span the judge named as the answer (passed the answer-type check)
     dense_ok: bool = False
     ranked: list[int] = field(default_factory=list)
     features: dict[str, Any] | None = None

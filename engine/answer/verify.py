@@ -5,7 +5,7 @@ import re
 from dataclasses import dataclass
 from typing import Iterable
 
-from ..search.normalize import GLOSSARY, Vocab, analyze, fold
+from ..search.normalize import FREQ_WORDS, GLOSSARY, TABLE_LABEL, Vocab, analyze, fold
 
 
 # Named roles and bodies: acronyms (CISO, BSI, SOC) and role nouns, also as the tail of a compound ("Küchenleitung", "CISO-Office")
@@ -81,3 +81,63 @@ def verify_sentence(text: str, spans: list[str], vocab: Vocab) -> list[str]:
         if fold(e) not in src:
             problems.append(f"Rolle/Stelle: {e}")
     return problems
+
+
+# ── answer type at the evidence span (judge with evidence duty) ──
+# The judge names the one span that answers; that span must then carry the kind of answer the question asks for. Generic
+# language classes only, no wording from the eval questions; each rule has a unit test on an invented example.
+# value question → a number (not a section reference), a frequency word, a duration in words or a deadline word
+SECTION_REF = re.compile(r"§\s*[\d.]+")
+DURATION_WORDS = re.compile(r"\b(?:eine?[mnrs]?|zwei|drei|vier|funf|sechs|sieben|acht|neun|zehn|zwolf|halbe\w*|one|two|three|four|five|six|"
+                            r"seven|eight|nine|ten|twelve|an?|half an?)\s+(?:minute|stunde|werktag|arbeitstag|tag|woche|monat|quartal|jahr|"
+                            r"minute|hour|business day|working day|day|week|month|quarter|year)")
+DEADLINE_WORDS = re.compile(r"\b(?:unverzuglich\w*|sofort\w*|umgehend\w*|unmittelbar\w*|spatestens|fristgerecht|immediately|promptly|"
+                            r"without (?:undue )?delay|no later than|at the latest)\b")
+# 'who' question → a named role/body (entities) or a generic organisational unit
+ORG_UNIT = re.compile(r"\b[\w-]*(?:abteilung|referat|gremium|ausschuss|komitee|feuerwehr|sekretariat|department|committee|board)\b")
+# plural 'welche/which' question → several items; German 'welche' is plural only with a plural finite verb, English
+# 'which' only with are/were/have ("Welche Geräte sind …", "Which tools are …")
+PLURAL_WHICH = re.compile(r"\b(?:welche|which)\b")
+PLURAL_VERB = re.compile(r"\b(?:sind|waren|mussen|durfen|konnen|sollen|werden|gelten|haben|gehoren|fallen|are|were|have)\b")
+LIST_SEP = re.compile(r"\s*(?:[,;|•]|:\s|\s(?:und|oder|sowie|bzw|and|or)\s)\s*")
+# otherwise the evidence span itself (+ section/document title, counted half) must carry the key terms of the part —
+# the same floor the gate demands from the whole window
+ANSWER_COVERAGE = 0.5
+
+
+def _plain(span: str) -> str:
+    return SECTION_REF.sub(" ", TABLE_LABEL.sub("", span))
+
+
+def has_value(span: str) -> bool:
+    f = fold(_plain(span))
+    return bool(re.search(r"\d", f) or DURATION_WORDS.search(f) or DEADLINE_WORDS.search(f) or any(w in FREQ_WORDS for w in re.findall(r"[a-z]+", f)))
+
+
+def has_role(span: str) -> bool:
+    text = _plain(span)
+    return bool(entities(text) or ORG_UNIT.search(fold(text)))
+
+
+def plural_which(question: str) -> bool:
+    f = fold(question)
+    return bool(PLURAL_WHICH.search(f) and PLURAL_VERB.search(f))
+
+
+def is_enumeration(span: str) -> bool:
+    """Three or more listed items, or two or more numbers."""
+    text = _plain(span)
+    items = [x for x in LIST_SEP.split(fold(text)) if x.strip()]
+    return len(items) >= 3 or len(set(re.findall(r"\d+(?:[.,]\d+)?", text))) >= 2
+
+
+def answer_type_problem(question: str, span: str, value: bool, who: bool, cov: float) -> str:
+    """'' when the evidence span carries the asked kind of answer, else the reason. value/who: the part's VALUE_Q/WHO_Q
+    flags; cov: key-term coverage of the span (with its section/document title)."""
+    if value:
+        return "" if has_value(span) else "Belegstelle ohne Zahl/Dauer/Frist"
+    if who:
+        return "" if has_role(span) else "Belegstelle ohne Rolle/Stelle"
+    if plural_which(question):
+        return "" if is_enumeration(span) else "Belegstelle ohne Aufzählung"
+    return "" if cov >= ANSWER_COVERAGE else f"Belegstelle deckt die Teilfrage nicht ab ({cov:.2f})"
