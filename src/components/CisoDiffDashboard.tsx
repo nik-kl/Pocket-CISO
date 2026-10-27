@@ -128,10 +128,10 @@ export default function CisoDiffDashboard({ session, snap, refresh, notify }: Pr
             className="w-full !justify-start"
             onClick={() => void syncInbox()}
             disabled={busy === "sync"}
-            title="Scannt backend/watched_inbox/ auf neue/geänderte Richtlinien (SharePoint/SMB Connector)"
+            title="Scannt den Inbox-Ordner (data/inbox/) auf neue/geänderte Richtlinien (SharePoint/SMB Connector)"
           >
             <RefreshCw size={14} className={busy === "sync" ? "animate-spin" : ""} /> Sync Inbox
-            <span className="ml-auto font-mono text-[10px] font-normal text-faint">watched_inbox/</span>
+            <span className="ml-auto font-mono text-[10px] font-normal text-faint">data/inbox/</span>
           </Button>
           {pending.length === 0 && <div className="rounded-lg border border-dashed border-line-strong p-4 text-center text-xs text-faint">Keine ausstehenden Policy-Diffs.</div>}
           {pending.map((d) => (

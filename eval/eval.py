@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """Pocket CISO evaluation harness (retrieval + answer correctness, per engine mode).
 
-    backend/.venv/bin/python backend/eval.py                      # dev set, modes ollama,noollama,node
-    backend/.venv/bin/python backend/eval.py --modes noollama --passes 1 --ids W-1,X-4
-    backend/.venv/bin/python backend/eval.py --holdout backend/eval_holdout.jsonl   # holdout: aggregate metrics only
+    engine/.venv/bin/python eval/eval.py                      # dev set, modes ollama,noollama,node
+    engine/.venv/bin/python eval/eval.py --modes noollama --passes 1 --ids W-1,X-4
+    engine/.venv/bin/python eval/eval.py --holdout eval/eval_holdout.jsonl   # holdout: aggregate metrics only
 
-Every mode builds its corpus in a fresh temp data dir: copies of backend/watched_inbox/* go through the watched-inbox
-connector, backend/seed_policies/* through stage_document (minRole L2), and every diff is approved through the real
+Every mode builds its corpus in a fresh temp data dir: copies of eval/corpus/inbox/* go through the watched-inbox
+connector, eval/corpus/seed/* through stage_document (minRole L2), and every diff is approved through the real
 approval path (override with a reason where conflicts block the merge). Python modes run in-process in a worker
 subprocess (no HTTP); the node mode and one smoke test go through the Next.js gateway. Results: /tmp/pocket-ciso-rag/.
 
@@ -36,7 +36,8 @@ from pathlib import Path
 from typing import Any
 
 ROOT = Path(__file__).resolve().parent.parent
-BACKEND = ROOT / "backend"
+EVAL = ROOT / "eval"
+CORPUS = EVAL / "corpus"
 SCRATCH = Path("/tmp/pocket-ciso-rag")
 SECRET = "pocket-ciso-eval-secret-0123456789abcdef"  # ≥ 32 chars; only ever used for throw-away eval data dirs
 PASSWORDS = {"L2": "eval-l2-password-xyz", "L3": "eval-l3-password-xyz"}
@@ -172,7 +173,7 @@ Kran 3 darf nur von unterwiesenen Personen mit Kranschein bedient werden.
 
 
 def sign_token(role: str, secret: str = SECRET) -> str | None:
-    """Same format as signToken in src/lib/db.ts: ROLE.expiryMs.HMAC(secret, ROLE.expiryMs)."""
+    """Same format as signToken in src/lib/db/auth.ts: ROLE.expiryMs.HMAC(secret, ROLE.expiryMs)."""
     if role == "L1":
         return None
     payload = f"{role}.{int(time.time() * 1000) + 8 * 3600 * 1000}"
@@ -241,8 +242,8 @@ def make_pdf(lines: list[list[tuple[float, str]]], font: str = "Courier", size: 
 # ───────────────────────── worker (runs inside a subprocess with the mode's environment) ─────────────────────────
 
 def worker(args: argparse.Namespace) -> None:
-    sys.path.insert(0, str(BACKEND))
-    import rag_engine as rag  # noqa: E402  (configuration is read from the environment at import time)
+    sys.path.insert(0, str(ROOT))
+    import engine as rag  # noqa: E402  (configuration is read from the environment at import time)
 
     workdir = Path(args.workdir)
     log = open(workdir / "worker.log", "a", encoding="utf-8")
@@ -281,7 +282,7 @@ def worker(args: argparse.Namespace) -> None:
 
 
 def init_db(rag: Any) -> None:
-    """Mirror of emptyDb() in src/lib/db.ts (production): three role accounts + one DB_INITIALIZED audit entry."""
+    """Mirror of emptyDb() in src/lib/db/store.ts (production): three role accounts + one DB_INITIALIZED audit entry."""
     db = {
         "meta": {"liveVersion": 1, "nextTicket": 4712, "nextAudit": 1, "seededAt": rag.now_iso(), "ingestedFiles": {}},
         "users": [
@@ -304,7 +305,7 @@ def approve_pending(rag: Any, say: Any) -> None:
 
 
 def build_corpus(rag: Any, workdir: Path, injection_doc: bool, say: Any, corpus: str = "") -> None:
-    """Default corpus: watched_inbox (connector) + seed_policies (stage_document). --corpus DIR: every pdf/docx/md/txt of DIR
+    """Default corpus: eval/corpus/inbox (connector) + eval/corpus/seed (stage_document). --corpus DIR: every pdf/docx/md/txt of DIR
     through the watched-inbox connector (same import path, minRole L2)."""
     data, inbox = workdir / "data", workdir / "inbox"
     shutil.rmtree(data, ignore_errors=True)
@@ -313,7 +314,7 @@ def build_corpus(rag: Any, workdir: Path, injection_doc: bool, say: Any, corpus:
     inbox.mkdir(parents=True)
     t0 = time.time()
     init_db(rag)
-    for src in sorted((Path(corpus) if corpus else BACKEND / "watched_inbox").iterdir()):
+    for src in sorted((Path(corpus) if corpus else CORPUS / "inbox").iterdir()):
         if src.is_file() and not src.name.startswith(".") and src.suffix.lower() in (".pdf", ".docx", ".md", ".txt"):
             shutil.copy2(src, inbox / src.name)
     l2 = sign_token("L2")
@@ -326,7 +327,7 @@ def build_corpus(rag: Any, workdir: Path, injection_doc: bool, say: Any, corpus:
         db = rag.read_db()
         say(f"corpus ready in {time.time() - t0:.0f} s: {len(db['live_chunks'])} chunks, {len({c['docName'] for c in db['live_chunks']})} documents")
         return
-    seeds = [(p.name, p.read_bytes()) for p in sorted((BACKEND / "seed_policies").iterdir()) if p.is_file() and not p.name.startswith(".")]
+    seeds = [(p.name, p.read_bytes()) for p in sorted((CORPUS / "seed").iterdir()) if p.is_file() and not p.name.startswith(".")]
     if injection_doc:
         seeds.append((INJECTION_DOC[0], INJECTION_DOC[1].encode("utf-8")))
         seeds += robust_docs()
@@ -713,7 +714,7 @@ def smoke(workdir: Path, questions: list[dict[str, Any]], inproc: dict[str, Any]
     """Same questions through Next.js gateway → Python FastAPI (mode ollama); answers must equal the in-process ones."""
     env = base_env(workdir, "ollama")
     port = free_port()
-    py = start([sys.executable, "-c", f"import uvicorn, main; uvicorn.run(main.app, host='127.0.0.1', port={port}, log_level='warning')"], env, BACKEND, workdir / "python.log")
+    py = start([sys.executable, "-c", f"import uvicorn; from engine import api; uvicorn.run(api.app, host='127.0.0.1', port={port}, log_level='warning')"], env, ROOT, workdir / "python.log")
     try:
         wait_http(f"http://127.0.0.1:{port}/health")
         gw = run_gateway(workdir, "ollama", questions, 1, f"http://127.0.0.1:{port}")
@@ -731,13 +732,13 @@ def smoke(workdir: Path, questions: list[dict[str, Any]], inproc: dict[str, Any]
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--modes", default=",".join(MODES))
-    ap.add_argument("--dev", default=str(BACKEND / "eval_dev.jsonl"))
-    ap.add_argument("--holdout", nargs="?", const=str(BACKEND / "eval_holdout.jsonl"), default=None)
+    ap.add_argument("--dev", default=str(EVAL / "eval_dev.jsonl"))
+    ap.add_argument("--holdout", nargs="?", const=str(EVAL / "eval_holdout.jsonl"), default=None)
     ap.add_argument("--ids", default="")
     ap.add_argument("--categories", default="")
     ap.add_argument("--passes", type=int, default=2, help="2 = determinism check (second pass with cleared caches)")
     ap.add_argument("--label", default=time.strftime("%Y%m%d-%H%M%S"))
-    ap.add_argument("--corpus", default="", help="directory with pdf/docx/md/txt used instead of watched_inbox + seed_policies")
+    ap.add_argument("--corpus", default="", help="directory with pdf/docx/md/txt used instead of eval/corpus/inbox + eval/corpus/seed")
     ap.add_argument("--reuse-corpus", action="store_true", help="skip the corpus build when the mode's workdir already has one")
     ap.add_argument("--no-smoke", action="store_true")
     ap.add_argument("--show-failures", type=int, default=60)

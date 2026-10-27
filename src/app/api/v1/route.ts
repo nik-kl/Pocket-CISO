@@ -2,7 +2,7 @@
 //
 // Hybrid resilience: query / stage / sync_inbox / approve are first proxied to the Python FastAPI + Ollama backend
 // (PYTHON_BACKEND_URL, default http://127.0.0.1:8000). If it is not running, the identical action is served by the
-// local TypeScript engine in src/lib/db.ts, so the UI works out-of-the-box with or without Python/Ollama.
+// local TypeScript engine in src/lib/db/, so the UI works out-of-the-box with or without Python/Ollama.
 // Authentication, tickets (create/resolve), reject, audit export and snapshots always run locally (same JSON DB, shared via file lock).
 import { NextResponse, type NextRequest } from "next/server";
 import * as db from "@/lib/db";
@@ -220,7 +220,7 @@ async function stageFile(form: FormData, token: string | null): Promise<NextResp
   if (isFile) {
     docName = db.safeDocName(file.name.replace(/\\/g, "/").split("/").pop()!);
     if (!/\.(md|txt)$/i.test(docName))
-      return reply({ ok: false, status: 415, code: "NEEDS_PYTHON", error: "PDF/DOCX-Parsing benötigt das Python-Backend (python backend/main.py). Offline werden .md und .txt unterstützt." });
+      return reply({ ok: false, status: 415, code: "NEEDS_PYTHON", error: "PDF/DOCX-Parsing benötigt das Python-Backend (python -m engine.api). Offline werden .md und .txt unterstützt." });
     content = await file.text();
   }
   return reply(await db.stageDocument(token, { docName, title, text: content, minRole: minRole as Role, replaces: replaces || null, author: author || undefined }));

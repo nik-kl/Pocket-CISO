@@ -1,8 +1,8 @@
-"""Pocket CISO — FastAPI service (port 8000). Thin HTTP layer over rag_engine.py.
+"""Pocket CISO — FastAPI service (port 8000). Thin HTTP layer over the engine package (engine/__init__.py).
 
-Run:  python main.py        (or: uvicorn main:app --host 127.0.0.1 --port 8000)
+Run from the repository root:  engine/.venv/bin/python -m engine.api   (or: uvicorn engine.api:app --host 127.0.0.1 --port 8000)
 Env:  OLLAMA_BASE_URL, LLM_MODEL, EMBED_MODEL, CORS_ORIGINS, POCKET_CISO_DATA_DIR,
-      AUTO_SYNC=1 (watch backend/watched_inbox/ every AUTO_SYNC_SECONDS=30), WATCHED_INBOX_DIR
+      AUTO_SYNC=1 (watch data/inbox/ every AUTO_SYNC_SECONDS=30), WATCHED_INBOX_DIR
 """
 from __future__ import annotations
 
@@ -18,7 +18,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-import rag_engine as rag
+import engine as rag
+from engine.config import AUTO_SYNC, AUTO_SYNC_SECONDS, OLLAMA_BASE_URL
 
 
 @asynccontextmanager
@@ -86,9 +87,26 @@ class ApproveBody(BaseModel):
 MAX_REQUEST_BYTES = rag.MAX_UPLOAD_BYTES + 256 * 1024
 
 
+def service_status() -> dict:
+    """GET /health payload: Ollama models, DB readiness, vector and chunk counts."""
+    names = rag.OLLAMA.tags()
+    try:
+        db: dict | None = rag.read_db()
+    except rag.ApiError:
+        db = None
+    return {
+        "ok": True, "status": "ok", "service": "pocket-ciso-rag", "version": rag.VERSION, "python": True,
+        "dbReady": db is not None,
+        "ollama": {"connected": names is not None, "baseUrl": OLLAMA_BASE_URL, "llmModel": rag.OLLAMA.llm_model(), "embedModel": rag.OLLAMA.embed_model(), "models": names or []},
+        "engineMode": rag.engine_label(), "vectorCount": rag.VECTORS.count(), "vectorEngine": rag.VECTORS.engine,
+        "autoSync": AUTO_SYNC, "autoSyncSeconds": AUTO_SYNC_SECONDS if AUTO_SYNC else None,
+        "liveChunks": len(db["live_chunks"]) if db else 0, "pendingDiffs": sum(1 for d in db["staged_diffs"] if d["status"] == "pending") if db else 0,
+    }
+
+
 @app.get("/health")
 def health() -> dict:
-    return rag.health()
+    return service_status()
 
 
 @app.post("/query")
@@ -139,7 +157,7 @@ async def stage_file(request: Request, authorization: str | None = Header(defaul
 
 @app.post("/sync-inbox")
 def sync_inbox(authorization: str | None = Header(default=None)) -> dict:
-    """Zero-touch connector: scan backend/watched_inbox/ and stage new/modified files for CISO approval (L2+)."""
+    """Zero-touch connector: scan the watched inbox (default data/inbox/) and stage new/modified files for CISO approval (L2+)."""
     return rag.sync_watched_inbox(bearer(authorization))
 
 
