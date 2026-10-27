@@ -239,3 +239,70 @@ def select_windows(idx: "LexIndex", view: RoleView, part: Part, ranked: list[int
             got = got | window_terms(idx, w)
     part.windows = chosen
     part.coverage = max(base, coverage(part.qt, got, idx.ctx_terms[first[-1][0]]))
+
+
+# Definition questions (class a): "was heißt/bedeutet X", "wofür steht X", "what does X stand for/mean". A span that spells
+# the term out — "Langform (X)", "X (Langform)" or a table row with X as a cell next to a cell of several words (glossary
+# table) — answers the question deterministically; the phrasing still goes through the verifier.
+DEF_Q = re.compile(r"\b(?:was (?:heisst|bedeutet|meint)|wofur steht|was steht\b.*\bfur|bedeutung (?:von|der|des)|abkurzung|ausgeschrieben|"
+                   r"langform|what does\b.*\b(?:stand for|mean)|what is meant by|meaning of|stands? for|abbreviation|full form)\b")
+TERM_RE = re.compile(r"[„\"'‚]([^“\"'‘]{2,40})[“\"'‘]|\b([A-ZÄÖÜ][A-Za-z0-9ÄÖÜäöü]*[A-Z0-9][A-Za-z0-9]*(?:-[A-Za-z0-9]+)*)\b")
+
+
+def definition_term(question: str) -> str | None:
+    """The asked term of a definition question: a quoted term, else an acronym-like word (≥ 2 capitals, e.g. ISMS, NIS-2)."""
+    if not DEF_Q.search(fold(question)):
+        return None
+    for m in TERM_RE.finditer(question):
+        term = m.group(1) or m.group(2)
+        if m.group(1) or sum(ch.isupper() for ch in term) >= 2:
+            return term.strip()
+    return None
+
+
+def _spells(long_form: str, term: str) -> bool:
+    """An abbreviation's letters occur in order in the long form, starting at the first letter of one of its last words
+    ('Recovery Time Objective' → RTO, 'Informationssicherheitsmanagementsystem' → ISMS); other terms: any long form."""
+    letters = [ch for ch in fold(term) if ch.isalnum()]
+    if sum(ch.isupper() for ch in term) < 2:
+        return True
+    words = long_form.split()
+    for start in range(len(words) - 1, -1, -1):
+        cand, pos = fold(" ".join(words[start:])), 0
+        if not cand.startswith(letters[0]):
+            continue
+        for ch in letters:
+            pos = cand.find(ch, pos) + 1
+            if not pos:
+                break
+        else:
+            return True
+    return False
+
+
+def defines(span: str, term: str) -> bool:
+    """Does the span spell out `term`? 'Recovery Time Objective (RTO)', 'RTO (Recovery Time Objective)', or a table row
+    'Kürzel: RTO | Bedeutung: Recovery Time Objective'."""
+    t = re.escape(term)
+    long_form = r"([A-Za-zÄÖÜäöüß][\w&-]*(?:[ -][\w&-]+){0,7})"
+    for m in re.finditer(long_form + r"\s*\(\s*" + t + r"\s*\)", span):
+        if _spells(m.group(1), term):
+            return True
+    for m in re.finditer(r"\b" + t + r"\s*\(\s*" + long_form + r"\s*\)", span):
+        if len(m.group(1)) >= 6 and _spells(m.group(1), term):
+            return True
+    if span.startswith("Tabelle ["):
+        cells = [c.split(": ", 1)[-1].strip(" .") for c in span.split(": ", 1)[-1].split(" | ")]
+        return any(fold(c) == fold(term) for c in cells) and any(len(c.split()) >= 2 and fold(term) not in fold(c) for c in cells)
+    return False
+
+
+def definition_window(idx: "LexIndex", view: RoleView, ranked: list[int], term: str) -> list[tuple[int, int]] | None:
+    """First span (fused rank, then the rest of the allowed corpus that contains the term) that defines `term`."""
+    folded = fold(term)
+    rest = [i for i in view.allowed if i not in ranked and folded in fold(idx.chunks[i]["content"])]
+    for i in list(ranked) + sorted(rest, key=lambda j: idx.chunks[j]["id"]):
+        for k, text in enumerate(idx.span_text[i]):
+            if not idx.span_instr[i][k] and defines(text, term):
+                return [(i, k)]
+    return None

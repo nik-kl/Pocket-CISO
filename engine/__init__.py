@@ -17,7 +17,7 @@ from .staging import approve_diff, same_series, stage_document, stage_text
 from .inbox import start_inbox_watcher, sync_watched_inbox
 from .answer.verify import entities, has_value, value_dim, verify_sentence
 from .answer.gate import (
-    DENSE_GATE, MAX_PARTS, NO_ANSWER, NORM_Q, question_parts, SEARCH_LABEL, span_windows,
+    DENSE_GATE, MAX_PARTS, NO_ANSWER, NORM_Q, definition_term, defines, question_parts, SEARCH_LABEL, span_windows,
     UNCONFIRMED_LABEL, VALUE_Q, WHO_Q,
 )
 from .answer.judge import judge_answerable, JUDGE_SYSTEM

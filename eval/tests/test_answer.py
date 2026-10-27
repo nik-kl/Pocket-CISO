@@ -95,6 +95,35 @@ class ValueAnswers(unittest.TestCase):
         self.assertTrue(res["result"]["trace"]["answerBy"].startswith("verbatim"))
 
 
+class Definitions(unittest.TestCase):
+    """Class a: a span spelling out the asked term answers a definition question (invented examples)."""
+
+    def test_term_of_a_definition_question(self) -> None:
+        for q, term in (("Was heißt ZFA?", "ZFA"), ("What does ZFA stand for?", "ZFA"), ("Wofür steht KTW-2?", "KTW-2"),
+                        ("Was bedeutet „Fundsachenruhe“?", "Fundsachenruhe"), ("Wer leitet die ZFA?", None)):
+            self.assertEqual(rag.definition_term(q), term, q)
+
+    def test_span_spelling_out_the_term(self) -> None:
+        self.assertTrue(rag.defines("Fundstücke gehen an die Zentrale Fundsachen-Annahme (ZFA).", "ZFA"))
+        self.assertTrue(rag.defines("Die ZFA (Zentrale Fundsachen-Annahme) öffnet um 8 Uhr.", "ZFA"))
+        self.assertTrue(rag.defines("Tabelle [§1 Begriffe]: Kürzel: ZFA | Bedeutung: Zentrale Fundsachen-Annahme.", "ZFA"))
+        self.assertFalse(rag.defines("Die Leitstelle (ZFA) ist besetzt.", "ZFA"))  # letters do not spell ZFA
+        self.assertFalse(rag.defines("Die ZFA (siehe §3) ist besetzt.", "ZFA"))
+
+    def test_definition_span_answers_even_after_judge_no(self) -> None:
+        fresh_db([("Fundbüro.md", "§1 Begriffe", "L2", "Fundstücke gehen an die Zentrale Fundsachen-Annahme (ZFA). Die ZFA ist werktags besetzt."),
+                  ("Fundbüro.md", "§2 Geheim", "L3", "Der Tresor der Kassen-Tresor-Verwaltung (KTV) steht im Keller.")])
+        lexical._LEX_CACHE = None
+        rag.reset_query_caches()
+        with stub_llm("NEIN"):
+            res = rag.run_query(token("L2"), "Was heißt ZFA?")
+            self.assertEqual(res["result"]["kind"], "answer")
+            self.assertIn("Zentrale Fundsachen-Annahme (ZFA)", res["answer"])
+            self.assertEqual(res["result"]["trace"]["parts"][0]["features"]["definition"], "ZFA")
+            self.assertNotEqual(rag.run_query(token("L2"), "Was heißt KTV?")["result"]["kind"], "answer")  # L3 span: RBAC
+        self.assertNotEqual(rag.run_query(token("L2"), "Was heißt ZFA?")["result"]["kind"], "answer")  # without LLM: never an answer
+
+
 class AnswerGate(unittest.TestCase):
     """Step-5 gate: lexical floor (GATE_COVERAGE / GATE_MISSING) + LLM answerability judge; without LLM only search hits."""
     DOCS = [

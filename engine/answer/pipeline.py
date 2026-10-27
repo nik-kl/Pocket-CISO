@@ -9,7 +9,7 @@ from .compose import CONTRADICTION_LABEL, compose_sentences, display_span, relat
 from .contradictions import find_contradiction
 from .gate import (
     GATE_COVERAGE, GATE_MISSING, NORM_Q, NO_ANSWER, Part, SEARCH_LABEL, UNCONFIRMED_LABEL, VALUE_Q,
-    WHO_Q, dense_window, fact_chunks, question_parts, select_windows, window_ok, window_terms,
+    WHO_Q, definition_term, definition_window, dense_window, fact_chunks, question_parts, select_windows, window_ok, window_terms,
 )
 from .judge import judge_answerable
 from .verify import has_value, value_dim
@@ -136,6 +136,15 @@ def run_query(token: str | None, question: str) -> dict[str, Any]:
                 p.windows, p.answered, p.reason = ws, True, ""
                 p.coverage = max(p.coverage, coverage(p.qt, frozenset().union(*(window_terms(idx, w) for w in ws))))
                 p.features = {**(p.features or {}), "pool": True}
+    # definition questions (class a): a span spelling out the asked term ("Langform (X)", glossary table row) is the answer
+    # even when the judge said NEIN; LLM mode only — without LLM every mode returns search hits
+    if use_llm:
+        for p in parts:
+            term = None if p.answered or p.contradiction else definition_term(p.text)
+            w = definition_window(idx, view, p.ranked, term) if term else None
+            if w:
+                p.windows, p.answered, p.reason = [w], True, ""
+                p.features = {**(p.features or {}), "definition": term}
     # value questions: the shown spans must carry a value of the asked dimension (duration, count, deadline, frequency). The
     # value sentence of a confirmed window can be dropped by related_spans (its key term already in the section title) →
     # it is added back; a confirmed window without such a value is no answer to a value question → search hit / note.
