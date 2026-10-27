@@ -1,7 +1,8 @@
 # runtime state (DB, vectors, auth secret, default watched inbox data/inbox/)
 data/
-# secrets / local environment
+# secrets / local environment (the placeholder template is tracked)
 .env*
+!.env.example
 # Python
 .venv/
 __pycache__/

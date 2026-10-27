@@ -67,6 +67,28 @@ POCKET_CISO_DEMO=1 AUTO_SYNC=1 npm run engine
 
 Place `.pdf`, `.docx`, `.md`, or `.txt` files in `data/inbox/` (or set `WATCHED_INBOX_DIR`); for the demo copy the samples with `mkdir -p data/inbox && cp eval/corpus/inbox/* data/inbox/`. Files are SHA-256 deduplicated and staged with L2 connector clearance; the CISO must still approve them.
 
+## Lokal starten
+
+Einmalig: Abhängigkeiten installieren und die Konfiguration anlegen.
+
+```bash
+npm install
+python3 -m venv engine/.venv
+engine/.venv/bin/pip install -r engine/requirements.txt
+cp .env.example .env        # Platzhalter in .env durch eigene Werte ersetzen
+```
+
+Dann zwei Terminals im Repository-Root; in **beiden** zuerst die Env laden (beide Prozesse brauchen dieselben Werte):
+
+```bash
+set -a; source .env; set +a
+npm run engine              # Terminal 1: Python-Engine auf http://127.0.0.1:8000
+npm run dev                 # Terminal 2: UI auf http://localhost:3000
+```
+
+Login: L1 ohne Passwort; L2 mit dem Wert von `POCKET_CISO_L2_PASSWORD`, L3 mit dem Wert von `POCKET_CISO_L3_PASSWORD` aus der `.env`.
+Ohne Demo-Flag startet die Datenbank leer; Richtlinien kommen über Upload oder `data/inbox/` (Beispiele: `cp eval/corpus/inbox/* data/inbox/`, dann *Sync Inbox*).
+
 ## Production configuration
 
 Never run a deployment with the seeded demo credentials. Start **both** processes with the same values:
