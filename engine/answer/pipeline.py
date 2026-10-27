@@ -33,7 +33,7 @@ def _restricted_match(db: dict[str, Any], role: str, question: str) -> dict[str,
         return None
     qt = key_terms(question, full)
     bm = {i: s for i, s in full.bm25(qt.weights).items() if i in restricted}
-    for i in sorted(bm, key=lambda i: (-bm[i], idx.chunks[i]["id"]))[:3]:
+    for i in sorted(bm, key=lambda i: (-bm[i], i))[:3]:
         if coverage(qt, frozenset(idx.doc_terms[i]), idx.ctx_terms[i]) >= GATE_COVERAGE:
             return idx.chunks[i]
     return None

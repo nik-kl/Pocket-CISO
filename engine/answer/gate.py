@@ -144,7 +144,7 @@ def dense_window(idx: "LexIndex", view: RoleView, part: Part, dense: dict[int, f
     or the whole chunk when it has ≤ 2 spans and none shares one; must pass window_ok (value/role present)."""
     if not dense:
         return None
-    i = min(dense, key=lambda j: (-dense[j], idx.chunks[j]["id"]))
+    i = min(dense, key=lambda j: (-dense[j], j))
     if dense[i] < DENSE_GATE:
         return None
     ks = [k for k in range(len(idx.span_text[i])) if not idx.span_instr[i][k]]
@@ -157,10 +157,10 @@ def fact_chunks(idx: "LexIndex", view: RoleView, part: Part, limit: int = 6) -> 
     """Exact fact lookup for value questions: spans that carry an extracted fact (table cell, value sentence), ranked by
     key-term coverage over the whole allowed corpus — independent of the fused top-k."""
     allowed = set(view.allowed)
-    scored = sorted((-coverage(part.qt, idx.span_terms[i][k], idx.ctx_terms[i]), idx.span_ids[i][k], i)
+    scored = sorted((-coverage(part.qt, idx.span_terms[i][k], idx.ctx_terms[i]), i, k)
                     for (i, k) in idx.facts_by_span if i in allowed and not idx.span_instr[i][k])
     out: list[int] = []
-    for _, _, i in scored:
+    for _, i, _ in scored:
         if i not in out:
             out.append(i)
         if len(out) >= limit:
@@ -190,7 +190,7 @@ def select_windows(idx: "LexIndex", view: RoleView, part: Part, ranked: list[int
         normative = 0.08 if part.norm and (modal_classes(text) or PROHIBITION_RE.search(text)) else 0.0
         # coverage first (+ small bonuses: better fused rank, normative sentence for yes/no questions), then shorter
         # window, rank, span id (deterministic)
-        return (-(cov + 0.1 / (1 + rank) + normative), -cov, len(w), rank, idx.span_ids[w[-1][0]][w[-1][1]])
+        return (-(cov + 0.1 / (1 + rank) + normative), -cov, len(w), rank, w[-1])
 
     scored = []
     for w in cands:
@@ -301,7 +301,7 @@ def definition_window(idx: "LexIndex", view: RoleView, ranked: list[int], term: 
     """First span (fused rank, then the rest of the allowed corpus that contains the term) that defines `term`."""
     folded = fold(term)
     rest = [i for i in view.allowed if i not in ranked and folded in fold(idx.chunks[i]["content"])]
-    for i in list(ranked) + sorted(rest, key=lambda j: idx.chunks[j]["id"]):
+    for i in list(ranked) + sorted(rest):
         for k, text in enumerate(idx.span_text[i]):
             if not idx.span_instr[i][k] and defines(text, term):
                 return [(i, k)]

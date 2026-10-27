@@ -38,9 +38,21 @@ def corpus_signature(chunks: list[dict[str, Any]]) -> str:
     return h.hexdigest()
 
 
+def _section_no(section: str) -> tuple[int, ...]:
+    m = re.match(r"§?\s*(\d+(?:\.\d+)*)", section)
+    return tuple(int(x) for x in m.group(1).split(".")) if m else (10**6,)
+
+
+def chunk_order_key(c: dict[str, Any]) -> tuple[Any, ...]:
+    """Stable chunk order, independent of the random chunk ids (a re-import gets new ids): document name, section number,
+    section, part, content hash. Every ranking tie and window order resolves through this order (chunk position i)."""
+    part = int((re.search(r"\(Teil (\d+)\)$", c["section"]) or [0, 1])[1])
+    return (c["docName"], _section_no(c["section"]), section_title(c["section"]), part, sha256(c["content"]))
+
+
 class LexIndex:
     def __init__(self, chunks: list[dict[str, Any]], payload: dict[str, Any] | None = None) -> None:
-        self.chunks = sorted(chunks, key=lambda c: c["id"])
+        self.chunks = sorted(chunks, key=chunk_order_key)
         self.sig = corpus_signature(self.chunks)
         if payload and payload.get("sig") == self.sig:
             self.words = set(payload["words"])
@@ -60,7 +72,7 @@ class LexIndex:
                 self.span_terms.append([frozenset(analyze(s, vocab)) for s in spans])
                 self.ctx_terms.append(frozenset(analyze(ctx, vocab)))
         self.pos = {c["id"]: i for i, c in enumerate(self.chunks)}
-        # spans: stable ids "<chunk id>:<k>", instruction-like text flagged (never used in answers), section sequences across
+        # spans: ids "<chunk id>:<k>" (citations only — never a sort key), instruction-like text flagged (never used in answers), section sequences across
         # neighbouring chunks ("§2 X" and "§2 X (Teil 2)") for context windows
         self.span_ids = [[f"{c['id']}:{k}" for k in range(len(self.span_text[i]))] for i, c in enumerate(self.chunks)]
         self.span_instr = [[bool(INSTRUCTION_RE.search(fold(t))) for t in spans] for spans in self.span_text]
@@ -72,7 +84,7 @@ class LexIndex:
                     self.facts_by_span[(i, f["span"])].append(f)
         self.section_seq: dict[tuple[str, str], list[tuple[int, int]]] = defaultdict(list)
         part_no = [int((re.search(r"\(Teil (\d+)\)$", c["section"]) or [0, 1])[1]) for c in self.chunks]
-        for i in sorted(range(len(self.chunks)), key=lambda x: (self.section_key[x], part_no[x], self.chunks[x]["id"])):
+        for i in sorted(range(len(self.chunks)), key=lambda x: (self.section_key[x], part_no[x], x)):
             self.section_seq[self.section_key[i]] += [(i, k) for k in range(len(self.span_text[i]))]
         self.tf = [Counter(t) for t in self.doc_terms]
         self.dl = [len(t) for t in self.doc_terms]

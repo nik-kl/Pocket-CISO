@@ -124,6 +124,44 @@ class Definitions(unittest.TestCase):
         self.assertNotEqual(rag.run_query(token("L2"), "Was heißt ZFA?")["result"]["kind"], "answer")  # without LLM: never an answer
 
 
+class StableOrder(unittest.TestCase):
+    """Answers must not depend on the random chunk ids of an import: two builds of the same corpus with other ids and
+    another list order give the same answers, citations (document, section) and search hits (invented corpus)."""
+    DOCS = [("Hausordnung Nord.md", "§1 Empfang", "L2", "Besucher melden sich am Empfang an und tragen den Besucherausweis sichtbar."),
+            ("Hausordnung Süd.md", "§1 Empfang", "L2", "Besucher melden sich am Empfang an und tragen den Besucherausweis sichtbar."),
+            ("Hausordnung Süd.md", "§2 Parken", "L2", "Besucher parken auf den Plätzen 1 bis 12 vor dem Empfang."),
+            ("Hausordnung Nord.md", "§2 Parken", "L2", "Besucher parken auf den Plätzen 20 bis 30 hinter dem Empfang.")]
+    QUESTIONS = ("Wo melden sich Besucher an?", "Wo parken Besucher?", "Was tragen Besucher am Empfang?")
+
+    def build(self, ids: list[str], order: list[int]) -> None:
+        fresh_db([self.DOCS[n] for n in order])
+        db = rag.read_db()
+        for c, cid in zip(db["live_chunks"], ids):
+            c["id"] = cid
+        rag.write_db(db)
+        lexical._LEX_CACHE = None
+        rag.reset_query_caches()
+
+    def answers(self) -> list[tuple]:
+        out = []
+        for judge in ("JA", None):
+            with stub_llm(judge):
+                for q in self.QUESTIONS:
+                    r = rag.run_query(token("L2"), q)["result"]
+                    cites = [(r["citations"][s["chunkId"]]["docName"], r["citations"][s["chunkId"]]["section"]) for s in r["segments"] if s["type"] == "cite"]
+                    out.append((r["kind"], [s.get("text") for s in r["segments"] if s["type"] != "cite"], cites,
+                                [(h["docName"], h["content"]) for h in r.get("hits", [])]))
+        return out
+
+    def test_two_builds_with_other_ids_give_identical_answers(self) -> None:
+        self.build(["chk-a1", "chk-b2", "chk-c3", "chk-d4"], [0, 1, 2, 3])
+        first = self.answers()
+        self.build(["chk-z9", "chk-y8", "chk-x7", "chk-w6"], [0, 1, 2, 3])  # reversed id order: Süd now sorts before Nord by id
+        self.assertEqual(self.answers(), first)
+        self.build(["chk-m5", "chk-n6", "chk-k3", "chk-l4"], [3, 1, 0, 2])  # other list order
+        self.assertEqual(self.answers(), first)
+
+
 class AnswerGate(unittest.TestCase):
     """Step-5 gate: lexical floor (GATE_COVERAGE / GATE_MISSING) + LLM answerability judge; without LLM only search hits."""
     DOCS = [
