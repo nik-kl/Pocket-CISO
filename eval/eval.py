@@ -314,16 +314,19 @@ def build_corpus(rag: Any, workdir: Path, injection_doc: bool, say: Any, corpus:
     inbox.mkdir(parents=True)
     t0 = time.time()
     init_db(rag)
+    inputs: list[str] = []  # input file count for the import statistics (documents with 0 chunks)
     for src in sorted((Path(corpus) if corpus else CORPUS / "inbox").iterdir()):
         if src.is_file() and not src.name.startswith(".") and src.suffix.lower() in (".pdf", ".docx", ".md", ".txt"):
             shutil.copy2(src, inbox / src.name)
+            inputs.append(src.name)
     l2 = sign_token("L2")
     report = rag.sync_watched_inbox(l2)["report"]
     say(f"inbox: scanned {report['scanned']}, staged {len(report['staged'])}, skipped {len(report['skipped'])}, failed {report['failed']}")
-    if report["failed"]:
-        raise SystemExit(f"inbox ingestion failed: {report['failed']}")
+    if report["failed"]:  # counted as documents with 0 chunks in the import statistics, the run continues
+        say(f"WARNING: {len(report['failed'])} document(s) not imported")
     approve_pending(rag, say)
     if corpus:
+        (workdir / "import.json").write_text(json.dumps({"inputs": len(inputs), "failed": len(report["failed"])}), encoding="utf-8")
         db = rag.read_db()
         say(f"corpus ready in {time.time() - t0:.0f} s: {len(db['live_chunks'])} chunks, {len({c['docName'] for c in db['live_chunks']})} documents")
         return
@@ -336,6 +339,7 @@ def build_corpus(rag: Any, workdir: Path, injection_doc: bool, say: Any, corpus:
         text = rag.parse_document(doc_name, raw)
         rag.stage_document(l2, doc_name=doc_name, text=text, min_role="L2")
         approve_pending(rag, say)
+    (workdir / "import.json").write_text(json.dumps({"inputs": len(inputs) + len(seeds), "failed": len(report["failed"])}), encoding="utf-8")
     db = rag.read_db()
     docs = Counter(c["docName"] for c in db["live_chunks"])
     say(f"corpus ready in {time.time() - t0:.0f} s: {len(db['live_chunks'])} chunks, {len(docs)} documents")
@@ -651,6 +655,69 @@ def metrics(mode: str, questions: list[dict[str, Any]], raw: dict[str, Any], pas
     }
 
 
+def rejection_reason(part: dict[str, Any], contradiction: bool) -> str:
+    """Why an unanswered question part was not answered (aggregate diagnostics; thresholds mirror engine/answer/gate.py)."""
+    sys.path.insert(0, str(ROOT))
+    from engine.answer.gate import DENSE_GATE, GATE_COVERAGE, GATE_MISSING
+    f = part.get("features") or {}
+    dense = " + Dense < %.2f" % DENSE_GATE if f.get("dense") is not None else ""
+    if f.get("judge") is False:
+        return "Judge NEIN" + (" (Dense-Pfad)" if f.get("densePath") else "")
+    if "judge" in f and f["judge"] is None:
+        return "Judge ohne Antwort"
+    if part.get("reason", "").startswith("kein Wert der gefragten Art"):
+        return "Wertfrage ohne Wert der Dimension"
+    if contradiction:
+        return "Widerspruch (nur Fundstellen)"
+    if not f or "coverage" not in f:
+        return "keine Fundstelle / keine Suchbegriffe"
+    if f["coverage"] < GATE_COVERAGE:
+        return f"Abdeckungsschwelle (< {GATE_COVERAGE}){dense}"
+    if (f.get("missingMax") or 0) > GATE_MISSING:
+        return f"missingMax (> {GATE_MISSING}){dense}"
+    if part.get("reason") == "kein Wert/keine Rolle in den Fundstellen":
+        return "kein Wert / keine Rolle im Fenster"
+    return "ohne LLM: nur Fundstellen" if "judge" not in f else "sonst"
+
+
+def diagnostics(m: dict[str, Any]) -> dict[str, Any]:
+    """Aggregates only (safe for the holdout): rejection reasons and coverage histogram of the unanswered parts of
+    answerable questions, import statistics of the mode's corpus."""
+    reasons: Counter = Counter()
+    hist = [0] * 10
+    for s in m["scored"]:
+        if s["expect"] != "answer":
+            continue
+        if not s["trace"].get("parts") and s["kind"] != "answer":
+            reasons["Trace ohne Teilfragen (Node-Engine)"] += 1
+        for p in s["trace"].get("parts") or []:
+            if p.get("answered"):
+                continue
+            reasons[rejection_reason(p, bool(s["trace"].get("contradiction")))] += 1
+            hist[min(9, int(float(p.get("coverage") or 0.0) * 10))] += 1
+    chunks = m.get("chunks") or []
+    per_doc = sorted(Counter(c["docName"] for c in chunks).values())
+    inputs = (m.get("import") or {}).get("inputs")
+    imp = {"documents": len(per_doc), "inputs": inputs, "failed": (m.get("import") or {}).get("failed"), "zero_chunk_docs": max(0, inputs - len(per_doc)) if inputs is not None else None,
+           "chunks": len(chunks), "per_doc": (per_doc[0], per_doc[len(per_doc) // 2], per_doc[-1]) if per_doc else None,
+           "table_share": round(sum(1 for c in chunks if "Tabelle [" in c["content"]) / len(chunks), 3) if chunks else None}
+    return {"reasons": dict(reasons.most_common()), "hist": hist, "import": imp}
+
+
+def diagnostics_md(ms: list[dict[str, Any]]) -> str:
+    md = "## Diagnose (nur Aggregate)\n"
+    for m in ms:
+        d = m["diagnostics"]
+        imp = d["import"]
+        md += f"\n### {m['mode']}\nAblehnungsgründe (Teilfragen beantwortbarer Fragen, nicht beantwortet): " + \
+              (", ".join(f"{k}: {v}" for k, v in d["reasons"].items()) or "keine") + "\n"
+        md += "Abdeckung der abgelehnten Teilfragen: " + " · ".join(f"{k / 10:.1f}–{(k + 1) / 10:.1f}: {n}" for k, n in enumerate(d["hist"])) + "\n"
+        md += (f"Import: {imp['documents']} Dokumente mit Chunks (Eingabedateien {imp['inputs'] if imp['inputs'] is not None else '?'}, "
+               f"0 Chunks: {imp['zero_chunk_docs'] if imp['zero_chunk_docs'] is not None else '?'}, davon Importfehler {imp['failed'] if imp['failed'] is not None else '?'}), {imp['chunks']} Chunks, pro Dokument "
+               f"min/median/max {'/'.join(map(str, imp['per_doc'])) if imp['per_doc'] else '–'}, Tabellen-Chunks {imp['table_share']}\n")
+    return md
+
+
 def summary_table(ms: list[dict[str, Any]]) -> str:
     keys = [
         ("correct (answerable)", lambda m: f"{m['correct_answerable']}/{m['answerable']} ({pct(m['correct_answerable'], m['answerable'])})"),
@@ -799,13 +866,18 @@ def main() -> None:
                 smoke_result = smoke(workdir, pick, raw)
         m = metrics(mode, questions, raw, args.passes)
         m["wall_s"] = round(time.time() - t0)
+        imp = workdir / "import.json"
+        m["chunks"] = raw.get("meta", {}).get("chunks") or []
+        m["import"] = json.loads(imp.read_text(encoding="utf-8")) if imp.exists() else None
+        m["diagnostics"] = diagnostics(m)
         all_metrics.append(m)
-        (resdir / f"{mode}.json").write_text(json.dumps({"metrics": {k: v for k, v in m.items() if k != "scored"}, "scored": m["scored"], "raw": raw}, ensure_ascii=False, indent=1), encoding="utf-8")
+        (resdir / f"{mode}.json").write_text(json.dumps({"metrics": {k: v for k, v in m.items() if k not in ("scored", "chunks")}, "scored": m["scored"], "raw": raw}, ensure_ascii=False, indent=1), encoding="utf-8")
         print(f"  [{mode}] done in {m['wall_s']} s", flush=True)
 
     table = summary_table(all_metrics)
     cats = category_table(all_metrics)
     md = f"# Eval {label}\n\n{len(questions)} questions\n\n{table}\n\n## Per category (correct/false answer/false abstention/incomplete)\n\n{cats}\n"
+    md += "\n" + diagnostics_md(all_metrics)
     if smoke_result:
         md += f"\n## Gateway smoke (Next.js → Python)\n{smoke_result['checked']} questions, served by python: {smoke_result['served_python']}, identical to in-process: {smoke_result['identical']}\n"
     if not holdout:
@@ -825,6 +897,8 @@ def main() -> None:
     print(table)
     print()
     print(cats)
+    print()
+    print(diagnostics_md(all_metrics))
     if smoke_result:
         print(f"\ngateway smoke: {smoke_result['checked']} checked, served python {smoke_result['served_python']}, identical {smoke_result['identical']}")
     if not holdout and args.show_failures:
