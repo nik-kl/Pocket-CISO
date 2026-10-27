@@ -68,7 +68,7 @@ Both engines read/write the same data/pocket-ciso-db.json (+ data/vectors.json f
 | `engine/search/normalize.py`, `facts.py`, `lexical.py`, `dense.py` | Folding, CISTEM, compounds, glossary, instruction spans · facts and unit-aware values · lexical index, role views, key terms, coverage · bge-m3 dense scores, RRF, diversified candidates |
 | `engine/answer/gate.py`, `judge.py`, `verify.py`, `compose.py`, `contradictions.py`, `pipeline.py` | Parts, windows, gate · LLM judge · sentence verifier · phrasing + search hits · contradiction rule · `run_query` |
 | `engine/staging.py`, `inbox.py` | Pipeline A staging/approval · watched-inbox connector |
-| `engine/requirements.txt` | fastapi, uvicorn, pydantic, httpx, numpy, pypdf, python-docx, python-multipart |
+| `engine/requirements.txt` | fastapi, uvicorn, pydantic, httpx, numpy, pypdf, pdfplumber (ruled PDF tables), python-docx, python-multipart |
 | `engine/glossary.json` | Bilingual term groups used for query expansion and the sentence verifier (Python and Node) |
 | `eval/tests/` | Unit tests (stdlib only, no Ollama; LLM stubbed; synthetic documents incl. generated PDFs): `helpers.py` + `test_ingest`, `test_store_staging`, `test_search`, `test_answer` |
 | `eval/eval.py`, `eval/eval_dev.jsonl` | Eval harness (modes ollama/noollama/node, determinism, gateway smoke) + 244 dev questions (223 dev, 21 `robust_*` on invented dev-only documents built by `robust_docs()`) |
