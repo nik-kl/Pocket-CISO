@@ -12,13 +12,13 @@ from .gate import (
     WHO_Q, dense_window, fact_chunks, question_parts, select_windows, window_ok, window_terms,
 )
 from .judge import judge_answerable, judge_evidence
-from .verify import answer_type_problem
-from ..config import ApiError, JUDGE_EVIDENCE, ROLE_RANK
+from .verify import answer_type_problem, focus_problem
+from ..config import ApiError, JUDGE_EVIDENCE, JUDGE_FOCUS, ROLE_RANK
 from ..llm import OLLAMA, engine_label
 from ..search.dense import dense_scores, diversify, fuse
 from ..search.facts import values_in
 from ..search.lexical import coverage, key_terms, lexical_index
-from ..search.normalize import fold
+from ..search.normalize import Vocab, fold
 from ..store import actor_for, append_denial, cached_db, locked_db
 
 
@@ -39,7 +39,7 @@ def _restricted_match(db: dict[str, Any], role: str, question: str) -> dict[str,
     return None
 
 
-def _judge(idx: "LexIndex", part: Part, question: str, windows: list[list[tuple[int, int]]]) -> bool | None:
+def _judge(idx: "LexIndex", vocab: Vocab, part: Part, question: str, windows: list[list[tuple[int, int]]]) -> bool | None:
     """Answerability judge over the windows' spans (≤ 6). JUDGE_EVIDENCE (measurement variant): the LLM names the span that
     answers (or 0), the answer type is checked at exactly that span, and a confirmed part keeps only the window holding it.
     None = no LLM reply."""
@@ -52,6 +52,8 @@ def _judge(idx: "LexIndex", part: Part, question: str, windows: list[list[tuple[
         return None if n is None else False
     w, (i, k) = flat[n - 1]
     problem = answer_type_problem(part.text, idx.span_text[i][k], part.value, part.who, coverage(part.qt, idx.span_terms[i][k], idx.ctx_terms[i]))
+    if not problem and JUDGE_FOCUS:
+        problem = focus_problem(part.text, idx.span_text[i][k], vocab)
     if problem:
         part.features["answerType"] = problem
         return False
@@ -127,7 +129,7 @@ def run_query(token: str | None, question: str) -> dict[str, Any]:
             # deterministic contradiction rule (step 4, same with and without LLM): never an answer, shown as search hits
             part.contradiction = find_contradiction(idx, view, part, ranked) or None
             if use_llm and not part.contradiction:
-                part.features["judge"] = _judge(idx, part, ptext + ctx_note, part.windows)
+                part.features["judge"] = _judge(idx, view.vocab, part, ptext + ctx_note, part.windows)
         # dense path only below the lexical floor: a second judge call after a NEIN on the lexical window gave the 7B judge a
         # second chance to say JA and produced 2 false answers on the dev set (I-1, R-10) → never retried
         if dense and not part.lexical_ok:
@@ -136,7 +138,7 @@ def run_query(token: str | None, question: str) -> dict[str, Any]:
                 part.dense_ok, part.windows = True, [dw[0]]
                 part.features["densePath"] = round(dw[1], 4)
                 if use_llm:
-                    part.features["judge"] = _judge(idx, part, ptext + ctx_note, [dw[0]])
+                    part.features["judge"] = _judge(idx, view.vocab, part, ptext + ctx_note, [dw[0]])
         part.answered = (part.lexical_ok or part.dense_ok) and part.features.get("judge") is True and not part.contradiction
         if not part.answered and part.windows:
             part.reason = ("Abdeckung zu gering" if not (part.lexical_ok or part.dense_ok) else "Antwortbarkeitsprüfung: nein" if use_llm else "kein LLM: nur Fundstellen")
@@ -151,7 +153,7 @@ def run_query(token: str | None, question: str) -> dict[str, Any]:
                 continue
             ws = [w for w in pool if not p.value or window_ok(idx, p, w)]  # role names are left to the judge here
             p.pooled = bool(ws)
-            if ws and _judge(idx, p, f"{p.text} (Gesamtfrage: {q})", ws) is True:
+            if ws and _judge(idx, view.vocab, p, f"{p.text} (Gesamtfrage: {q})", ws) is True:
                 p.windows = p.windows if p.evidence else ws
                 p.answered, p.reason = True, ""
                 p.coverage = max(p.coverage, coverage(p.qt, frozenset().union(*(window_terms(idx, w) for w in p.windows))))

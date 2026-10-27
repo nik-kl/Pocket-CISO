@@ -5,7 +5,7 @@ import re
 from dataclasses import dataclass
 from typing import Iterable
 
-from ..search.normalize import FREQ_WORDS, GLOSSARY, TABLE_LABEL, Vocab, analyze, fold
+from ..search.normalize import FREQ_WORDS, GENERIC_WORDS, GLOSSARY, R_STOP, TABLE_LABEL, Vocab, analyze, cistem, fold
 
 
 # Named roles and bodies: acronyms (CISO, BSI, SOC) and role nouns, also as the tail of a compound ("Küchenleitung", "CISO-Office")
@@ -141,3 +141,67 @@ def answer_type_problem(question: str, span: str, value: bool, who: bool, cov: f
     if plural_which(question):
         return "" if is_enumeration(span) else "Belegstelle ohne Aufzählung"
     return "" if cov >= ANSWER_COVERAGE else f"Belegstelle deckt die Teilfrage nicht ab ({cov:.2f})"
+
+
+# ── focus words (JUDGE_FOCUS=1, measurement variant on top of JUDGE_EVIDENCE) ──
+# The core noun(s) of the part must occur at the span the judge named (stem or glossary synonym), otherwise the span is
+# about something else ("Welche Geräte …" answered by a sentence about the opening hours of the same room). Nouns: German
+# with casing → capitalised words (the first word only when it is no function word); English or all-lower-case → the
+# content words after an article, preposition, possessive or question word, or at the start (up to two: "the hand dryers").
+# Stop words, document-type words (Richtlinie, Policy, …), permission/obligation predicates (erlaubt, required, …) and the
+# document named with "laut/gemäß/according to" are no focus.
+_WORD = re.compile(r"[A-Za-zÄÖÜäöüß0-9][A-Za-zÄÖÜäöüß0-9-]*")
+_EN_FUNC = frozenset("the a an is are do does how what who whom which when where why can must should may to of for in on my our we i".split())
+_DE_FUNC = frozenset("der die das den dem des ist sind wie wer was welche welcher welches wann wo ich wir muss darf fur von zu im ein eine und".split())
+_NOUN_CUE = frozenset("der die das den dem des ein eine einen einem einer eines mein meine meinen meinem unser unsere unseren unserem "
+                      "fur bei von vom zu zum zur im in mit auf an nach uber aus durch gegen ohne welche welcher welches welchen welchem "
+                      "the a an of for about to in on at with by from into my our your their this that these those which what whose "
+                      "much many".split())
+_SOURCE_CUE = frozenset("laut gemass according per".split())
+_PREDICATE = frozenset("erlaubt verboten zulassig gestattet untersagt erforderlich notwendig pflicht verpflichtend permitted prohibited "
+                       "forbidden required mandatory necessary".split())
+
+
+def focus_words(question: str) -> list[str]:
+    """Core nouns of a question part (folded surface forms, in question order)."""
+    raw = _WORD.findall(question)
+    low = [fold(w) for w in raw]
+    en = sum(w in _EN_FUNC for w in low) > sum(w in _DE_FUNC for w in low)
+    cased = not en and any(w[:1].isupper() for w in raw[1:])
+
+    def content(k: int) -> bool:
+        w = low[k]
+        return len(w) >= 2 and not w.isdigit() and w not in R_STOP and w not in GENERIC_WORDS and w not in _PREDICATE and \
+            not (k and low[k - 1] in _SOURCE_CUE)
+
+    out: list[str] = []
+    for k, w in enumerate(raw):
+        if not content(k):
+            continue
+        if cased:
+            noun = w[:1].isupper() or w.isupper()
+        else:
+            j = k - 1
+            while j >= 0 and k - j <= 2 and content(j):
+                j -= 1  # a run of content words after the cue: "the risk acceptance"
+            noun = (j < 0 and k <= 1) or (j >= 0 and k - j <= 2 and low[j] in _NOUN_CUE) or (en and w[:1].isupper() and k > 0)
+        if noun and low[k] not in out:
+            out.append(low[k])
+    return out
+
+
+def _present(word: str, terms: set[str]) -> bool:
+    parts = [cistem(x) for x in re.findall(r"[a-z]+", word) if x not in R_STOP]
+    if parts and all(x in terms for x in parts):
+        return True
+    stem = cistem(re.sub(r"[^a-z]", "", word))
+    return any(any(m <= terms for m in GLOSSARY.groups[gi]) for t in {stem, *parts} for gi in GLOSSARY.single.get(t, []))
+
+
+def focus_problem(question: str, span: str, vocab: Vocab) -> str:
+    """'' when a focus word of the part occurs at the span (stem or glossary synonym) or the part has none, else the reason."""
+    focus = focus_words(question)
+    if not focus:
+        return ""
+    terms = set(analyze(span, vocab))
+    return "" if any(_present(w, terms) for w in focus) else "Fokuswort fehlt an der Belegstelle: " + ", ".join(focus)

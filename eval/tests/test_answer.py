@@ -97,6 +97,43 @@ class AnswerType(unittest.TestCase):
         self.assertIn("deckt", p("Darf man im Lesesaal essen?", "Der Lesesaal hat 40 Plätze.", False, False, 0.3))
 
 
+class FocusWords(unittest.TestCase):
+    """JUDGE_FOCUS=1 (measurement variant): a core noun of the part must occur at the named span (invented examples)."""
+    V = rag.Vocab({"fahrrad", "fahrradkeller", "keller"})
+
+    def test_core_nouns_of_german_and_english_questions(self) -> None:
+        self.assertEqual(rag.focus_words("Welche Geräte sind im Labor erlaubt?"), ["gerate", "labor"])
+        self.assertEqual(rag.focus_words("Wofür ist der Hausmeister laut Hausordnung verantwortlich?"), ["hausmeister"])  # named document
+        self.assertEqual(rag.focus_words("Gilt die Richtlinie für Praktikanten?"), ["praktikanten"])  # document-type word
+        self.assertEqual(rag.focus_words("how often are the hand dryers cleaned"), ["hand", "dryers"])  # after an article
+        self.assertEqual(rag.focus_words("aquarium fische füttern wann"), ["aquarium", "fische"])  # all lower case: run at the start
+        self.assertEqual(rag.focus_words("hunde im büro erlaubt?"), ["hunde", "buro"])  # predicate word is no focus
+
+    def test_focus_word_must_occur_at_the_span(self) -> None:
+        q = "Wo darf ich mein Fahrrad abstellen?"
+        self.assertEqual(rag.focus_problem(q, "Fahrräder sind im Fahrradkeller abzustellen.", self.V), "")  # stem / compound part
+        self.assertIn("Fokuswort", rag.focus_problem(q, "Der Keller ist ab 22 Uhr verschlossen.", self.V))
+        self.assertEqual(rag.focus_problem("Wie spät ist es?", "Irgendein Satz.", self.V), "")  # no focus word → no veto
+
+    def test_glossary_synonym_counts(self) -> None:
+        q = "Darf die KI im Kochkurs Rezepte erfinden?"
+        self.assertEqual(rag.focus_problem(q, "Artificial intelligence may only suggest dishes.", self.V), "")
+        self.assertIn("Fokuswort", rag.focus_problem(q, "Kursleiter dürfen Gerichte vorschlagen.", self.V))
+
+    def test_pipeline_vetoes_a_span_without_focus_word(self) -> None:
+        # the lawn sentence enters the window through the adverb "draußen" (a key term, but no noun of the question)
+        fresh_db([("Gartenordnung.md", "§1 Pflege", "L2", "Draußen wird der Rasen wöchentlich gemäht. Die Hecke wird jährlich geschnitten.")])
+        lexical._LEX_CACHE = None
+        q = "Wie oft wird die Hecke draußen geschnitten?"
+        with mock.patch.object(pipeline, "JUDGE_EVIDENCE", True), mock.patch.object(pipeline, "JUDGE_FOCUS", True):
+            with stub_llm(pick("Hecke")):
+                self.assertEqual(rag.run_query(token("L2"), q)["result"]["kind"], "answer")
+            with stub_llm(pick("Rasen")):  # frequency present, but the span is about the lawn
+                res = rag.run_query(token("L2"), q)
+        self.assertNotEqual(res["result"]["kind"], "answer")
+        self.assertIn("Fokuswort", res["result"]["trace"]["parts"][0]["features"]["answerType"])
+
+
 class AnswerGate(unittest.TestCase):
     """Step-5 gate: lexical floor (GATE_COVERAGE / GATE_MISSING) + LLM answerability judge; without LLM only search hits."""
     DOCS = [

@@ -24,6 +24,8 @@ ANSWER_PHRASING = os.getenv("ANSWER_PHRASING", "1") != "0"
 # measurement variant only (P2c, not adopted: 2 false answers with qwen2.5:7b): JUDGE_EVIDENCE=1 makes the judge name the
 # answering span, which then has to pass the answer-type check (verify.answer_type_problem)
 JUDGE_EVIDENCE = os.getenv("JUDGE_EVIDENCE", "0") == "1"
+# measurement variant on top of JUDGE_EVIDENCE: a focus word of the part must occur at the named span (verify.focus_problem)
+JUDGE_FOCUS = os.getenv("JUDGE_FOCUS", "0") == "1"
 EMBED_MODEL = os.getenv("EMBED_MODEL", "bge-m3")
 LLM_TIMEOUT = float(os.getenv("LLM_TIMEOUT", "14"))
 # chat context and residency: judge/phrasing prompts are < 2k tokens, so 4096 is enough and keeps a 14B model at ~10 GB
