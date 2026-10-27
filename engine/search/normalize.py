@@ -305,6 +305,9 @@ INSTRUCTION_RE = re.compile(
     r"(\bignor\w*\s+(?:alle\w*|all|any|the|previous|prior|vorherig\w*|bisherig\w*|obig\w*)\b|\bvergiss\s+(?:alle\w*|die|deine|your)\b"
     r"|\bforget\s+(?:all|everything|your|the)\b|system\s*-?\s*prompt|^\s*system\s*:|\bdu bist (?:jetzt|nun|ab sofort)\b|\byou are now\b"
     r"|\b(?:antworte|answer|respond|reply)\w*\b.{0,40}\b(?:nur|only|ausschliesslich|exclusively|everything|alles|jede\w*|every)\b"
-    r"|\bact as\b|\bpretend\b|\bassistenzsystem\w*|\bjailbreak\b)", re.I)
+    r"|\bact as\b|\bpretend\b|\bassistenzsystem\w*|\bjailbreak\b"
+    # addressed to AI systems ("Hinweis für KI-Assistenten, Chatbots", "note to AI assistants") or dictating the reply format
+    r"|\b\w*(?:hinweis|anweisung|instruktion|instruction|message|note|notice)\w*\s+(?:fur|für|for|an|to)\s+(?:alle\s+|all\s+)?(?:ki|ai|chatbot|sprachmodell|language model|llm)"
+    r"|\b(?:beende|beendet|end|finish|schliess\w*|schließ\w*)\s+(?:jede|jeder|each|every|all|deine|your)\w*\s+(?:antwort|answer|response|reply)\w*)", re.I)
 
 TABLE_LABEL = re.compile(r"^Tabelle \[[^\]]*\]:\s*")

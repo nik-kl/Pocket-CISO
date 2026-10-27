@@ -7,7 +7,7 @@ from typing import Any
 
 from .verify import entities, modal_classes, numeric_terms
 from ..search.lexical import KeyTerm, QueryTerms, RoleView, coverage
-from ..search.normalize import FREQ_WORDS, INSTRUCTION_RE, _LEX, fold, norm
+from ..search.normalize import FREQ_WORDS, INSTRUCTION_RE, R_STOP, _LEX, _edit_distance, cistem, fold, norm
 
 
 NO_ANSWER = "Keine belegbare Antwort im freigegebenen Bestand."
@@ -53,6 +53,21 @@ PROHIBITION_RE = re.compile(r"\b(?:untersagt\w*|verbot\w*|unzulassig\w*|prohibit
 ANAPHOR = re.compile(r"^(?:er|sie|es|dies\w*|dabei|dazu|hierbei|this|these|it|they|he|she)\b", re.I)
 
 
+def fix_function_words(question: str, view: RoleView) -> str:
+    """Folded question with typos of function/question words corrected for the question-type rules ('wie lnage' → 'wie
+    lange'): a word unknown to the role's corpus within one edit of a stop word of similar length (same rule key_terms
+    uses to drop such typos from the search terms)."""
+    out = []
+    for w in fold(question).split():
+        core = re.sub(r"\W", "", w)
+        if len(core) >= 4 and core not in R_STOP and cistem(core) not in view.df:
+            fix = next((s for s in sorted(R_STOP) if len(s) >= 4 and abs(len(s) - len(core)) <= 1 and _edit_distance(core, s, 1) <= 1), None)
+            if fix:
+                w = w.replace(core, fix)
+        out.append(w)
+    return " ".join(out)
+
+
 @dataclass
 class Part:
     text: str
@@ -70,6 +85,7 @@ class Part:
     contradiction: list[tuple[list[tuple[int, int]], dict[str, set[float]]]] | None = None
     coverage: float = 0.0
     answered: bool = False
+    flag_text: str = ""  # folded question with function-word typos fixed (question-type rules)
     shown: list[list[tuple[int, int]]] = field(default_factory=list)  # spans shown per window (answered parts)
     reason: str = ""
 

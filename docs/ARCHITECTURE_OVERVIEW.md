@@ -90,4 +90,7 @@ All 35 unanswerable questions refused in every mode, 0 leakage, 0 number/negatio
 | pre-P5c (4f538f7) | without Ollama | 0 | 0 | 25 (19) | 5 | 1 | 1 |
 | P5c (c5214fa) | Python + Ollama | 8 | 1 (D2-09) | 17 (12) | 3 | 1 | 1 |
 | P5c (c5214fa) | without Ollama / Local engine | 0 / 0 | 0 / 0 | 25 (18) / 21 (13) | 5 / 9 | 1 / 1 | 1 / 0 |
+| after dev2 class fixes | Python + Ollama | 10 | 0 | 16 (11) | 3 | 0 | 1 |
+| after dev2 class fixes | without Ollama / Local engine | 0 / 0 | 0 / 0 | 26 (19) / 22 (13) | 4 / 8 | 0 / 0 | 1 / 0 |
+dev1 after the same fixes: Python + Ollama 96/205, 0 false, 90 search (79); without Ollama 187 search (171), contradictions 15/19 (K-14 had been found only through the random chunk-id tie-break before the stable order); Local engine 159 search (141); Local engine no longer shows the injection sentence of the dev-only visitor policy.
 **Known RAG limits:** the 7B judge rejects many correct windows (most remaining misses: combined sections, colloquial questions, multi-part pools); who-questions need a recognised role noun ("Werkschutz", "Facility Management" are not); contradictions S-5, R-3, I-17 are not found; dev numbers are tuned on the dev set — the holdout run is still open.

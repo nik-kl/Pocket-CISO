@@ -95,10 +95,14 @@ def search_hits(idx: "LexIndex", parts: list[Part], per_part: int = 3) -> list[d
         if not ((p.lexical_ok and not p.capped_only) or p.dense_ok):
             continue
         cand = [(w[-1][0], " ".join(display_span(idx.span_text[i][k]) for i, k in related_spans(idx, p, w))) for w in p.windows]
-        for i in p.ranked:  # further chunks: only their sentences that share a key term (whole chunk when none does)
-            best = max((coverage(p.qt, terms) for terms in idx.span_terms[i]), default=0.0)
-            rel = [display_span(t) for t, terms in zip(idx.span_text[i], idx.span_terms[i]) if best > 0 and coverage(p.qt, terms) >= 0.5 * best]
-            cand.append((i, " ".join(rel) or display_span(idx.chunks[i]["content"])))
+        for i in p.ranked:  # further chunks: only their sentences that share a key term (all sentences when none does);
+            # instruction-like spans (prompt injection) are never shown, as in answers
+            ok = [k for k in range(len(idx.span_text[i])) if not idx.span_instr[i][k]]
+            best = max((coverage(p.qt, idx.span_terms[i][k]) for k in ok), default=0.0)
+            rel = [display_span(idx.span_text[i][k]) for k in ok if best > 0 and coverage(p.qt, idx.span_terms[i][k]) >= 0.5 * best]
+            text = " ".join(rel) or " ".join(display_span(idx.span_text[i][k]) for k in ok)
+            if text:
+                cand.append((i, text))
         n = 0
         for i, text in cand:
             if n >= per_part or any(h["chunkId"] == idx.chunks[i]["id"] for h in hits):

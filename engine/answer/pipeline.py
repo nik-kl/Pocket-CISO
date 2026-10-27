@@ -9,7 +9,7 @@ from .compose import CONTRADICTION_LABEL, compose_sentences, display_span, relat
 from .contradictions import find_contradiction
 from .gate import (
     GATE_COVERAGE, GATE_MISSING, NORM_Q, NO_ANSWER, Part, SEARCH_LABEL, UNCONFIRMED_LABEL, VALUE_Q,
-    WHO_Q, definition_term, definition_window, dense_window, fact_chunks, question_parts, select_windows, window_ok, window_terms,
+    WHO_Q, definition_term, fix_function_words, definition_window, dense_window, fact_chunks, question_parts, select_windows, window_ok, window_terms,
 )
 from .judge import judge_answerable
 from .verify import has_value, value_dim
@@ -68,8 +68,8 @@ def run_query(token: str | None, question: str) -> dict[str, Any]:
     candidate_docs: list[str] = []
     for ptext in texts:
         qt = key_terms(ptext, view)
-        f = fold(ptext)
-        part = Part(ptext, qt, bool(VALUE_Q.search(f) or qt.unit_cues), bool(WHO_Q.search(f)), [], bool(NORM_Q.search(f)))
+        f = fix_function_words(ptext, view)
+        part = Part(ptext, qt, bool(VALUE_Q.search(f) or qt.unit_cues), bool(WHO_Q.search(f)), [], bool(NORM_Q.search(f)), flag_text=f)
         if not qt.keys or not view.n:
             part.reason = "keine Suchbegriffe" if view.n else "keine Fundstelle"
             parts.append(part)
@@ -154,7 +154,7 @@ def run_query(token: str | None, question: str) -> dict[str, Any]:
         p.shown = [related_spans(idx, p, w) for w in p.windows]
         if not p.value:
             continue
-        dim = value_dim(p.text)
+        dim = value_dim(p.flag_text or p.text)
         if any(has_value(dim, idx.span_text[i][k]) for ws in p.shown for i, k in ws):
             continue
         add = next(((n, x) for n, w in enumerate(p.windows) for x in reversed(w) if has_value(dim, idx.span_text[x[0]][x[1]])), None)
@@ -238,7 +238,7 @@ def run_query(token: str | None, question: str) -> dict[str, Any]:
                     ordered.append((sid, idx.span_text[i][k]))
     sentences, answer_by = compose_sentences(q, ordered, view.vocab, use_llm)
     said = " ".join(s.text for s in sentences)
-    if any(p.value and not has_value(value_dim(p.text), said) for p in answered):  # phrasing dropped the value → verbatim spans
+    if any(p.value and not has_value(value_dim(p.flag_text or p.text), said) for p in answered):  # phrasing dropped the value → verbatim spans
         sentences, answer_by = compose_sentences(q, ordered, view.vocab, False)[0], "verbatim (Wert fehlte in der Formulierung)"
     lat["generation"] = int((time.perf_counter() - t) * 1000)
 

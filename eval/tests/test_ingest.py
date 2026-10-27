@@ -211,6 +211,61 @@ class PdfRuledTables(unittest.TestCase):
                                                        {"Artikel": "Semmel", "Preis netto": "2 EUR", "Preis brutto": "2,14 EUR"}])
 
 
+class TextExports(unittest.TestCase):
+    """Plain-text/Markdown export classes: HTML remnants, pipe tables with blank lines and wrapped rows, ASCII tables
+    without outer pipes (invented content)."""
+
+    @staticmethod
+    def statements(name: str, text: str) -> str:
+        _, chunks = rag.chunk_document(rag.parse_document(name, text.encode("utf-8-sig")))
+        return " ".join(c["content"] for c in chunks)
+
+    def test_html_remnants_and_crlf(self) -> None:
+        raw = rag.parse_document("faq.txt", "Frage: Kaffee &amp; Tee?<br>Antwort:&nbsp;Nur in der K&uuml;che &gt; 2. Stock.\r\n".encode("utf-8-sig"))
+        self.assertEqual(raw.strip(), "Frage: Kaffee & Tee?\nAntwort: Nur in der Küche > 2. Stock.")
+
+    def test_pipe_table_with_blank_lines_and_wrapped_cells(self) -> None:
+        text = ("## 1 Geräte\n\n| Gerät      | Zweck                   | Wartung |\n|------------|-------------------------|---------|\n\n"
+                "| Ofen 1     | Brot, Brötchen,         | 6 Monate |\n|            | Gebäck                  |          |\n\n"
+                "| Kühlraum   | Lagerung                | 12 Monate |\n")
+        st = self.statements("geraete.md", text)
+        self.assertIn("Gerät: Ofen 1 | Zweck: Brot, Brötchen, Gebäck | Wartung: 6 Monate", st)
+        self.assertIn("Gerät: Kühlraum | Zweck: Lagerung | Wartung: 12 Monate", st)
+
+    def test_continuation_row_without_blank_lines(self) -> None:
+        text = "| Raum | Schlüssel |\n|---|---|\n| Archiv | Hausmeister |\n|  | und Empfang |\n| Labor | Laborleitung |\n"
+        st = self.statements("raeume.md", text)
+        self.assertIn("Raum: Archiv | Schlüssel: Hausmeister und Empfang", st)
+        self.assertIn("Raum: Labor | Schlüssel: Laborleitung", st)
+
+    def test_ascii_table_without_outer_pipes(self) -> None:
+        text = ("Aufbewahrung der Unterlagen\n\nUnterlage            | Frist\n---------------------+--------------\n"
+                "Stundenzettel        | 2 Jahre\nUrlaubsantrag        | 1 Jahr nach Ende\n\nWeiterer Text.\n")
+        st = self.statements("fristen.txt", text)
+        self.assertIn("Unterlage: Stundenzettel | Frist: 2 Jahre", st)
+        self.assertIn("Unterlage: Urlaubsantrag | Frist: 1 Jahr nach Ende", st)
+
+
+@unittest.skipUnless(HAVE_REPORTLAB, "reportlab (engine/requirements-dev.txt) not installed")
+class PdfTwoColumns(unittest.TestCase):
+    def test_columns_are_read_one_after_the_other(self) -> None:
+        import io
+        from reportlab.lib.pagesizes import A4
+        from reportlab.lib.styles import getSampleStyleSheet
+        from reportlab.platypus import BaseDocTemplate, Frame, FrameBreak, PageTemplate, Paragraph
+        st = getSampleStyleSheet()["BodyText"]
+        left = ("Gäste melden sich am Empfang im Erdgeschoss an und erhalten dort einen Gästeausweis mit Foto. " * 4).strip()
+        right = ("Das Rauchen ist nur auf der Dachterrasse erlaubt, niemals in den Werkstätten oder Lagern. " * 4).strip()
+        buf = io.BytesIO()
+        doc = BaseDocTemplate(buf, pagesize=A4)
+        w, h = A4
+        doc.addPageTemplates([PageTemplate(frames=[Frame(60, 100, w / 2 - 75, h - 200), Frame(w / 2 + 15, 100, w / 2 - 75, h - 200)])])
+        doc.build([Paragraph(left, st), FrameBreak(), Paragraph(right, st)])
+        flat = " ".join(rag.parse_document("Merkblatt.pdf", buf.getvalue()).split())
+        self.assertIn(left, flat)  # the left column as one text, not interleaved with the right one
+        self.assertIn(right, flat)
+
+
 class DocumentNames(unittest.TestCase):
     def test_same_rule_as_node(self) -> None:
         # src/lib/db/staging.ts safeDocName keeps the same characters: letters, digits, space . _ - & , ( )
