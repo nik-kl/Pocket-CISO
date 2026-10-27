@@ -6,7 +6,7 @@ The prototype is designed for a controlled enterprise demo:
 
 - **Pipeline B — Ask Pocket CISO:** stateless, RBAC-filtered retrieval with German and English query support, grounded answers, citations, telemetry, and a hard fallback when evidence is insufficient.
 - **Pipeline A — Policy Diff & Sign-Off:** PDF, DOCX, Markdown, and TXT ingestion; semantic red/green diffs; table-aware chunking; conflict detection; ticket-backed approval; and merge to the live policy collection.
-- **Zero-touch ingestion:** the flat `backend/watched_inbox/` folder acts as a SharePoint/SMB connector stand-in. Manual sync or an optional polling cycle stages changed files for CISO review.
+- **Zero-touch ingestion:** the `data/inbox/` folder (gitignored; sample documents in `eval/corpus/inbox/`) acts as a SharePoint/SMB connector stand-in. Manual sync or an optional polling cycle stages changed files for CISO review.
 - **Closed-loop governance:** Jira/ServiceNow-style webhook payload previews, ticket resolution, hash-chained audit logs, JSON/CSV export, and a printable executive summary.
 - **Hybrid resilience:** the browser uses Python first when available and falls back to the local TypeScript engine when Python or Ollama is offline.
 
@@ -18,11 +18,8 @@ The prototype is designed for a controlled enterprise demo:
 
 ```bash
 npm install
-cd backend
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-cd ..
+python3 -m venv engine/.venv
+engine/.venv/bin/pip install -r engine/requirements.txt
 ```
 
 For the full local AI path, install Ollama and download the configured models:
@@ -38,13 +35,10 @@ The UI and Python rule engine can still run when Ollama is unavailable.
 
 Use two terminals from the repository root:
 
-**Terminal 1 — FastAPI backend**
+**Terminal 1 — FastAPI engine**
 
 ```bash
-cd backend
-export POCKET_CISO_DEMO=1
-source .venv/bin/activate
-python main.py
+POCKET_CISO_DEMO=1 npm run engine          # = engine/.venv/bin/python -m engine.api
 ```
 
 **Terminal 2 — Next.js frontend**
@@ -68,34 +62,59 @@ These credentials are available only when an explicit demo flag is set. `POCKET_
 The UI’s **Sync Inbox** action is always available. To also poll the inbox every 30 seconds:
 
 ```bash
-cd backend
-export POCKET_CISO_DEMO=1
-export AUTO_SYNC=1
-source .venv/bin/activate
-python main.py
+POCKET_CISO_DEMO=1 AUTO_SYNC=1 npm run engine
 ```
 
-Place `.pdf`, `.docx`, `.md`, or `.txt` files in `backend/watched_inbox/`. Files are SHA-256 deduplicated and staged with L2 connector clearance; the CISO must still approve them.
+Place `.pdf`, `.docx`, `.md`, or `.txt` files in `data/inbox/` (or set `WATCHED_INBOX_DIR`); for the demo copy the samples with `mkdir -p data/inbox && cp eval/corpus/inbox/* data/inbox/`. Files are SHA-256 deduplicated and staged with L2 connector clearance; the CISO must still approve them.
 
-## Non-demo configuration
+## Lokal starten
 
-Do not use the seeded demo credentials in a deployment. Configure the same HMAC secret in the Node and Python processes and provide role passwords:
+Einmalig: Abhängigkeiten installieren und die Konfiguration anlegen.
 
 ```bash
-export POCKET_CISO_SECRET='replace-with-at-least-32-random-characters'
-export POCKET_CISO_L2_PASSWORD='your-l2-password'
-export POCKET_CISO_L3_PASSWORD='your-l3-password'
+npm install
+python3 -m venv engine/.venv
+engine/.venv/bin/pip install -r engine/requirements.txt
+cp .env.example .env        # Platzhalter in .env durch eigene Werte ersetzen
 ```
 
-`POCKET_CISO_SECRET` must contain at least 32 characters. Outside explicit demo mode:
+Dann zwei Terminals im Repository-Root; in **beiden** zuerst die Env laden (beide Prozesse brauchen dieselben Werte):
 
-- L2 and L3 passwords are required.
-- A missing database starts empty with the role accounts and one genuine `DB_INITIALIZED` audit event; demo policies, pending diffs, and backdated audit history are never fabricated in production mode.
-- `reset_demo` is disabled.
-- The gateway returns explicit `AUTH_CONFIG_MISSING` or `AUTH_CONFIG_INVALID` errors instead of silently falling back.
-- The HMAC secret is not stored in `data/pocket-ciso-db.json`.
+```bash
+set -a; source .env; set +a
+npm run engine              # Terminal 1: Python-Engine auf http://127.0.0.1:8000
+npm run dev                 # Terminal 2: UI auf http://localhost:3000
+```
 
-In explicit demo mode, a local `data/.auth-secret` file is generated with restrictive permissions when no `POCKET_CISO_SECRET` is supplied. Legacy `meta.secret` values in old database files are ignored and removed during Node migration.
+Login: L1 ohne Passwort; L2 mit dem Wert von `POCKET_CISO_L2_PASSWORD`, L3 mit dem Wert von `POCKET_CISO_L3_PASSWORD` aus der `.env`.
+Ohne Demo-Flag startet die Datenbank leer; Richtlinien kommen über Upload oder `data/inbox/` (Beispiele: `cp eval/corpus/inbox/* data/inbox/`, dann *Sync Inbox*).
+
+## Production configuration
+
+Never run a deployment with the seeded demo credentials. Start **both** processes with the same values:
+
+```bash
+export POCKET_CISO_ENV=production
+export POCKET_CISO_SECRET='replace-with-at-least-32-random-characters'
+export POCKET_CISO_L2_PASSWORD='at-least-14-characters'
+export POCKET_CISO_L3_PASSWORD='at-least-14-characters'
+
+# terminal 1
+npm run engine
+# terminal 2
+npm run build && npm run start
+```
+
+In production mode:
+
+- demo flags are ignored; L2/L3 passwords (≥ 14 characters) and the secret (≥ 32 characters) are mandatory;
+- a missing database starts **empty** with the role accounts and one genuine `DB_INITIALIZED` audit event — no demo policies, diffs or backdated history;
+- passwords are checked with scrypt and are never stored in `data/`; the HMAC secret is never written to disk;
+- `reset_demo` is disabled (403);
+- missing configuration returns a generic 503 `AUTH_CONFIG_MISSING` (details only in the server log);
+- put a reverse proxy with TLS in front and set `TRUST_PROXY=1` so rate limits work per client IP. **The proxy must overwrite (not append to) `X-Forwarded-For`** — otherwise a client can forge it and bypass the limits. Without `TRUST_PROXY=1` all users share one rate-limit bucket (widened ×10).
+
+In demo mode (`POCKET_CISO_DEMO=1`) a local `data/.auth-secret` is generated with owner-only permissions when no `POCKET_CISO_SECRET` is supplied. Keep data directories out of backups that are readable by untrusted users: they contain the audit log and policy content.
 
 ## Main workflows
 
@@ -103,9 +122,9 @@ In explicit demo mode, a local `data/.auth-secret` file is generated with restri
 
 1. Select an RBAC role in the sidebar.
 2. Ask a question in **Ask Pocket CISO**.
-3. Review the rewrite, RBAC filter, retrieval score, grounding result, engine mode, and latency in **Under the Hood**.
+3. Review the question parts, RBAC filter, retrieval score, lexical support, verification (span verifier, or "nicht verifiziert" for search hits), engine mode, and latency in **Under the Hood**. The retrieval score is a raw similarity, not a probability.
 4. Open a citation to inspect the exact source chunk, SHA-256, approval metadata, and similarity.
-5. Unsupported questions trigger the hallucination-protection fallback and offer a CISO-office ticket.
+5. Results are one of three kinds: a verified **answer**, labelled **search hits** (sources found but not confirmed as an answer, including "Mögliche Widersprüche" between documents), or a **fallback** ("Keine belegbare Antwort im freigegebenen Bestand.") with a CISO-office ticket.
 
 ### Stage and approve a policy update
 
@@ -113,8 +132,8 @@ In explicit demo mode, a local `data/.auth-secret` file is generated with restri
 2. Click **+ Stage Policy Update** to upload a PDF/DOCX/Markdown/TXT file or paste policy text.
 3. Choose the minimum clearance and optional replacement document.
 4. Review semantic red/green hunks and cross-document conflict alerts.
-5. Create a Sync-Ticket for conflicts or use an explicit CISO override.
-6. Approve and merge only after the conflict governance requirement is satisfied.
+5. Create a Sync-Ticket per conflict and resolve it (Knowledge DB & Audit Log), or tick the CISO override and give a reason (≥ 10 characters; audited with the conflict ids).
+6. Approve and merge: changed clauses replace their predecessors, clauses that no longer exist are removed, and the document series is renamed to the new version. A stale base (live data changed since staging) is rejected.
 
 ### Sync the watched inbox
 
@@ -135,9 +154,9 @@ In **Knowledge DB & Audit Log**:
 - export the NIS-2 audit report as JSON or CSV;
 - open **Print / PDF Summary** to print the governance summary.
 
-The report includes active policy hashes, the hash-chain status, recent approvals, a policy-set hash, and a report hash. It is an operational compliance artifact, not a legal certification.
+The report includes active policies with recomputed content hashes, the hash-chain status, recent approvals, a policy-set hash, and a report hash over the whole report (policies, audit log, tickets). The audit log is hash-chained and anchored with an HMAC, which makes tampering detectable — it is not append-only storage and not a legal certification.
 
-The report recomputes policy content hashes and hashes a canonical payload containing policy metadata, tickets, audit entries, chain data, and the policy-set hash. External signing or anchoring is still required when the audit store itself must be treated as independently tamper-evident.
+External signing or anchoring (and individual user identities via SSO) is still required when the audit store itself must be treated as independently tamper-evident.
 
 ## Architecture
 
@@ -147,9 +166,9 @@ Browser
   ▼
 Next.js /api/v1 gateway
   ├── Python FastAPI :8000 ── Ollama :11434
-  │     └── Qwen 2.5 7B + BGE-M3, NumPy vectors, document parsing
+  │     └── BM25 + BGE-M3 (RRF), Qwen 2.5 7B judge + verified phrasing, document parsing
   └── TypeScript fallback engine
-        └── keyword retrieval, local staging, audit and ticket workflows
+        └── keyword search hits, local staging, audit and ticket workflows
 
 Both engines
   ├── data/pocket-ciso-db.json
@@ -157,7 +176,7 @@ Both engines
   └── Python: data/vectors.json
 ```
 
-The gateway routes query and policy mutations to Python first. Query requests may fall back when Python is unavailable; mutation timeouts are returned rather than replayed locally to avoid double application. Authentication, ticket resolution, audit export, and demo reset remain local gateway actions.
+The gateway routes query and policy mutations to Python whenever it is up (without Ollama, Python returns search hits only). Queries fall back to the local engine (search hits only) when Python is unavailable; mutation timeouts are returned rather than replayed locally to avoid double application. Authentication, ticket resolution, audit export, and demo reset remain local gateway actions.
 
 ## Backend endpoints
 
@@ -173,50 +192,41 @@ The FastAPI service exposes:
 
 The Next.js gateway also exposes local actions for authentication, tickets, rejection, audit export, snapshots, and demo reset.
 
-## Flat repository layout
-
-Documentation and operational entry points stay at the repository root. Application code remains in the compact existing `src/` layout, and backend runtime code stays flat in `backend/`:
+## Repository layout
 
 ```text
 README.md
-AGENT_INDEX.md
-ARCHITECTURE_OVERVIEW.md
-backend/
-  main.py
-  rag_engine.py
-  requirements.txt
-  seed_policies/
-  watched_inbox/
-src/
-  app/
-  components/
-  lib/
-data/                         # runtime state; gitignored
+docs/                 AGENT_INDEX.md (lookup table), ARCHITECTURE_OVERVIEW.md
+engine/               Python engine: api.py (FastAPI), config, llm, store, staging, inbox,
+                      ingest/ (parse, chunk), search/ (normalize, facts, lexical, dense),
+                      answer/ (gate, judge, verify, compose, contradictions, pipeline), glossary.json
+eval/                 eval.py, eval_dev.jsonl, tests/, corpus/ (inbox/ + seed/ sample documents)
+src/                  Next.js: app/ (UI + /api/v1 gateway), components/, lib/ (db/ = local TS engine)
+data/                 runtime state incl. data/inbox/; gitignored
 ```
 
-See [AGENT_INDEX.md](./AGENT_INDEX.md) for the file-to-symbol lookup and [ARCHITECTURE_OVERVIEW.md](./ARCHITECTURE_OVERVIEW.md) for the detailed pipeline and governance model.
+See [docs/AGENT_INDEX.md](./docs/AGENT_INDEX.md) for the file-to-symbol lookup and [docs/ARCHITECTURE_OVERVIEW.md](./docs/ARCHITECTURE_OVERVIEW.md) for the detailed pipeline and governance model.
 
 ## Verification
 
 Run the mandated static checks:
 
 ```bash
-rm -f tsconfig.tsbuildinfo && npx tsc --noEmit
-backend/.venv/bin/python -m py_compile backend/main.py backend/rag_engine.py
+rm -f tsconfig.tsbuildinfo && npx tsc --noEmit && npm run build
+engine/.venv/bin/python -m compileall -q engine eval
+npm run test:engine                      # 73 tests, no Ollama needed
+engine/.venv/bin/python eval/eval.py --label X --modes ollama,noollama,node   # dev eval → /tmp/pocket-ciso-rag/results/X
 ```
 
-No browser automation or background daemon is required for these checks.
+Model switch only via `LLM_MODEL` (default `qwen2.5:7b`); `LLM_NUM_CTX` (4096) and `LLM_KEEP_ALIVE` (30m) tune Ollama. Latest dev numbers (0 false answers, 92/188 correct with Ollama) are in `docs/ARCHITECTURE_OVERVIEW.md`. Behavioural checks (RBAC matrix, dynamic proof, inbox scenarios, hostile uploads, concurrency) were run against live servers during the QA pass; see *Verification performed* in `ARCHITECTURE_OVERVIEW.md`.
 
 ## Current limitations and roadmap
 
-This is a local MVP, not a production certification platform. The main follow-up areas are:
+This is a local MVP, not a production certification platform. See [docs/ARCHITECTURE_OVERVIEW.md](./docs/ARCHITECTURE_OVERVIEW.md) → *Known limitations and RAG proposals* for measured numbers. In short:
 
-- OIDC/Entra ID SSO and individual actor identity;
-- Argon2id or scrypt password hashing;
-- PostgreSQL or another append-only audit store;
-- externally anchored audit signatures;
-- rate limiting and idempotency keys for mutations;
-- external anchoring/signing and append-only storage for audit evidence;
-- production vector storage and retrieval re-ranking;
-- OCR for scanned documents;
-- multi-tenant policy collections and real Jira/ServiceNow connectors.
+- role-level identity only (shared accounts) — OIDC/Entra ID SSO and individual actors are the next step;
+- tamper-evident (hash chain + HMAC anchor), not append-only: PostgreSQL / an external anchor or signing service is needed for stronger guarantees;
+- in-memory, per-process rate limits (per-IP needs a reverse proxy with `TRUST_PROXY=1`);
+- retrieval quality: the 7B answerability judge is strict (about half of the answerable dev questions end as search hits, not answers), the sentence verifier is heuristic (numbers/units, polarity, modality, roles), and the dev numbers are not yet confirmed on a holdout set;
+- unit tests and an eval harness exist, but no CI;
+- OCR for scanned PDFs, multi-tenant collections, real Jira/ServiceNow connectors.

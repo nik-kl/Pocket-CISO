@@ -6,7 +6,6 @@
 export type Role = "L1" | "L2" | "L3";
 
 export const ROLE_RANK: Record<Role, number> = { L1: 1, L2: 2, L3: 3 };
-export const hasRole = (have: Role, need: Role) => ROLE_RANK[have] >= ROLE_RANK[need];
 
 // `group` = Enterprise Directory group (Entra ID / OIDC) that maps to the RBAC level in a production SSO setup.
 export const ROLE_META: Record<Role, { id: string; sub: string; label: string; needsPassword: boolean; group: string }> = {
@@ -35,6 +34,18 @@ export interface LiveChunk {
   updatedAt: string;
   sha256: string;
   approvedBy?: string;
+  // Exact facts extracted by the Python engine at approval time (table cells, value sentences); absent for Node-side approvals.
+  facts?: ChunkFact[];
+  factsVersion?: number;
+}
+
+export interface ChunkFact {
+  span: number; // sentence index inside the chunk content
+  subject: string; // first table cell, empty for value sentences
+  attribute: string; // column header, empty for value sentences
+  dim: string; // "time" (minutes) | unit name | "num"
+  value: number;
+  surface: string; // literal text, e.g. "2 Stunden"
 }
 
 export interface Conflict {
@@ -95,6 +106,7 @@ export interface AuditLog {
   detail: string;
   prevHash: string;
   hash: string;
+  v?: 2; // hash format: absent = legacy "|"-joined, 2 = JSON array (unambiguous)
 }
 
 export interface Ticket {
@@ -127,15 +139,17 @@ export interface Snapshot {
   chunks: LiveChunk[];
   diffs: StagedDiff[] | null;
   audit: AuditLog[] | null;
+  auditTotal?: number | null;
   tickets: Ticket[] | null;
   integrity: { valid: boolean; entries: number; brokenAt: string | null } | null;
   backend: BackendStatus;
 }
 
-export type AnswerSegment = { type: "text"; text: string } | { type: "cite"; chunkId: string };
+// "note" = statement about the answer itself (e.g. an unanswered part), never a claim from the documents.
+export type AnswerSegment = { type: "text"; text: string } | { type: "note"; text: string } | { type: "cite"; chunkId: string; spanId?: string };
 
 export interface LatencyMs {
-  rewrite: number;
+  rewrite?: number; // local engine only; the Python engine splits questions by rules (no rewrite stage)
   rbac: number;
   retrieval: number;
   generation?: number;
@@ -144,9 +158,10 @@ export interface LatencyMs {
 }
 
 export interface QueryResult {
-  kind: "answer" | "fallback" | "denied";
+  kind: "answer" | "search" | "fallback" | "denied";
   requiredRole: Role | null;
   segments: AnswerSegment[];
+  hits?: { chunkId: string; docName: string; section: string; content: string }[]; // kind "search": no answer, RBAC-filtered spans
   citations: Record<string, LiveChunk>;
   scores?: Record<string, number>;
   trace: {
@@ -157,8 +172,11 @@ export interface QueryResult {
     total: number;
     nliVerified: boolean;
     temperature: number;
-    confidence: number;
+    confidence: number; // = retrievalScore (kept for compatibility; not a probability)
     topScore?: number;
+    retrievalScore?: number; // raw cosine of the best chunk (Python) or query-term coverage (local engine)
+    lexicalSupport?: number; // share of question terms found in the best chunk
+    verification?: "lexical-nli" | "extractive" | "none"; // what actually checked the answer
     latencyMs?: LatencyMs;
     engineMode?: string;
     rewriteBy?: string;

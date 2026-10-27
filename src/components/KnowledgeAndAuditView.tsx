@@ -31,12 +31,16 @@ function reportToCsv(r: AuditReport): string {
     csvRow(["chainHeadHash", r.chain.headHash]), csvRow(["chainAlgorithm", r.chain.algorithm]), csvRow(["policySetHash", r.policySetHash]), csvRow(["reportHash", r.reportHash]),
     "",
     csvRow(["# ACTIVE POLICIES"]),
-    csvRow(["id", "docName", "section", "minRole", "sha256", "approvedAt", "approvedBy"]),
-    ...r.activePolicies.map((p) => csvRow([p.id, p.docName, p.section, p.minRole, p.sha256, p.approvedAt, p.approvedBy])),
+    csvRow(["id", "docName", "section", "minRole", "contentHash(sha256 recomputed)", "approvedAt", "approvedBy"]),
+    ...r.activePolicies.map((p) => csvRow([p.id, p.docName, p.section, p.minRole, p.contentHash, p.approvedAt, p.approvedBy])),
     "",
     csvRow(["# AUDIT LOG"]),
-    csvRow(["id", "timestamp", "actor", "role", "action", "target", "status", "detail", "prevHash", "hash"]),
-    ...r.auditLogs.map((a) => csvRow([a.id, a.timestamp, a.actor, a.role, a.action, a.target, a.status, a.detail, a.prevHash, a.hash])),
+    csvRow(["id", "timestamp", "actor", "role", "action", "target", "status", "detail", "prevHash", "hash", "hashVersion"]),
+    ...r.auditLogs.map((a) => csvRow([a.id, a.timestamp, a.actor, a.role, a.action, a.target, a.status, a.detail, a.prevHash, a.hash, a.v ?? "legacy"])),
+    "",
+    csvRow(["# TICKETS"]),
+    csvRow(["id", "type", "system", "status", "createdBy", "createdAt", "title", "targetDoc", "sha256", "slaDue", "resolvedBy", "resolutionNote"]),
+    ...r.tickets.map((t) => csvRow([t.id, t.type, t.system, t.status, t.createdBy, t.createdAt, t.title, t.targetDoc, t.sha256, t.slaDue, t.resolvedBy, t.resolutionNote])),
   ].join("\r\n");
 }
 
@@ -174,7 +178,7 @@ export default function KnowledgeAndAuditView({ session, snap, refresh, notify }
         </div>
         <div role="tablist" className="flex gap-6 border-b border-line">
           {tabBtn("chunks", "Live Vector Chunks", snap?.chunks.length)}
-          {tabBtn("audit", "Immutable Audit Trail & Tickets", privileged ? snap?.audit?.length : undefined)}
+          {tabBtn("audit", "Audit Log (Hash-Kette) & Tickets", privileged ? (snap?.auditTotal ?? snap?.audit?.length) : undefined)}
         </div>
       </div>
 
@@ -341,7 +345,7 @@ export default function KnowledgeAndAuditView({ session, snap, refresh, notify }
           </>
         }
       >
-        <p>Setzt Live-Chunks, Staging-Queue und Tickets auf den Seed-Zustand zurück und startet eine neue Audit-Hash-Kette. Nur für Demo-Zwecke — in Produktion ist der Audit Trail unveränderlich.</p>
+        <p>Setzt Live-Chunks, Staging-Queue und Tickets auf den Seed-Zustand zurück und startet eine neue Audit-Hash-Kette. Nur für Demo-Zwecke — außerhalb des Demo-Modus ist der Reset deaktiviert (die Hash-Kette macht Manipulationen erkennbar, verhindert sie aber nicht).</p>
       </Modal>
     </div>
   );
@@ -475,7 +479,7 @@ function AttestationSheet({ report, onClose }: { report: AuditReport; onClose: (
               <dt className="text-zinc-500">chain.headHash</dt><dd className="break-all">{report.chain.headHash}</dd>
               <dt className="text-zinc-500">reportHash</dt><dd className="break-all">{report.reportHash}</dd>
             </dl>
-            <p className="text-[11px] text-zinc-500">policySetHash = SHA-256 über die sortierten Chunk-Hashes der aktiven Policy-Collection. Kette: {report.chain.algorithm}</p>
+            <p className="text-[11px] text-zinc-500">policySetHash = SHA-256 über die kanonische JSON-Liste der aktiven Policies (Metadaten + aus dem Inhalt neu berechneter Hash); reportHash = SHA-256 über den gesamten Bericht (Policies, Audit-Log, Tickets, Kettenstatus). Kette: {report.chain.algorithm}</p>
           </section>
 
           <section className="space-y-1.5">
@@ -488,7 +492,7 @@ function AttestationSheet({ report, onClose }: { report: AuditReport; onClose: (
                     <td className={`${sheetTd} font-mono`}>{p.docName}</td>
                     <td className={sheetTd}>{p.section}</td>
                     <td className={`${sheetTd} font-mono`}>{p.minRole}</td>
-                    <td className={`${sheetTd} break-all font-mono text-[9px] text-zinc-600`}>{p.sha256}</td>
+                    <td className={`${sheetTd} break-all font-mono text-[9px] text-zinc-600`}>{p.contentHash}{p.contentHash !== p.sha256 ? " ⚠ abweichend vom gespeicherten Hash" : ""}</td>
                   </tr>
                 ))}
               </tbody>

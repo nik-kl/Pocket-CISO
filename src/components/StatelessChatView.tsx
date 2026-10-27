@@ -151,7 +151,7 @@ export default function StatelessChatView({ session, snap, notify, onElevate }: 
             </div>
             <div className="overflow-hidden rounded-lg border border-line bg-surface">
               <div className="border-b border-line px-3 py-1.5 font-mono text-[11px] text-faint">chunk_id: {chunk.id}</div>
-              <blockquote className="border-l-2 border-brand px-4 py-3 text-[13px] leading-6 text-fg">{chunk.content}</blockquote>
+              <blockquote className="whitespace-pre-line border-l-2 border-brand px-4 py-3 text-[13px] leading-6 text-fg">{readableChunk(chunk.content)}</blockquote>
             </div>
             <dl className="divide-y divide-line overflow-hidden rounded-lg border border-line text-xs">
               <Prov label="Similarity score" value={score !== undefined ? score.toFixed(3) : "—"} hint={local ? "Term-Coverage (lokale Engine)" : "Cosine (Embedding)"} />
@@ -176,7 +176,7 @@ function Hero({ role, onPick }: { role: Role; onPick: (q: string) => void }) {
         </Badge>
         <h1 className="text-3xl font-semibold tracking-tight text-fg">Was sagt unsere Richtlinie dazu?</h1>
         <p className="max-w-xl text-sm leading-6 text-muted">
-          Jede Frage wird isoliert gegen die Live-Datenbank freigegebener Dokumente geprüft — mit RBAC-Filter, NLI-Grounding und lückenloser Quellenangabe.
+          Jede Frage wird isoliert gegen die Live-Datenbank freigegebener Dokumente geprüft — mit RBAC-Filter, lexikalischer Grounding-Prüfung und Quellenangabe pro Antwort.
         </p>
       </div>
       <div className="grid gap-3 sm:grid-cols-2">
@@ -237,6 +237,7 @@ function ResultView(p: ResultProps) {
   const fmt = (n?: number) => (n === undefined ? "" : ` · ${n < 10 ? n.toFixed(1) : Math.round(n)} ms`);
   const grounded = result.kind === "answer";
   const denied = result.kind === "denied";
+  const search = result.kind === "search";
   const sources = Object.values(result.citations);
 
   return (
@@ -262,9 +263,9 @@ function ResultView(p: ResultProps) {
           <Arrow />
           <Step ok={!denied} label={`2. RBAC Filter (${role})${fmt(lat?.rbac)}`} />
           <Arrow />
-          <Step ok={tr.confidence >= 0.85} label={`3. Vector Top-K (${Math.round(tr.confidence * 100)}%)${fmt(lat?.retrieval)}`} />
+          <Step ok={result.kind === "answer"} label={`3. Retrieval-Score ${(tr.retrievalScore ?? tr.confidence).toFixed(2)}${fmt(lat?.retrieval)}`} />
           <Arrow />
-          <Step ok={tr.nliVerified} label={`4. NLI Grounded: ${tr.nliVerified ? "PASS" : "FAIL"}${fmt(lat && (lat.generation ?? 0) + (lat.nli ?? 0) || undefined)}`} />
+          <Step ok={tr.nliVerified || tr.verification === "extractive"} label={`4. ${grounding(result.kind, tr)}${fmt(lat && (lat.generation ?? 0) + (lat.nli ?? 0) || undefined)}`} />
           <button onClick={p.onToggleTelemetry} aria-expanded={p.telemetryOpen} className="ml-auto inline-flex items-center gap-1 text-[11px] text-faint hover:text-fg">
             Under the Hood {p.telemetryOpen ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
           </button>
@@ -274,9 +275,9 @@ function ResultView(p: ResultProps) {
             <Cell label="1 · Original User Input" value={tr.original} />
             <Cell label={`2 · Query Rewrite (${tr.rewriteBy ?? "rules"})`} value={tr.rewrite} />
             <Cell label="3 · RBAC Filter Applied" value={`${tr.rbacFilter}  →  ${tr.searched} von ${tr.total} Chunks durchsuchbar`} mono />
-            <Cell label="4 · Grounding Check Status" value={`NLI Verified: ${tr.nliVerified ? "TRUE" : "FALSE"} | Temp: ${tr.temperature.toFixed(1)} | topScore: ${(tr.topScore ?? 0).toFixed(3)}`} mono />
+            <Cell label="4 · Grounding Check Status" value={`${result.kind === "answer" ? (tr.verification === "extractive" ? "Verification: extractive (verbatim chunk text, no NLI)" : `NLI Verified: ${tr.nliVerified ? "TRUE" : "FALSE"}`) : "nicht verifiziert (keine Antwort)"} | Temp: ${tr.temperature.toFixed(1)} | retrieval: ${(tr.retrievalScore ?? tr.topScore ?? 0).toFixed(3)}${tr.lexicalSupport !== undefined ? ` | lexical: ${tr.lexicalSupport.toFixed(2)}` : ""}`} mono />
             <Cell label="Engine" value={`${tr.engineMode ?? "—"}${tr.answerBy && tr.answerBy !== "none" ? ` · Antwort: ${tr.answerBy}` : ""}`} mono />
-            <Cell label="Latenz (ms)" value={lat ? `rewrite ${lat.rewrite} · rbac ${lat.rbac} · retrieval ${lat.retrieval} · generation ${lat.generation ?? 0} · nli ${lat.nli ?? 0} · Σ ${lat.total}` : "—"} mono />
+            <Cell label="Latenz (ms)" value={lat ? (["rewrite", "rbac", "retrieval", "generation", "nli"] as const).filter((k) => lat[k] !== undefined).map((k) => `${k} ${lat[k]}`).concat(`Σ ${lat.total}`).join(" · ") : "—"} mono />
           </dl>
         )}
       </div>
@@ -301,17 +302,24 @@ function ResultView(p: ResultProps) {
       ) : (
         <article className={`rounded-xl border bg-surface p-6 shadow-card ${grounded ? "border-line" : "border-warn/30"}`}>
           <div className="mb-4 flex items-center justify-between">
-            <span className="text-[10px] font-semibold uppercase tracking-[0.12em] text-faint">{grounded ? "Verified Compliance Answer" : "Compliance Answer"}</span>
+            <span className="text-[10px] font-semibold uppercase tracking-[0.12em] text-faint">{grounded ? "Verified Compliance Answer" : search ? "Fundstellen" : "Compliance Answer"}</span>
             {grounded ? (
-              <Badge tone="ok"><Check size={11} /> Grounded · {Math.round(tr.confidence * 100)}%</Badge>
+              <span className="flex items-center gap-1.5">
+                {/^(Local|Rule-based)/.test(tr.engineMode ?? "") && <Badge tone="warn"><AlertTriangle size={11} /> Keyword-Modus · geringe Präzision</Badge>}
+                <Badge tone="ok"><Check size={11} /> Grounded · Retrieval {(tr.retrievalScore ?? tr.confidence).toFixed(2)}</Badge>
+              </span>
+            ) : search ? (
+              <Badge><FileText size={11} /> Suchtreffer · nicht verifiziert</Badge>
             ) : (
-              <Badge tone="warn"><AlertTriangle size={11} /> Low Confidence</Badge>
+              <Badge tone="warn"><AlertTriangle size={11} /> Keine belastbare Quelle</Badge>
             )}
           </div>
           <p className="text-[15px] leading-7 text-fg">
             {result.segments.map((s, i) =>
               s.type === "text" ? (
                 <span key={i}>{s.text}</span>
+              ) : s.type === "note" ? (
+                <span key={i} className="block pt-2 text-sm italic text-muted">{s.text}</span>
               ) : (
                 <button
                   key={i}
@@ -358,6 +366,21 @@ function TicketControl({ ticket, ticketBusy, onCreateTicket, label }: ResultProp
       {ticketBusy ? <Loader2 size={14} className="animate-spin" /> : <TicketIcon size={14} />} {label}
     </Button>
   );
+}
+
+/** Step 4 label: a search hit or fallback was never verified as an answer, so it shows no NLI verdict. */
+function grounding(kind: string, tr: { verification?: string; nliVerified: boolean }): string {
+  if (kind !== "answer") return "nicht verifiziert";
+  return tr.verification === "extractive" ? "Wörtlicher Auszug (kein NLI)" : `NLI Grounded: ${tr.nliVerified ? "PASS" : "FAIL"}`;
+}
+
+/** Chunk text for people: the chunker's "Tabelle [§…]:" row label is dropped, every row becomes a "Spalte: Wert" list. */
+function readableChunk(content: string): string {
+  return content
+    .split(/\s*Tabelle \[[^\]]*\]:\s*/)
+    .map((part, i) => (i === 0 ? part : part.split(" | ").join("\n")))
+    .filter((part) => part.trim())
+    .join("\n\n");
 }
 
 function Step({ ok, label }: { ok: boolean; label: string }) {

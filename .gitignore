@@ -1,9 +1,19 @@
-node_modules
-.next
-next-env.d.ts
-*.tsbuildinfo
-.DS_Store
+# runtime state (DB, vectors, auth secret, default watched inbox data/inbox/)
 data/
-backend/.venv/
+# secrets / local environment (the placeholder template is tracked)
+.env*
+!.env.example
+# Python
+.venv/
 __pycache__/
 *.pyc
+# Node / Next.js
+node_modules/
+.next/
+next-env.d.ts
+*.tsbuildinfo
+# logs and OS files
+*.log
+.DS_Store
+# holdout questions: placed by the product owner, never committed
+eval_holdout.jsonl
