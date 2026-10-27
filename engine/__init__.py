@@ -15,7 +15,7 @@ from .search.lexical import DF0_CAP, key_terms, lexical_index
 from .search.dense import CAND_PER_DOC, diversify, fuse, reset_query_caches
 from .staging import approve_diff, same_series, stage_document, stage_text
 from .inbox import start_inbox_watcher, sync_watched_inbox
-from .answer.verify import entities, verify_sentence
+from .answer.verify import entities, has_value, value_dim, verify_sentence
 from .answer.gate import (
     DENSE_GATE, MAX_PARTS, NO_ANSWER, NORM_Q, question_parts, SEARCH_LABEL, span_windows,
     UNCONFIRMED_LABEL, VALUE_Q, WHO_Q,

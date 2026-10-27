@@ -70,6 +70,7 @@ class Part:
     contradiction: list[tuple[list[tuple[int, int]], dict[str, set[float]]]] | None = None
     coverage: float = 0.0
     answered: bool = False
+    shown: list[list[tuple[int, int]]] = field(default_factory=list)  # spans shown per window (answered parts)
     reason: str = ""
 
 

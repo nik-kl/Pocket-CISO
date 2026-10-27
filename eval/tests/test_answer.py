@@ -42,6 +42,59 @@ class Verifier(unittest.TestCase):
         self.assertEqual(rag.verify_sentence("Irgendetwas.", [], self.V), ["keine Quelle"])
 
 
+class ValueAnswers(unittest.TestCase):
+    """Value questions: the final answer must carry a value of the asked dimension (invented examples)."""
+
+    def setUp(self) -> None:
+        lexical._LEX_CACHE = None
+        rag.reset_query_caches()
+
+    def test_asked_dimension(self) -> None:
+        for q, dim in (("Wie oft wird gefüttert?", "frequency"), ("Wie viele Gäste dürfen hinein?", "count"), ("how many tickets are left", "count"),
+                       ("Wie lange dauert die Führung?", "duration"), ("Bis wann muss man buchen?", "deadline"), ("Wie hoch ist die Gebühr?", "value")):
+            self.assertEqual(rag.value_dim(q), dim, q)
+
+    def test_value_of_the_dimension(self) -> None:
+        hv = rag.has_value
+        self.assertTrue(hv("frequency", "Die Becken werden alle 3 Monate gereinigt."))
+        self.assertTrue(hv("frequency", "Gefüttert wird zweimal täglich."))
+        self.assertFalse(hv("frequency", "Die Reinigung dauert 3 Stunden."))  # a duration is no frequency
+        self.assertTrue(hv("frequency", "Gerät: Kaffeemaschine | Wartungsintervall: 6 Monate"))  # duration labelled as interval
+        self.assertTrue(hv("deadline", "Die Rückmeldung erfolgt 3 Werktage nach Eingang."))  # working days
+        self.assertTrue(hv("duration", "Die Führung dauert zwei Stunden."))
+        self.assertFalse(hv("duration", "Tabelle [§4.2 Führung]: Ort: Halle | Leitung: Kasse"))  # section number is no value
+        self.assertTrue(hv("deadline", "Buchungen sind spätestens am Vortag möglich."))
+        self.assertTrue(hv("deadline", "Buchungen sind bis 15.03. möglich."))
+        self.assertTrue(hv("count", "Es dürfen zwölf Gäste hinein."))
+        self.assertFalse(hv("count", "Die Führung beginnt am Eingang."))
+
+    def test_value_sentence_of_the_window_is_kept(self) -> None:
+        # "Dampf" is in the section title, so related_spans would drop the value sentence as adding no key term
+        fresh_db([("Reptilienhaus.md", "§2 Dampf", "L2", "Mit Dampf geschieht das alle 3 Monate. Der Brutkasten wird vom Pflegeteam gereinigt.")])
+        with stub_llm("JA"):
+            res = rag.run_query(token("L2"), "Wie oft wird der Brutkasten mit Dampf gereinigt?")
+        self.assertEqual(res["result"]["kind"], "answer")
+        self.assertIn("alle 3 Monate", res["answer"])
+        self.assertEqual(res["result"]["trace"]["parts"][0]["features"]["valueSpan"], "added")
+
+    def test_window_without_value_of_the_dimension_is_a_search_hit(self) -> None:
+        fresh_db([("Reptilienhaus.md", "§2 Pflege", "L2", "Der Brutkasten wird von 2 Pflegern gereinigt.")])  # a count, not a frequency
+        with stub_llm("JA"):
+            res = rag.run_query(token("L2"), "Wie oft wird der Brutkasten gereinigt?")
+        self.assertEqual(res["result"]["kind"], "search")
+        self.assertIn("frequency", res["result"]["trace"]["parts"][0]["reason"])
+
+    def test_phrasing_without_the_value_falls_back_to_verbatim(self) -> None:
+        fresh_db([("Reptilienhaus.md", "§2 Pflege", "L2", "Der Brutkasten wird alle 3 Monate vom Pflegeteam gereinigt.")])
+        def chat(system: str, user: str, **_: object) -> str | None:
+            return "JA" if system == rag.JUDGE_SYSTEM else "Der Brutkasten wird vom Pflegeteam gereinigt. [S1]"
+        with mock.patch.object(rag.OLLAMA, "llm_model", return_value="stub"), mock.patch.object(rag.OLLAMA, "chat", side_effect=chat):
+            res = rag.run_query(token("L2"), "Wie oft wird der Brutkasten gereinigt?")
+        self.assertEqual(res["result"]["kind"], "answer")
+        self.assertIn("alle 3 Monate", res["answer"])
+        self.assertTrue(res["result"]["trace"]["answerBy"].startswith("verbatim"))
+
+
 class AnswerGate(unittest.TestCase):
     """Step-5 gate: lexical floor (GATE_COVERAGE / GATE_MISSING) + LLM answerability judge; without LLM only search hits."""
     DOCS = [
