@@ -6,7 +6,7 @@ from typing import Any
 
 from .gate import ANAPHOR, Part
 from .verify import Sentence, verify_sentence
-from ..config import LLM_TIMEOUT
+from ..config import ANSWER_PHRASING, LLM_TIMEOUT
 from ..llm import OLLAMA
 from ..search.lexical import coverage
 from ..search.normalize import TABLE_LABEL, Vocab, analyze, split_sentences
@@ -64,6 +64,8 @@ def compose_sentences(q: str, spans: list[tuple[str, str]], vocab: Vocab, use_ll
     verbatim = [Sentence(display_span(t), [sid], "verbatim") for sid, t in spans]
     if not use_llm or not spans:
         return verbatim, "verbatim"
+    if not ANSWER_PHRASING:  # measurement variant: the answer is the verbatim evidence spans
+        return verbatim, "verbatim (Formulierung aus)"
     text_of = dict(spans)
     # the model keeps the 'Spalte: Wert | Spalte: Wert' row form (with '; ' it picked single cells of the wrong column)
     prompt = "Frage: " + q + "\nTextstellen:\n" + "\n".join(f"[S{k + 1}] {TABLE_LABEL.sub('', t)}" for k, (_, t) in enumerate(spans)) + "\nAntwort:"

@@ -16,7 +16,11 @@ IS_PRODUCTION = os.getenv("NODE_ENV") == "production" or os.getenv("POCKET_CISO_
 DEMO_MODE = not IS_PRODUCTION and (os.getenv("POCKET_CISO_DEMO") == "1" or os.getenv("POCKET_CISO_DEMO_MODE") == "1")
 
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/")
-LLM_MODEL = os.getenv("LLM_MODEL", "qwen2.5:7b")
+LLM_MODEL = os.getenv("LLM_MODEL", "qwen2.5:7b")  # answer phrasing
+# answerability judge and staging conflict pairs; may be a larger model than the phrasing one, falls back to LLM_MODEL
+JUDGE_MODEL = os.getenv("JUDGE_MODEL") or LLM_MODEL
+# measurement variant only: ANSWER_PHRASING=0 answers with the verbatim evidence spans instead of LLM phrasing
+ANSWER_PHRASING = os.getenv("ANSWER_PHRASING", "1") != "0"
 EMBED_MODEL = os.getenv("EMBED_MODEL", "bge-m3")
 LLM_TIMEOUT = float(os.getenv("LLM_TIMEOUT", "14"))
 # chat context and residency: judge/phrasing prompts are < 2k tokens, so 4096 is enough and keeps a 14B model at ~10 GB

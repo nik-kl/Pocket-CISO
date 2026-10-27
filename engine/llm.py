@@ -11,7 +11,7 @@ from collections import Counter
 from typing import Any
 
 from .config import (
-    EMBED_MODEL, EMBED_TIMEOUT, EMBED_TOTAL_BUDGET, HASH_ID, LLM_KEEP_ALIVE, LLM_MODEL, LLM_NUM_CTX, LLM_TIMEOUT,
+    EMBED_MODEL, EMBED_TIMEOUT, EMBED_TOTAL_BUDGET, HASH_ID, JUDGE_MODEL, LLM_KEEP_ALIVE, LLM_MODEL, LLM_NUM_CTX, LLM_TIMEOUT,
     OLLAMA_BASE_URL,
 )
 from .search.normalize import content_stems
@@ -56,6 +56,12 @@ class OllamaClient:
             return None
         return self._match(names, LLM_MODEL) or next((n for n in names if not any(k in n.lower() for k in ("embed", "bge"))), None)
 
+    def judge_model(self) -> str | None:
+        names = self.tags()
+        if not names:
+            return None
+        return self._match(names, JUDGE_MODEL) or self.llm_model()
+
     def embed_model(self) -> str | None:
         names = self.tags()
         if not names:
@@ -90,8 +96,10 @@ class OllamaClient:
             self.mark_down()
             return None
 
-    def chat(self, system: str, user: str, *, json_mode: bool = False, timeout: float = LLM_TIMEOUT, max_tokens: int = 256) -> str | None:
-        model = self.llm_model()
+    def chat(self, system: str, user: str, *, json_mode: bool = False, timeout: float = LLM_TIMEOUT, max_tokens: int = 256,
+             judge: bool = False) -> str | None:
+        """judge=True: answerability/conflict decisions on JUDGE_MODEL; otherwise phrasing on LLM_MODEL."""
+        model = self.judge_model() if judge else self.llm_model()
         if not model:
             return None
         payload: dict[str, Any] = {
@@ -165,5 +173,6 @@ def engine_label(engine_id: str | None = None) -> str:
     eid = engine_id or EMBEDDER.engine_id()
     emb = eid.split(":", 1)[1] if eid.startswith("ollama:") else "Hash-Ngram"
     if llm:
-        return f"Ollama {llm} + {emb}"
+        judge = OLLAMA.judge_model()
+        return f"Ollama {llm}" + (f" (Judge {judge})" if judge and judge != llm else "") + f" + {emb}"
     return f"Rule-based + {emb}" + (" (Ollama offline)" if OLLAMA.tags() is None else "")

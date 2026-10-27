@@ -88,7 +88,7 @@ def check_conflict(a: dict[str, str], b: dict[str, str]) -> tuple[dict[str, Any]
             'Antworte als JSON: {"has_conflict": true|false, "severity": "High"|"Medium", '
             '"explanation": "kurze Begründung auf Deutsch", "conflicting_quote": "wörtliches Zitat aus Regel B"}'
         )
-        out = _json_from(OLLAMA.chat(CONFLICT_SYSTEM, prompt, json_mode=True, timeout=CONFLICT_LLM_TIMEOUT, max_tokens=220))
+        out = _json_from(OLLAMA.chat(CONFLICT_SYSTEM, prompt, json_mode=True, timeout=CONFLICT_LLM_TIMEOUT, max_tokens=220, judge=True))
         if isinstance(out, dict) and isinstance(out.get("has_conflict"), bool):
             quote = str(out.get("conflicting_quote") or "").strip()
             if len(quote) < 15 or quote not in b["text"]:  # guard against hallucinated quotes
