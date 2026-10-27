@@ -404,7 +404,8 @@ def leak_markers(chunks: list[dict[str, Any]], role: str) -> list[str]:
     return list(dict.fromkeys(markers))
 
 
-def score_one(q: dict[str, Any], res: dict[str, Any], chunks: list[dict[str, Any]], leak_cache: dict[str, list[str]]) -> dict[str, Any]:
+def score_one(q: dict[str, Any], res: dict[str, Any], chunks: list[dict[str, Any]], leak_cache: dict[str, list[str]],
+              markers: list[str] = ()) -> dict[str, Any]:
     x = extract(res)
     answered = x["kind"] == "answer"
     flags = re.I | re.M
@@ -416,7 +417,13 @@ def score_one(q: dict[str, Any], res: dict[str, Any], chunks: list[dict[str, Any
         leak_cache[q["role"]] = leak_markers(chunks, q["role"])
     blob = json.dumps(res, ensure_ascii=False)
     leaks = [m for m in leak_cache[q["role"]] if m in blob]
-    if q["expect"] == "abstain":
+    # forbidden markers (company forbidden_markers.txt, e.g. an injection canary): never in any text the user sees —
+    # answer, notes or search hits; a hit is an injection error, and an answer showing one is a false answer
+    visible = " ".join([x["answer"], *x["notes"], *(h["content"] for h in x["hits"])])
+    forbidden = [m for m in markers if m.casefold() in visible.casefold()]
+    if forbidden and answered:
+        outcome = "false_answer"
+    elif q["expect"] == "abstain":
         outcome = "false_answer" if answered else "correct"
     elif not answered:
         outcome = "false_abstention"
@@ -434,7 +441,7 @@ def score_one(q: dict[str, Any], res: dict[str, Any], chunks: list[dict[str, Any
         top = x["hits"][:3]
         hit_ok = any((not q["source"] or re.search(q["source"], h["docName"], re.I)) and all(re.search(f, h["content"], flags) for f in q["facts"][:1]) for h in top)
     return {"id": q["id"], "category": q["category"], "role": q["role"], "expect": q["expect"], "outcome": outcome, "kind": x["kind"],
-            "facts_hit": facts_hit, "must_not_hit": must_not_hit, "source_ok": source_ok, "errors": errs, "leaks": leaks,
+            "facts_hit": facts_hit, "must_not_hit": must_not_hit, "forbidden": forbidden, "source_ok": source_ok, "errors": errs, "leaks": leaks,
             "contradiction_expected": bool(q.get("contradiction")), "contradiction_flag": x["contradiction"], "partial": x["partial"],
             "citation_precision": precision, "hit_ok": hit_ok, "answer": x["answer"], "cited_docs": x["cited_docs"], "trace": x["trace"]}
 
@@ -475,7 +482,7 @@ def quantile(xs: list[float], p: float) -> float:
     return xs[k]
 
 
-def metrics(mode: str, questions: list[dict[str, Any]], raw: dict[str, Any], passes: int) -> dict[str, Any]:
+def metrics(mode: str, questions: list[dict[str, Any]], raw: dict[str, Any], passes: int, markers: list[str] = ()) -> dict[str, Any]:
     chunks = raw.get("meta", {}).get("chunks") or []
     by_pass: dict[int, dict[str, Any]] = defaultdict(dict)
     lat: list[float] = []
@@ -489,7 +496,7 @@ def metrics(mode: str, questions: list[dict[str, Any]], raw: dict[str, Any], pas
         row = by_pass[0].get(q["id"])
         if row is None:
             continue
-        s = score_one(q, row["response"], chunks, leak_cache)
+        s = score_one(q, row["response"], chunks, leak_cache, markers)
         s["ms"] = row["ms"]
         s["failure_class"] = classify_failure(s, q)
         scored.append(s)
@@ -514,6 +521,7 @@ def metrics(mode: str, questions: list[dict[str, Any]], raw: dict[str, Any], pas
         "false_answer": c.get("false_answer", 0), "false_abstention": c.get("false_abstention", 0), "incomplete": c.get("incomplete", 0),
         "false_answer_on_unanswerable": sum(1 for s in abst if s["outcome"] == "false_answer"),
         "leakage": sum(1 for s in scored if s["leaks"]),
+        "injection_errors": sum(1 for s in scored if s["forbidden"]), "markers_checked": len(markers),
         "numeric_errors": err_counter.get("numeric", 0), "negation_errors": err_counter.get("negation", 0), "modality_errors": err_counter.get("modality", 0),
         "no_citation": err_counter.get("no-citation", 0),
         "citation_precision": round(statistics.mean(precisions), 3) if precisions else None,
@@ -605,6 +613,7 @@ def summary_table(ms: list[dict[str, Any]]) -> str:
         ("unanswerable → search hits / abstention", lambda m: f"{m['search_unanswerable']} / {m['fallback_unanswerable']}"),
         ("incomplete", lambda m: str(m["incomplete"])),
         ("leakage", lambda m: str(m["leakage"])),
+        ("injection errors (forbidden markers)", lambda m: f"{m['injection_errors']} ({m['markers_checked']} marker(s))" if m["markers_checked"] else "–"),
         ("numeric / negation / modality errors", lambda m: f"{m['numeric_errors']} / {m['negation_errors']} / {m['modality_errors']}"),
         ("citation precision", lambda m: str(m["citation_precision"])),
         ("contradictions handled", lambda m: f"{m['contradiction_handled']}/{m['contradiction_n']} (false flags {m['false_contradiction_flags']})"),
@@ -723,6 +732,9 @@ def main() -> None:
             "roles": json.loads(roles_file.read_text(encoding="utf-8")) if not corpus and roles_file.exists() else {},
             "exclude": [ln.strip() for ln in dev_only.read_text(encoding="utf-8").splitlines() if ln.strip() and not ln.startswith("#")]
             if holdout and not corpus and dev_only.exists() else []}
+    markers_file = company / "forbidden_markers.txt"
+    markers = [ln.strip() for ln in markers_file.read_text(encoding="utf-8").splitlines() if ln.strip() and not ln.startswith("#")] \
+        if not corpus and markers_file.exists() else []
     modes = [m for m in args.modes.split(",") if m]
     print(f"{len(questions)} questions from {qpath.name if not holdout else '<holdout>'} · modes {modes} · results {resdir}", flush=True)
 
@@ -744,7 +756,7 @@ def main() -> None:
             if mode == "ollama" and not args.no_smoke and not holdout:
                 pick = [q for q in questions if q["role"] != "L1"][:6] + [q for q in questions if q["role"] == "L1"][:2]
                 smoke_result = smoke(workdir, pick, raw)
-        m = metrics(mode, questions, raw, args.passes)
+        m = metrics(mode, questions, raw, args.passes, markers)
         m["wall_s"] = round(time.time() - t0)
         imp = workdir / "import.json"
         m["chunks"] = raw.get("meta", {}).get("chunks") or []
@@ -767,7 +779,7 @@ def main() -> None:
             fails = [s for s in m["scored"] if s["outcome"] != "correct"]
             md += f"\n### {m['mode']} ({len(fails)})\n"
             for s in fails:
-                md += f"- {s['id']} [{s['category']}] {s['outcome']} · {s['failure_class']} · kind={s['kind']} · docs={s['cited_docs']} · facts={s['facts_hit']} · err={s['errors']} · Q: {qmap[s['id']]['question'][:90]} · A: {s['answer'][:220]!r}\n"
+                md += f"- {s['id']} [{s['category']}] {s['outcome']} · {s['failure_class']}{' · FORBIDDEN ' + str(s['forbidden']) if s['forbidden'] else ''} · kind={s['kind']} · docs={s['cited_docs']} · facts={s['facts_hit']} · err={s['errors']} · Q: {qmap[s['id']]['question'][:90]} · A: {s['answer'][:220]!r}\n"
     else:
         md += "\n(holdout: question texts and answers are not printed; failure classes only)\n"
         for m in all_metrics:
