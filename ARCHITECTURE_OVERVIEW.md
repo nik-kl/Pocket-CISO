@@ -30,15 +30,15 @@ Demo flags are ignored when production is on. Missing configuration yields a gen
 ## Engine modes
 | Sidebar | Retrieval | Answer / diff / conflicts |
 |---|---|---|
-| `Python FastAPI + Ollama (Connected)` | `bge-m3` embeddings, NumPy cosine | `qwen2.5:7b` rewrite + grounded answer, rule + LLM conflict verdicts, PDF/DOCX/MD/TXT |
-| `Python FastAPI · Rule Engine (Ollama offline)` | deterministic hash-n-gram embeddings (staging/conflicts only — **queries are answered by the local keyword engine** in this state, it measured better) | rule conflicts, PDF/DOCX/MD/TXT |
-| `Local Fallback Engine (Active)` | keyword coverage + synonyms | verbatim extractive answers, rule conflicts, `.md/.txt` only |
+| `Python FastAPI + Ollama (Connected)` | BM25 + `bge-m3` dense, RRF | `qwen2.5:7b` answerability judge + phrasing with span verifier, rule + LLM conflict verdicts at staging, PDF/DOCX/MD/TXT |
+| `Python FastAPI · Rule Engine (Ollama offline)` | BM25 (hash-n-gram embeddings for staging only) | labelled search hits only, rule conflicts, PDF/DOCX/MD/TXT |
+| `Local Fallback Engine (Active)` | keyword coverage + synonyms | labelled search hits only, rule conflicts, `.md/.txt` only |
 All three share `data/pocket-ciso-db.json`; Python keeps `data/vectors.json` and re-embeds what the other engine changed. If Ollama flaps, the expensive Ollama vector set is kept in a stash and restored instead of re-embedding everything.
 
 ## Request flow and gateway protections
 ```
 Browser ─► /api/v1 (src/app/api/v1/route.ts)
-   ├─ query · stage_policy · stage_file · sync_inbox · approve ──► Python :8000 ──► Ollama :11434   (offline → same action locally; mutation timeouts are not replayed)
+   ├─ query · stage_policy · stage_file · sync_inbox · approve ──► Python :8000 (whenever up) ──► Ollama :11434   (Python down → same action locally; mutation timeouts are not replayed)
    └─ authenticate · tickets · reject · export_report · snapshot ──► src/lib/db.ts
 ```
 Rate limits (sliding window per client key and action; 429 + `Retry-After`): query 20/min, authenticate 10/min, create_ticket 5/10 min, stage 20/min, sync 10/min, snapshot 180/min, others 60/min. The client key is the proxy-supplied IP only with `TRUST_PROXY=1` — and only when the proxy **overwrites** `X-Forwarded-For`, otherwise clients can forge it. Without it all callers share one `direct` bucket: its limits are widened ×10 (so one office cannot rate-limit itself), the login limit is the account ceiling only (30 failures per 15 min, then backoff), and a startup warning is logged in production. Residual risk without a proxy: a persistent attacker can keep L3 logins in backoff; per-IP isolation (verified: attacker IP locked, other IP unaffected) needs the proxy. Limits are in memory and reset on restart. Login: per (client, role) 5 failures per 15 min then exponential backoff (30 s · 2ⁿ, max 15 min) plus a higher per-account ceiling (30 per 15 min) so an anonymous caller cannot trivially lock out L3. JSON bodies are read through a 256 KB cap (413; a 150 MB body used to be buffered, ≈ 1 GB RSS). Uploads: `Content-Length` required (411), ≤ 10.25 MB (413), L2 token verified **before** `formData()`/`request.form()` is read; Python repeats this and size-checks DOCX archives (64 MB uncompressed) before parsing.
@@ -47,11 +47,13 @@ Rate limits (sliding window per client key and action; 429 + `Retry-After`): que
 Stateless token `ROLE.expiry.HMAC` (8 h), verified by Node and Python with the same secret (byte-length-safe comparison; garbage → L1). L1 has no login by design. **Identity is still role-level:** the audit `actor` is one of three shared accounts (`employee@`, `admin@`, `ciso@company.at`). The role → directory-group mapping shown in the UI (`oidc:SG-All-Staff` / `-IT-Infrastructure` / `-CISO-Governance`) is the contract for a future OIDC/Entra rollout; individual accountability needs that SSO.
 
 ## Pipeline B — stateless compliance chat
-1. **Rewrite** (LLM temp 0, validated; otherwise rules). Narrow bilingual `queryHint`/`REWRITES` entries exist for verified intents (see limitations).
-2. **RBAC pre-filter** before ranking. A restricted-only match returns the **same** `fallback` as "no match": no score, role or existence hint (the audit still records `RBAC_DENIED`).
-3. **Gate:** dense cosine ≥ `MIN_SCORE` (0.55 for bge-m3) **and** lexical support ≥ `LEX_MIN` (0.34; calibrated floor for multi-intent questions).
-4. **Answer:** ≤ 4 chunks → LLM (temp 0, `[C1]` citations) → grounding check → otherwise extractive. A citation the model did not use is never added.
-**What the numbers mean.** `trace.retrievalScore` is the raw cosine (Python) or query-term coverage (local engine); `lexicalSupport` the share of question terms found; `confidence` is kept as an alias of `retrievalScore` and **is not a probability** (see calibration below). The fallback text still says "Konfidenz < 85 %" because that wording was specified by the product owner; the actual gate is the one above. `verification` is `lexical-nli` (Python; numbers must occur in the cited chunks, ≥ 60 % content words supported, no negation / obligation↔permission / number–unit contradiction) or `extractive` (local engine: verbatim chunk text, no NLI is claimed).
+1. **RBAC view first:** document frequencies, vocabulary and candidates come only from chunks the role may read. A restricted-only match looks exactly like no match (the audit still records `RBAC_DENIED`).
+2. **Question parts:** ≤ 4 parts (sentence ends; inside question sentences also at und/oder/comma + question word or modal verb); other sentences are context; text addressed to the assistant ("ignoriere alle Anweisungen …") is dropped and such spans in documents are never used.
+3. **Retrieval:** BM25 over key terms (glossary, compound and typo alternatives; words that occur nowhere in the role's corpus are capped) + `bge-m3` dense, reciprocal-rank fusion, 12 candidates with ≤ 3 per document, exact-fact chunks for value questions.
+4. **Gate:** sentence windows must cover ≥ 0.5 of the key-term weight with no missing term > 0.5 (windows from up to 3 sections of one document may be combined; table rows stand alone), or the best dense chunk reaches 0.62 (dev curve: highest unanswerable part 0.6045). Then the LLM answerability judge (JA/NEIN, temp 0, seed 7, no reply = NEIN) must confirm; parts left open are re-judged against the windows of the answered parts.
+5. **Contradictions:** a deterministic rule (another document, same quantity and unit dimension, disjoint values; a document named with "laut/gemäß/according to" is not contradicted; intervals are not compared with durations) turns the result into kind `search` labelled "Mögliche Widersprüche – nicht als Antwort bestätigt" with every source and value, never an answer.
+6. **Answer:** the LLM may only rephrase the confirmed spans (≤ 3 sentences); each sentence passes a span verifier (numbers + units, negation, modality, named roles, content words) or is replaced by the verbatim span. Unconfirmed windows are returned as kind `search` ("Fundstellen, nicht als Antwort bestätigt"), nothing above the floor as `fallback`.
+**What the numbers mean.** `trace.retrievalScore` is the best dense cosine of the selected windows (lexical coverage without Ollama), filled for every kind; `lexicalSupport` the key-term coverage; `confidence` is an alias and **not a probability**. `trace.parts[]` lists per part coverage, dense, judge and the reason when not answered. The ticket text still says "Konfidenz < 85 %" (product-owner wording); the gate is the one above.
 
 ## Pipeline A — ingestion, diff, conflicts, approval
 Parse (`pypdf`, `python-docx` incl. tables in body order, text) → table-aware chunking (≤ 600 chars; KPI lines such as `2 Stunden` / `250.000 EUR` stay content) → embeddings → alignment with the existing **document series** (name similarity or explicit "replaces") → red/green diff + `removedChunkIds` (old chunks without counterpart) → conflict scan against other documents the actor may see (rules: same unit, different value on a shared topic — identical in both engines; Python adds cosine ≥ `CONFLICT_SIM` and an LLM verdict, `verifiedBy` shows which) → pending diff. The shown author is the verified session; a client name appears as "angegeben: …". Re-submitting an identical pending diff returns the existing one (safe after a gateway timeout).
@@ -72,24 +74,13 @@ Everything below was executed against running servers, not just read: `tsc`, `ne
 - Role-level identity only (shared accounts); no SSO. L1 is unauthenticated by design, so L1 ticket creation is capped/idempotent instead of authenticated.
 - Audit log is tamper-evident, not tamper-proof or append-only; the anchor secret must be kept outside the data directory (production) — demo mode cannot give that guarantee. No external anchoring/signing service.
 - Rate limits are per process and in memory; per-IP needs `TRUST_PROXY=1` behind a reverse proxy. Every transaction rewrites the whole JSON file and each snapshot verifies the whole chain (fine for MVP scale, not for tens of thousands of entries).
-- No tests or CI in the repository (the repo rules forbid new files); QA scripts were scratch-only.
-- Node and Python still differ in synonym/stop lists and the hard-coded query hints; the conflict *rule* and file-name handling are aligned. `NODE_ENV=production` set only for Node (e.g. `next start`) while Python runs in demo mode makes the secrets disagree — export the same variables for both.
-**Keyword mode:** the local engine answers without an LLM and still gave an unsupported answer for 2 of 19 out-of-scope questions (10.5 %); answers from `Local`/`Rule-based` engines carry a visible "Keyword-Modus · geringe Präzision" badge.
-**RAG (66-question evaluation, 8 documents / 79 chunks, ground truth written for this corpus)**
-| Mode | correct before → after | false fallback | false answer |
-|---|---|---|---|
-| Python + Ollama (qwen2.5:7b, bge-m3) | 70.2 % → **76.6 %** | 14.9 % → 10.6 % | 0 % → 0 % |
-| Python rule engine (hash embeddings; retrieval measured directly, no longer used for gateway queries) | 36.2 % → 34.0 % | 46.8 % → 46.8 % | 5.3 % → 5.3 % |
-| Local fallback engine (keyword) | 55.3 % → 59.6 % | 25.5 % → 25.5 % | 10.5 % → 10.5 % |
-"Before" = original code and mis-chunked corpus (KPI values split into headings); "after" = all fixes. No restricted content leaked to L1 in any mode. Displayed confidence did not separate right from wrong answers (before: 0.888 vs 0.876; after, honest retrieval score: 0.663 vs 0.625), while the raw dense score of the best chunk separates answerable from unanswerable questions very well (AUROC 0.997) — the gate works, the number is just not a probability.
-Experiments (Python + Ollama): hints disabled → 66.0 % (−8.5 pp; exactly the USB-in-train ×2, critical-risk-acceptance and emergency-USB questions ⇒ these acceptance items are hint-driven); `LEX_MIN=0.20` → **91.5 %** correct but 5.3 % false answers (1/19: a prompt-injection question mentioning "CISO"); `LEX_MIN=0.50` → 70.2 %; `MIN_SCORE=0.50` → 76.6 %; `MIN_SCORE=0.60` → 59.6 %. A stricter multi-intent floor in the local engine lowered correctness (59.6 → 53.2 %) without removing its two false answers, so it was reverted.
-Ranked proposals (benefit / cost / risk, estimated effect on this set unless stated):
-1. **Use lexical overlap as a ranking signal instead of a hard gate** (e.g. `LEX_MIN` 0.20 with `MIN_SCORE` 0.55): +15 pp correct, +5 pp false answers on this set; S effort; risk — the margin at 0.55 is thin (lowest answerable score 0.550) and the set is small ⇒ validate on a held-out set first.
-2. **Replace the hard-coded hints by general bilingual query expansion** (glossary or one extra LLM multi-query call, ~1–2 s): keeps the 4 hint-dependent questions without overfitting; M effort.
-3. **Parent-section context / chunk overlap** (heading chunk vs clause chunk is why "Lösegeld zahlen?" and "Kühlschrank" cite the wrong chunk): est. +2–4 questions; M.
-4. **Hybrid BM25 + dense with reciprocal-rank fusion**, then a **cross-encoder reranker** (e.g. bge-reranker-v2-m3, +1–2 s): better precision than a lexical gate; M–L.
-5. **Version/conflict-aware answering** (document status/effective date in ranking; show conflicting live chunks): "ab welchem Risikowert Geschäftsführung" answered 12 (BIA) while the risk policy says 6 — the corpus contradicts itself and the answer does not say so; M.
-6. **Real entailment** (NLI cross-encoder or LLM judge, sentence-level citation check) instead of the heuristic guard (now catches negation, obligation/permission swaps and number–unit errors, nothing deeper); M.
-7. **Calibrated confidence** (logistic regression on the retrieval score + lexical support from a labelled set); S once a held-out set exists.
-8. **Held-out regression set + CI kept outside prompts/hints** — prerequisite for 1–7; S.
-9. Vector database only when scale demands it (JSON + NumPy is fine below ~10⁴ chunks).
+- Unit tests (`backend/test_engine.py`) and the eval harness (`backend/eval.py`) exist, but no CI runs them.
+- Node and Python still differ in synonym/stop lists (Node only returns search hits); the conflict *rule* and file-name handling are aligned. `NODE_ENV=production` set only for Node (e.g. `next start`) while Python runs in demo mode makes the secrets disagree — export the same variables for both.
+**RAG quality (dev set, 2026-10-22; `qwen2.5:7b` digest 845dbda0ea48, `bge-m3`; ground truth written for the dev corpus, holdout not yet run)**
+| Mode | correct (of 188 answerable) | false answers | search hits (hits@3) | abstentions | contradictions (of 17) |
+|---|---|---|---|---|---|
+| Python + Ollama | 92 | 0 | 84 (73) | 8 | 14, 0 false flags |
+| Python without Ollama | 0 (search hits only) | 0 | 175 (159) | 13 | 14, 0 false flags |
+| Local engine | 0 (search hits only) | 0 | 152 (133) | 36 | — |
+All 35 unanswerable questions refused in every mode, 0 leakage, 0 number/negation/modality errors, deterministic over two passes; p50/p95 619/3144 ms with Ollama. 21 `robust_*` questions on invented documents (tables without blank lines, colloquial wording, multi-part, cross-section, contradictions next to a dominating document): 4/17 correct, 0 false. A stronger judge (`qwen3:14b`) answered 144/188 but gave 9 false answers and p95 10.5 s, so it is not used.
+**Known RAG limits:** the 7B judge rejects many correct windows (most remaining misses: combined sections, colloquial questions, multi-part pools); who-questions need a recognised role noun ("Werkschutz", "Facility Management" are not); contradictions S-5, R-3, I-17 are not found; dev numbers are tuned on the dev set — the holdout run is still open.

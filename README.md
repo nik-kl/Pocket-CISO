@@ -110,9 +110,9 @@ In demo mode (`POCKET_CISO_DEMO=1`) a local `data/.auth-secret` is generated wit
 
 1. Select an RBAC role in the sidebar.
 2. Ask a question in **Ask Pocket CISO**.
-3. Review the rewrite, RBAC filter, retrieval score, lexical support, verification mode (grounding check or verbatim extract), engine mode, and latency in **Under the Hood**. The retrieval score is a raw similarity, not a probability.
+3. Review the question parts, RBAC filter, retrieval score, lexical support, verification (span verifier, or "nicht verifiziert" for search hits), engine mode, and latency in **Under the Hood**. The retrieval score is a raw similarity, not a probability.
 4. Open a citation to inspect the exact source chunk, SHA-256, approval metadata, and similarity.
-5. Unsupported questions trigger the hallucination-protection fallback and offer a CISO-office ticket.
+5. Results are one of three kinds: a verified **answer**, labelled **search hits** (sources found but not confirmed as an answer, including "Mögliche Widersprüche" between documents), or a **fallback** ("Keine belegbare Antwort im freigegebenen Bestand.") with a CISO-office ticket.
 
 ### Stage and approve a policy update
 
@@ -154,9 +154,9 @@ Browser
   ▼
 Next.js /api/v1 gateway
   ├── Python FastAPI :8000 ── Ollama :11434
-  │     └── Qwen 2.5 7B + BGE-M3, NumPy vectors, document parsing
+  │     └── BM25 + BGE-M3 (RRF), Qwen 2.5 7B judge + verified phrasing, document parsing
   └── TypeScript fallback engine
-        └── keyword retrieval, local staging, audit and ticket workflows
+        └── keyword search hits, local staging, audit and ticket workflows
 
 Both engines
   ├── data/pocket-ciso-db.json
@@ -164,7 +164,7 @@ Both engines
   └── Python: data/vectors.json
 ```
 
-The gateway routes query and policy mutations to Python first. Query requests may fall back when Python is unavailable; mutation timeouts are returned rather than replayed locally to avoid double application. Authentication, ticket resolution, audit export, and demo reset remain local gateway actions.
+The gateway routes query and policy mutations to Python whenever it is up (without Ollama, Python returns search hits only). Queries fall back to the local engine (search hits only) when Python is unavailable; mutation timeouts are returned rather than replayed locally to avoid double application. Authentication, ticket resolution, audit export, and demo reset remain local gateway actions.
 
 ## Backend endpoints
 
@@ -208,11 +208,13 @@ See [AGENT_INDEX.md](./AGENT_INDEX.md) for the file-to-symbol lookup and [ARCHIT
 Run the mandated static checks:
 
 ```bash
-rm -f tsconfig.tsbuildinfo && npx tsc --noEmit
-backend/.venv/bin/python -m py_compile backend/main.py backend/rag_engine.py
+rm -f tsconfig.tsbuildinfo && npx tsc --noEmit && npm run build
+backend/.venv/bin/python -m py_compile backend/*.py
+backend/.venv/bin/python -m unittest backend/test_engine.py          # 73 tests, no Ollama needed
+backend/.venv/bin/python backend/eval.py --label X --modes ollama,noollama,node   # dev eval → /tmp/pocket-ciso-rag/results/X
 ```
 
-These are the static checks. Behavioural checks (RBAC matrix, dynamic proof, inbox scenarios, hostile uploads, concurrency) were run against live servers during the QA pass; see *Verification performed* in `ARCHITECTURE_OVERVIEW.md`.
+Model switch only via `LLM_MODEL` (default `qwen2.5:7b`); `LLM_NUM_CTX` (4096) and `LLM_KEEP_ALIVE` (30m) tune Ollama. Latest dev numbers (0 false answers, 92/188 correct with Ollama) are in `ARCHITECTURE_OVERVIEW.md`. Behavioural checks (RBAC matrix, dynamic proof, inbox scenarios, hostile uploads, concurrency) were run against live servers during the QA pass; see *Verification performed* in `ARCHITECTURE_OVERVIEW.md`.
 
 ## Current limitations and roadmap
 
@@ -221,6 +223,6 @@ This is a local MVP, not a production certification platform. See [ARCHITECTURE_
 - role-level identity only (shared accounts) — OIDC/Entra ID SSO and individual actors are the next step;
 - tamper-evident (hash chain + HMAC anchor), not append-only: PostgreSQL / an external anchor or signing service is needed for stronger guarantees;
 - in-memory, per-process rate limits (per-IP needs a reverse proxy with `TRUST_PROXY=1`);
-- retrieval quality: hard-coded bilingual query hints, a strict lexical gate (see the ranked proposals), contradictions between documents are not surfaced in answers, and the grounding check is heuristic (polarity, modality, number/unit), not a real entailment model;
-- no automated test suite or CI in the repository yet;
+- retrieval quality: the 7B answerability judge is strict (about half of the answerable dev questions end as search hits, not answers), the sentence verifier is heuristic (numbers/units, polarity, modality, roles), and the dev numbers are not yet confirmed on a holdout set;
+- unit tests and an eval harness exist, but no CI;
 - OCR for scanned PDFs, multi-tenant collections, real Jira/ServiceNow connectors.

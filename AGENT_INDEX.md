@@ -28,10 +28,10 @@ First-time setup: `npm install` · `cd backend && python3 -m venv .venv && sourc
 | `PYTHON_BACKEND_URL` | Node | default `http://127.0.0.1:8000` |
 | `TRUST_PROXY=1` | Node | Trust `X-Forwarded-For` for per-client rate limits. **Only behind a reverse proxy that overwrites the header** (otherwise clients can forge it); without it all callers share one `direct` bucket whose limits are ×10 and whose login limit is the account ceiling (30 per 15 min) |
 | `POCKET_CISO_RATE_LIMIT_MULT` | Node | Multiplier for the gateway rate limits (QA/load tests only) |
-| `POCKET_CISO_DISABLE_HINTS=1` | Node, Python | Evaluation switch: disables the hard-coded `queryHint` / `REWRITES` |
-| `OLLAMA_BASE_URL`, `LLM_MODEL` (qwen2.5:7b), `EMBED_MODEL` (bge-m3) | Python | Changing the embedding model rebuilds `data/vectors.json` |
-| `MIN_SCORE` (0.55), `CONFLICT_SIM` (0.68), `ALIGN_SIM` (0.60), `LEX_MIN` (0.34) | Python | Retrieval gate / conflict / alignment thresholds (hash-embedding values differ) |
-| `LLM_TIMEOUT`, `REWRITE_TIMEOUT`, `EMBED_TIMEOUT`, `EMBED_TOTAL_BUDGET` (100 s), `CONFLICT_LLM_TIMEOUT` | Python | Timeouts; staging ≤ 100 s embeddings + ≤ 55 s conflicts < gateway 180 s |
+| `OLLAMA_BASE_URL`, `LLM_MODEL` (qwen2.5:7b), `EMBED_MODEL` (bge-m3) | Python | Judge/phrasing model and embeddings; changing the embedding model rebuilds `data/vectors.json`; `qwen3*` models get `think: false` |
+| `LLM_NUM_CTX` (4096), `LLM_KEEP_ALIVE` (30m) | Python | Chat context size and model residency in Ollama (7B: 4.8 GB) |
+| `CONFLICT_SIM` (0.68), `ALIGN_SIM` (0.60) | Python | Staging conflict / series alignment thresholds (query gate values are constants in `rag_engine.py`, see Pipelines) |
+| `LLM_TIMEOUT` (14 s), `EMBED_TIMEOUT`, `EMBED_TOTAL_BUDGET` (100 s), `CONFLICT_LLM_TIMEOUT` | Python | Timeouts; staging ≤ 100 s embeddings + ≤ 55 s conflicts < gateway 180 s |
 | `AUTO_SYNC=1`, `AUTO_SYNC_SECONDS` (30) | Python | Background inbox scan |
 | `MAX_UPLOAD_MB` (10), `CORS_ORIGINS`, `HOST`, `PORT` | Python | |
 
@@ -41,7 +41,7 @@ Browser ─► /api/v1 (route.ts gateway) ─┬─► Python FastAPI :8000  (qu
                                        └─► src/lib/db.ts (local TS engine, ALWAYS available)
 Both engines read/write the same data/pocket-ciso-db.json (+ data/vectors.json for Python) under a cross-process mkdir lock (data/.db.lock/, owner token, safe steal).
 ```
-- Routing: `stage_policy`, `stage_file`, `sync_inbox`, `approve` → Python first, else local. `query` → Python **only while Ollama is up**; Python without Ollama (hash-embedding retrieval) measured worse than the local keyword engine, so queries are then answered locally (the UI marks `Local`/`Rule-based` answers with "Keyword-Modus · geringe Präzision"). Timeout/5xx on **mutations are not replayed locally** (504/502); re-submitting a pending identical diff is idempotent. Everything else (`authenticate`, `logout`, `create_ticket`, `create_sync_ticket`, `resolve_ticket`, `reject`, `reset_demo`, `export_report`, snapshot) is always local.
+- Routing: `stage_policy`, `stage_file`, `sync_inbox`, `approve`, `query` → Python whenever it is up, else local. Without Ollama, Python answers queries with labelled search hits only (BM25, no LLM); the local engine (Python down) also returns search hits only, never composed answers. Timeout/5xx on **mutations are not replayed locally** (504/502); re-submitting a pending identical diff is idempotent. Everything else (`authenticate`, `logout`, `create_ticket`, `create_sync_ticket`, `resolve_ticket`, `reject`, `reset_demo`, `export_report`, snapshot) is always local.
 - Gateway protections (`route.ts`): per-client/per-action sliding-window rate limits (query 20/min, authenticate 10/min, create_ticket 5/10 min, stage 20/min, sync 10/min, snapshot 180/min, other 60/min → 429 + `Retry-After`); multipart needs `Content-Length` (411) ≤ 10.25 MB (413) and an L2 token **before** `formData()` is read; JSON bodies are read with a hard 256 KB cap (413, also without/with a wrong `Content-Length`); non-object JSON bodies → 400; config errors → generic 503 (env names only in the server log); held DB lock → 503 `DB_LOCKED`.
 - Python re-checks size/auth before parsing (`main.py /stage-file`: 411/413, `check_role` L2, then `request.form()`); DOCX is size-checked as ZIP (64 MB uncompressed) before parsing.
 - Backend status: `GET /api/v1` → `backend` (cached 4 s; `POST health` ≥ 1 s). Sidebar `data-testid="backend-status"` (`data-mode=python|fallback`): `Python FastAPI + Ollama (Connected)` · `Python FastAPI · Rule Engine (Ollama offline)` · `Local Fallback Engine (Active)`.
@@ -64,6 +64,9 @@ Both engines read/write the same data/pocket-ciso-db.json (+ data/vectors.json f
 | `backend/main.py` | FastAPI HTTP layer (size/auth pre-checks, 422 for malformed JSON) |
 | `backend/rag_engine.py` | Ollama client, hash-ngram fallback embeddings, vector store (+ stash), parser/chunker, Pipelines A/B, inbox connector, NLI check, conflict detector, DB lock/audit/token code |
 | `backend/requirements.txt` | fastapi, uvicorn, pydantic, httpx, numpy, pypdf, python-docx, python-multipart |
+| `backend/glossary.json` | Bilingual term groups used for query expansion and the sentence verifier |
+| `backend/test_engine.py` | Unit tests (stdlib only, no Ollama; LLM stubbed; synthetic documents incl. generated PDFs) |
+| `backend/eval.py`, `backend/eval_dev.jsonl` | Eval harness (modes ollama/noollama/node, determinism, gateway smoke) + 244 dev questions (223 dev, 21 `robust_*` on invented dev-only documents built by `robust_docs()`) |
 | `backend/watched_inbox/` | Connector folder (user documents + `BCM_Wiederanlauf_Matrix_2026.md`); connector stages as `minRole L2` |
 | `backend/seed_policies/` | Upload samples (`Passwort_Richtlinie_v4.md`, `NIS2_Incident_Playbook.md`, `KI_Nutzungsrichtlinie_2026.md`) |
 
@@ -71,7 +74,7 @@ Both engines read/write the same data/pocket-ciso-db.json (+ data/vectors.json f
 | Endpoint | Role | Notes |
 |---|---|---|
 | `GET /health` | – | status, models, vector count |
-| `POST /query {question}` | any | Pipeline B, stateless. Returns `result` (kind `answer`\|`fallback`; restricted-only matches are `fallback` too), `trace{retrievalScore, lexicalSupport, verification, confidence (= retrievalScore)}` |
+| `POST /query {question}` | any | Pipeline B, stateless. Returns `result` (kind `answer`\|`search`\|`fallback`; restricted-only matches look like no match), `hits[]` for search, `trace{parts[], retrievalScore, lexicalSupport, contradiction, contradictionValues, sentences, verification}` |
 | `POST /stage-file` (multipart or JSON) | L2 | 411/413/403 before parsing; idempotent for identical pending diffs |
 | `POST /sync-inbox` | L2 | connector → `SyncReport` |
 | `POST /approve/{id} {override?, overrideReason?}` | L3 | see approval semantics |
@@ -94,11 +97,13 @@ Errors: `{ok:false, code, error}`.
 4. Staging records `removedChunkIds` (series chunks not matched by the new version) **for complete document uploads only**; pasted rule text (`stage_policy`) is a partial update and never removes other clauses. The diff view lists every clause that will be removed (red block, `data-testid="removed-clauses"`). Conflicts are computed at staging only — they are **not** re-run at approval (known limitation).
 
 ## Pipelines
-**B (query):** rewrite (LLM, validated, else rules) → RBAC pre-filter (`minRole ≤ role`) → hybrid retrieval gate (dense cosine ≥ `MIN_SCORE` **and** lexical support ≥ `LEX_MIN`/multi-intent floor) → grounded answer (≤ 4 chunks) + lexical NLI (numbers must occur in cited chunks, ≥ 60 % content words); NLI failure ⇒ extractive answer; a citation the model did not use is never added. Restricted-only or no match ⇒ the same `fallback`. Local engine: keyword coverage; answers are verbatim chunk text (`verification: "extractive"`, `nliVerified:false`).
+**B (query):** RBAC view (`minRole ≤ role`) before any scoring → question split into ≤ 4 parts (sentence ends; inside question sentences also at und/oder/comma + question word or modal verb; other sentences = context; instructions to the assistant dropped) → per part BM25 (+ glossary/compound/typo alternatives; words with df = 0 capped) and bge-m3 dense, RRF (k = 60), 12 candidates with ≤ 3 per document, plus exact-fact chunks for value questions → span windows (≤ 3 per part, other sections of one document combined; table rows never) → **gate**: key-term coverage ≥ 0.5 and no missing term > 0.5 of the weight, or best dense chunk ≥ 0.62 when below that floor → **contradiction rule** (another document, same quantity, disjoint values; deterministic) ⇒ kind `search` labelled "Mögliche Widersprüche – nicht als Antwort bestätigt" → else LLM **judge** (JA/NEIN, temp 0, seed 7; no reply = NEIN; unanswered parts are re-judged against the answered parts' windows) → answer: LLM phrasing ≤ 3 sentences, each checked by the **span verifier** (numbers/units, negation, modality, roles, every content word but one from the cited spans), failing sentences replaced by verbatim spans. Not confirmed ⇒ kind `search` ("Fundstellen, nicht als Antwort bestätigt" / without LLM "Fundstellen, keine KI-Antwort"); nothing above the floor ⇒ `fallback` ("Keine belegbare Antwort im freigegebenen Bestand."). Local engine: keyword coverage, search hits only.
 **A (stage):** parse → table-aware chunking (KPI lines such as `2 Stunden` are content, not headings) → embeddings → series alignment → hunks + removed chunks → conflict scan (rules: same unit/different value on shared topic; Python additionally cosine ≥ `CONFLICT_SIM` and optional LLM verdict, both with `verifiedBy`) → pending diff (author = verified session; a client-supplied name is shown as "angegeben: …").
 
-## Acceptance matrices / eval
-`backend/watched_inbox` PDFs + the two 10-question matrices from the product owner. Hint-dependent questions (USB loss in train, emergency USB, US SaaS, Tier-2 RPO, critical-risk acceptance) rely on `queryHint` — disable with `POCKET_CISO_DISABLE_HINTS=1` to measure it (QA run: −4 of 47 answerable questions, i.e. −8.5 pp). See `ARCHITECTURE_OVERVIEW.md` → "Known limitations and RAG proposals".
+## Tests / eval
+- `backend/.venv/bin/python -m unittest backend/test_engine.py` (73 tests, no Ollama needed)
+- `backend/.venv/bin/python backend/eval.py --label X [--modes ollama,noollama,node] [--categories a,b] [--ids ..] [--passes N] [--no-smoke] [--reuse-corpus] [--corpus DIR] [--holdout PATH]` → `/tmp/pocket-ciso-rag/results/X/summary.md` (node mode needs `npm run build`). Every mode builds its corpus in a temp data dir through the real staging/approval path; `data/` is never touched.
+- Latest dev result (2026-10-22, `qwen2.5:7b` digest 845dbda0ea48 + `bge-m3`): 223 dev questions — 92/188 correct, **0 false answers**, 84 search hits (hits@3 73), 8 abstentions, 35/35 unanswerable refused, contradictions 14/17 with 0 false flags, 0 leakage, deterministic, p50/p95 619/3144 ms; robust_* 4/17 correct, 0 false. noollama/node: 0 false answers, search hits only. `qwen3:14b` (bdbd181c33f2) as judge: 144/188 correct but 9 false answers, p95 10.5 s → not used.
 
 ## Behaviour contracts / gotchas
 - Wiping the data dir while Python runs: demo mode re-reads `.auth-secret` when its mtime changes; production secrets come from the environment (restart both processes after changing it).
