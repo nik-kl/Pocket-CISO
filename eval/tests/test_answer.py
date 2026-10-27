@@ -5,7 +5,7 @@ import json
 import unittest
 from unittest import mock
 
-from helpers import fresh_db, pick, rag, stub_llm, token
+from helpers import fresh_db, rag, stub_llm, token
 from engine.answer import pipeline
 from engine.search import lexical
 
@@ -40,98 +40,6 @@ class Verifier(unittest.TestCase):
 
     def test_no_citation_fails(self) -> None:
         self.assertEqual(rag.verify_sentence("Irgendetwas.", [], self.V), ["keine Quelle"])
-
-
-class AnswerType(unittest.TestCase):
-    """Judge with evidence duty (JUDGE_EVIDENCE=1, measurement variant): reply parsing and the deterministic answer-type check
-    at the named span (invented examples)."""
-
-    def test_judge_reply_is_a_span_number(self) -> None:
-        spans = ["Der Zoo öffnet um 9 Uhr.", "Fütterungen sind verboten."]
-        for reply, want in (("2", 2), ("[1]", 1), ("Textstelle 2", 2), ("0", 0), ("3", 0), ("JA", 0), (None, None)):
-            with stub_llm(reply):
-                self.assertEqual(rag.judge_evidence("Wann öffnet der Zoo?", spans), want, reply)
-
-    def test_named_span_must_carry_the_answer_type(self) -> None:
-        fresh_db([("Werkstattordnung.md", "§3 Werkzeug", "L2", "Die Werkstatt ist werktags geöffnet. Der Drehmomentschlüssel wird "
-                   "jährlich kalibriert.")])
-        lexical._LEX_CACHE = None
-        q = "Wie oft wird der Drehmomentschlüssel in der Werkstatt kalibriert?"
-        with mock.patch.object(pipeline, "JUDGE_EVIDENCE", True):
-            with stub_llm(pick("kalibriert")):
-                res = rag.run_query(token("L2"), q)
-            self.assertEqual(res["result"]["kind"], "answer")
-            self.assertIn("jährlich kalibriert", res["answer"])
-            with stub_llm(pick("geöffnet")):  # the named span holds no frequency → not confirmed
-                res = rag.run_query(token("L2"), q)
-            self.assertEqual(res["result"]["kind"], "search")
-            self.assertIn("ohne Zahl", res["result"]["trace"]["parts"][0]["features"]["answerType"])
-
-    def test_value_question_needs_number_duration_or_deadline(self) -> None:
-        q, p = "Wie lange darf ein Gast im Ruheraum bleiben?", rag.answer_type_problem
-        self.assertEqual(p(q, "Gäste dürfen höchstens 90 Minuten im Ruheraum bleiben.", True, False, 0.0), "")
-        self.assertEqual(p(q, "Gäste dürfen höchstens zwei Stunden im Ruheraum bleiben.", True, False, 0.0), "")  # duration in words
-        self.assertEqual(p(q, "Defekte Liegen sind unverzüglich der Aufsicht zu melden.", True, False, 0.0), "")  # deadline word
-        self.assertEqual(p(q, "Die Liegen werden wöchentlich gereinigt.", True, False, 0.0), "")  # frequency word
-        self.assertTrue(p(q, "Im Ruheraum ist Ruhe zu halten.", True, False, 1.0))
-        self.assertTrue(p(q, "Tabelle [§4.2 Ruheraum]: Raum: Ruheraum | Licht: gedimmt", True, False, 1.0))  # section number is no value
-
-    def test_who_question_needs_role_or_unit(self) -> None:
-        q, p = "Wer genehmigt den Ausflug?", rag.answer_type_problem
-        self.assertEqual(p(q, "Den Ausflug genehmigt die Schulleitung.", False, True, 0.0), "")
-        self.assertEqual(p(q, "Den Ausflug genehmigt der Elternausschuss.", False, True, 0.0), "")  # organisational unit
-        self.assertTrue(p(q, "Ausflüge finden im Frühjahr statt.", False, True, 1.0))
-
-    def test_plural_which_question_needs_an_enumeration(self) -> None:
-        p = rag.answer_type_problem
-        q = "Welche Instrumente sind im Probenraum erlaubt?"
-        self.assertEqual(p(q, "Erlaubt sind Gitarren, Geigen und Flöten.", False, False, 0.0), "")
-        self.assertEqual(p(q, "Erlaubt sind Lautstärken von 60 bis 80 dB.", False, False, 0.0), "")  # several values
-        self.assertTrue(p(q, "Im Probenraum sind Gitarren erlaubt.", False, False, 1.0))
-        # singular 'welche' (no plural verb) falls back to key-term coverage
-        self.assertEqual(p("Welche Taste startet den Ofen?", "Die grüne Taste startet den Ofen.", False, False, 0.6), "")
-
-    def test_other_questions_need_key_term_coverage(self) -> None:
-        p = rag.answer_type_problem
-        self.assertEqual(p("Darf man im Lesesaal essen?", "Im Lesesaal ist Essen verboten.", False, False, 0.8), "")
-        self.assertIn("deckt", p("Darf man im Lesesaal essen?", "Der Lesesaal hat 40 Plätze.", False, False, 0.3))
-
-
-class FocusWords(unittest.TestCase):
-    """JUDGE_FOCUS=1 (measurement variant): a core noun of the part must occur at the named span (invented examples)."""
-    V = rag.Vocab({"fahrrad", "fahrradkeller", "keller"})
-
-    def test_core_nouns_of_german_and_english_questions(self) -> None:
-        self.assertEqual(rag.focus_words("Welche Geräte sind im Labor erlaubt?"), ["gerate", "labor"])
-        self.assertEqual(rag.focus_words("Wofür ist der Hausmeister laut Hausordnung verantwortlich?"), ["hausmeister"])  # named document
-        self.assertEqual(rag.focus_words("Gilt die Richtlinie für Praktikanten?"), ["praktikanten"])  # document-type word
-        self.assertEqual(rag.focus_words("how often are the hand dryers cleaned"), ["hand", "dryers"])  # after an article
-        self.assertEqual(rag.focus_words("aquarium fische füttern wann"), ["aquarium", "fische"])  # all lower case: run at the start
-        self.assertEqual(rag.focus_words("hunde im büro erlaubt?"), ["hunde", "buro"])  # predicate word is no focus
-
-    def test_focus_word_must_occur_at_the_span(self) -> None:
-        q = "Wo darf ich mein Fahrrad abstellen?"
-        self.assertEqual(rag.focus_problem(q, "Fahrräder sind im Fahrradkeller abzustellen.", self.V), "")  # stem / compound part
-        self.assertIn("Fokuswort", rag.focus_problem(q, "Der Keller ist ab 22 Uhr verschlossen.", self.V))
-        self.assertEqual(rag.focus_problem("Wie spät ist es?", "Irgendein Satz.", self.V), "")  # no focus word → no veto
-
-    def test_glossary_synonym_counts(self) -> None:
-        q = "Darf die KI im Kochkurs Rezepte erfinden?"
-        self.assertEqual(rag.focus_problem(q, "Artificial intelligence may only suggest dishes.", self.V), "")
-        self.assertIn("Fokuswort", rag.focus_problem(q, "Kursleiter dürfen Gerichte vorschlagen.", self.V))
-
-    def test_pipeline_vetoes_a_span_without_focus_word(self) -> None:
-        # the lawn sentence enters the window through the adverb "draußen" (a key term, but no noun of the question)
-        fresh_db([("Gartenordnung.md", "§1 Pflege", "L2", "Draußen wird der Rasen wöchentlich gemäht. Die Hecke wird jährlich geschnitten.")])
-        lexical._LEX_CACHE = None
-        q = "Wie oft wird die Hecke draußen geschnitten?"
-        with mock.patch.object(pipeline, "JUDGE_EVIDENCE", True), mock.patch.object(pipeline, "JUDGE_FOCUS", True):
-            with stub_llm(pick("Hecke")):
-                self.assertEqual(rag.run_query(token("L2"), q)["result"]["kind"], "answer")
-            with stub_llm(pick("Rasen")):  # frequency present, but the span is about the lawn
-                res = rag.run_query(token("L2"), q)
-        self.assertNotEqual(res["result"]["kind"], "answer")
-        self.assertIn("Fokuswort", res["result"]["trace"]["parts"][0]["features"]["answerType"])
 
 
 class AnswerGate(unittest.TestCase):

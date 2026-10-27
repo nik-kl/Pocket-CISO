@@ -13,7 +13,6 @@ import time
 import unittest
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Callable
 from unittest import mock
 
 _TMP = tempfile.mkdtemp(prefix="pocket-ciso-test-")
@@ -62,20 +61,11 @@ def fresh_db(chunks: list[dict]) -> None:
     rag.write_db(db)
 
 
-def pick(word: str):
-    """Evidence-judge reply for stub_llm: the number of the first listed span containing `word` ("0" when none does)."""
-    def reply(user: str) -> str:
-        return next((line[1:line.index("]")] for line in user.splitlines() if line.startswith("[") and word in line), "0")
-    return reply
-
-
 @contextmanager
-def stub_llm(judge: str | None | Callable[[str], str | None] = "JA"):
-    """Deterministic stand-in for Ollama: the answerability judge replies `judge` (None = no reply; a callable gets the
-    prompt — evidence judge: span number), phrasing never replies, so answers stay verbatim."""
+def stub_llm(judge: str | None = "JA"):
+    """Deterministic stand-in for Ollama: the answerability judge replies `judge` (None = no reply), phrasing never
+    replies, so answers stay verbatim."""
     def chat(system: str, user: str, **_: object) -> str | None:
-        if system not in (rag.JUDGE_SYSTEM, rag.EVIDENCE_SYSTEM):
-            return None
-        return judge(user) if callable(judge) else judge
+        return judge if system == rag.JUDGE_SYSTEM else None
     with mock.patch.object(rag.OLLAMA, "llm_model", return_value="stub"), mock.patch.object(rag.OLLAMA, "chat", side_effect=chat):
         yield

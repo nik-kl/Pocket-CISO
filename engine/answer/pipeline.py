@@ -11,14 +11,13 @@ from .gate import (
     GATE_COVERAGE, GATE_MISSING, NORM_Q, NO_ANSWER, Part, SEARCH_LABEL, UNCONFIRMED_LABEL, VALUE_Q,
     WHO_Q, dense_window, fact_chunks, question_parts, select_windows, window_ok, window_terms,
 )
-from .judge import judge_answerable, judge_evidence
-from .verify import answer_type_problem, focus_problem
-from ..config import ApiError, JUDGE_EVIDENCE, JUDGE_FOCUS, ROLE_RANK
+from .judge import judge_answerable
+from ..config import ApiError, ROLE_RANK
 from ..llm import OLLAMA, engine_label
 from ..search.dense import dense_scores, diversify, fuse
 from ..search.facts import values_in
 from ..search.lexical import coverage, key_terms, lexical_index
-from ..search.normalize import Vocab, fold
+from ..search.normalize import fold
 from ..store import actor_for, append_denial, cached_db, locked_db
 
 
@@ -37,28 +36,6 @@ def _restricted_match(db: dict[str, Any], role: str, question: str) -> dict[str,
         if coverage(qt, frozenset(idx.doc_terms[i]), idx.ctx_terms[i]) >= GATE_COVERAGE:
             return idx.chunks[i]
     return None
-
-
-def _judge(idx: "LexIndex", vocab: Vocab, part: Part, question: str, windows: list[list[tuple[int, int]]]) -> bool | None:
-    """Answerability judge over the windows' spans (≤ 6). JUDGE_EVIDENCE (measurement variant): the LLM names the span that
-    answers (or 0), the answer type is checked at exactly that span, and a confirmed part keeps only the window holding it.
-    None = no LLM reply."""
-    flat = [(w, ik) for w in windows for ik in w][:6]
-    if not JUDGE_EVIDENCE:
-        return judge_answerable(question, [idx.span_text[i][k] for _, (i, k) in flat])
-    n = judge_evidence(question, [idx.span_text[i][k] for _, (i, k) in flat])
-    part.features = {**(part.features or {}), "evidence": n}
-    if not n:
-        return None if n is None else False
-    w, (i, k) = flat[n - 1]
-    problem = answer_type_problem(part.text, idx.span_text[i][k], part.value, part.who, coverage(part.qt, idx.span_terms[i][k], idx.ctx_terms[i]))
-    if not problem and JUDGE_FOCUS:
-        problem = focus_problem(part.text, idx.span_text[i][k], vocab)
-    if problem:
-        part.features["answerType"] = problem
-        return False
-    part.windows, part.evidence = [w], (i, k)
-    return True
 
 
 def run_query(token: str | None, question: str) -> dict[str, Any]:
@@ -129,7 +106,7 @@ def run_query(token: str | None, question: str) -> dict[str, Any]:
             # deterministic contradiction rule (step 4, same with and without LLM): never an answer, shown as search hits
             part.contradiction = find_contradiction(idx, view, part, ranked) or None
             if use_llm and not part.contradiction:
-                part.features["judge"] = _judge(idx, view.vocab, part, ptext + ctx_note, part.windows)
+                part.features["judge"] = judge_answerable(ptext + ctx_note, [idx.span_text[i][k] for w in part.windows for i, k in w][:6])
         # dense path only below the lexical floor: a second judge call after a NEIN on the lexical window gave the 7B judge a
         # second chance to say JA and produced 2 false answers on the dev set (I-1, R-10) → never retried
         if dense and not part.lexical_ok:
@@ -138,7 +115,7 @@ def run_query(token: str | None, question: str) -> dict[str, Any]:
                 part.dense_ok, part.windows = True, [dw[0]]
                 part.features["densePath"] = round(dw[1], 4)
                 if use_llm:
-                    part.features["judge"] = _judge(idx, view.vocab, part, ptext + ctx_note, [dw[0]])
+                    part.features["judge"] = judge_answerable(ptext + ctx_note, [idx.span_text[i][k] for i, k in dw[0]])
         part.answered = (part.lexical_ok or part.dense_ok) and part.features.get("judge") is True and not part.contradiction
         if not part.answered and part.windows:
             part.reason = ("Abdeckung zu gering" if not (part.lexical_ok or part.dense_ok) else "Antwortbarkeitsprüfung: nein" if use_llm else "kein LLM: nur Fundstellen")
@@ -152,11 +129,11 @@ def run_query(token: str | None, question: str) -> dict[str, Any]:
             if p.answered or p.contradiction or not pool:
                 continue
             ws = [w for w in pool if not p.value or window_ok(idx, p, w)]  # role names are left to the judge here
-            p.pooled = bool(ws)
-            if ws and _judge(idx, view.vocab, p, f"{p.text} (Gesamtfrage: {q})", ws) is True:
-                p.windows = p.windows if p.evidence else ws
-                p.answered, p.reason = True, ""
-                p.coverage = max(p.coverage, coverage(p.qt, frozenset().union(*(window_terms(idx, w) for w in p.windows))))
+            spans = [idx.span_text[i][k] for w in ws for i, k in w][:6]
+            p.pooled = bool(spans)
+            if spans and judge_answerable(f"{p.text} (Gesamtfrage: {q})", spans) is True:
+                p.windows, p.answered, p.reason = ws, True, ""
+                p.coverage = max(p.coverage, coverage(p.qt, frozenset().union(*(window_terms(idx, w) for w in ws))))
                 p.features = {**(p.features or {}), "pool": True}
     lat["retrieval"] = int((time.perf_counter() - t) * 1000)
 
@@ -225,10 +202,7 @@ def run_query(token: str | None, question: str) -> dict[str, Any]:
     ordered: list[tuple[str, str]] = []
     for p in answered:
         for w in p.windows:
-            keep = related_spans(idx, p, w)
-            if p.evidence in w and p.evidence not in keep:  # the span the judge named is always shown
-                keep = [x for x in w if x in keep or x == p.evidence]
-            for i, k in keep:
+            for i, k in related_spans(idx, p, w):
                 sid = idx.span_ids[i][k]
                 if sid not in dict(ordered):
                     ordered.append((sid, idx.span_text[i][k]))
