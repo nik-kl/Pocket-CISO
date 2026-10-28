@@ -678,3 +678,27 @@ class ReferenceWord(unittest.TestCase):
         res = self.ask([("Richtlinie.md", "§1 Geltungsbereich", "L1", "Diese Richtlinie gilt für alle Mitarbeitenden und Praktikanten.")],
                        "Für wen gilt die Richtlinie?")
         self.assertEqual(res["result"]["kind"], "answer")
+
+
+class NormCheck(unittest.TestCase):
+    """A yes/no may/must question needs a permission, prohibition or obligation in the answer (invented examples)."""
+
+    def ask(self, text: str, q: str = "Darf ich das Lastenrad am Wochenende ausleihen?") -> dict:
+        fresh_db([("Fuhrpark.md", "§2 Lastenrad am Wochenende", "L1", text)])
+        lexical._LEX_CACHE = None
+        with stub_llm("JA"):
+            return rag.run_query(token("L1"), q)
+
+    def test_answer_without_a_norm_becomes_a_search_hit(self) -> None:
+        res = self.ask("Das Lastenrad steht am Wochenende in der Garage am Tor 2.")
+        self.assertNotEqual(res["result"]["kind"], "answer")
+        self.assertEqual(res["result"]["trace"]["parts"][0]["features"].get("normSpan"), "missing")
+
+    def test_prohibition_permission_and_negated_obligation_are_norms(self) -> None:
+        for text in ("Das Lastenrad darf am Wochenende nicht ausgeliehen werden.", "Am Wochenende ist das Ausleihen des Lastenrads verboten.",
+                     "Das Lastenrad darf am Wochenende mit Genehmigung ausgeliehen werden."):
+            self.assertEqual(self.ask(text)["result"]["kind"], "answer", text)
+
+    def test_value_question_with_must_needs_no_modal_verb(self) -> None:
+        res = self.ask("Tabelle [Ausleihe]: Fahrzeug: Lastenrad | Rückgabefrist: 2 Tage", "Bis wann muss das Lastenrad zurückgegeben werden?")
+        self.assertNotEqual(res["result"]["trace"]["parts"][0]["features"].get("normSpan"), "missing")

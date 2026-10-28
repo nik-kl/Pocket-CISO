@@ -17,7 +17,7 @@ from .gate import (
 )
 from .judge import judge_answerable
 from .keysentence import key_sentence, question_kind
-from .verify import has_value, judge_veto, value_dim
+from .verify import has_norm, has_value, judge_veto, value_dim
 from ..config import ApiError, ROLE_RANK
 from ..llm import OLLAMA, engine_label
 from ..search.dense import dense_scores, diversify, fuse
@@ -225,26 +225,30 @@ def run_query(token: str | None, question: str) -> dict[str, Any]:
             if w:
                 p.windows, p.answered, p.reason = [w], True, ""
                 p.features = {**(p.features or {}), "definition": term}
-    # value questions: the shown spans must carry a value of the asked dimension (duration, count, deadline, frequency). The
-    # value sentence of a confirmed window can be dropped by related_spans (its key term already in the section title) →
-    # it is added back; a confirmed window without such a value is no answer to a value question → search hit / note.
+    # value questions: the shown spans must carry a value of the asked dimension (duration, count, deadline, frequency);
+    # yes/no may/must questions a norm (permission, prohibition, obligation — "Dies gilt auch für …" alone is neither yes nor
+    # no; "bis wann muss …" / "wer muss …" ask for the value / role, a table row "Frist: 14 Tage" carries no modal verb).
+    # Such a sentence of a confirmed window can be dropped by related_spans (its key term already in the section title) →
+    # it is added back; a confirmed window without one is no answer → search hit / note.
     for p in parts:
         if not p.answered:
             continue
         p.shown = [related_spans(idx, p, w) for w in p.windows]
-        if not p.value:
-            continue
         dim = value_dim(p.flag_text or p.text)
-        if any(has_value(dim, idx.span_text[i][k]) for ws in p.shown for i, k in ws):
-            continue
-        add = next(((n, x) for n, w in enumerate(p.windows) for x in reversed(w) if has_value(dim, idx.span_text[x[0]][x[1]])), None)
-        if add:
-            n, x = add
-            p.shown[n] = [y for y in p.windows[n] if y in p.shown[n] or y == x]
-            p.features = {**(p.features or {}), "valueSpan": "added"}
-        else:
-            p.answered, p.reason = False, f"kein Wert der gefragten Art ({dim})"
-            p.features = {**(p.features or {}), "valueSpan": "missing"}
+        needs = ([("valueSpan", f"kein Wert der gefragten Art ({dim})", lambda t: has_value(dim, t))] if p.value else []) + \
+            ([("normSpan", "keine Erlaubnis, kein Verbot, keine Pflicht in der Fundstelle", has_norm)] if p.norm and not (p.value or p.who) else [])
+        for feature, reason, has in needs:
+            if any(has(idx.span_text[i][k]) for ws in p.shown for i, k in ws):
+                continue
+            add = next(((n, x) for n, w in enumerate(p.windows) for x in reversed(w) if has(idx.span_text[x[0]][x[1]])), None)
+            if add:
+                n, x = add
+                p.shown[n] = [y for y in p.windows[n] if y in p.shown[n] or y == x]
+                p.features = {**(p.features or {}), feature: "added"}
+            else:
+                p.answered, p.reason = False, reason
+                p.features = {**(p.features or {}), feature: "missing"}
+                break
     lat["retrieval"] = int((time.perf_counter() - t) * 1000)
 
     label = engine_label()

@@ -22,11 +22,17 @@ MODAL_CLASSES = {
 }
 
 YES_NO = re.compile(r"^\s*(?:ja|nein|yes|no)\b")
+PROHIBITION_RE = re.compile(r"\b(?:untersagt\w*|verbot\w*|unzulassig\w*|prohibit\w*|forbidden|never|nie|niemals)\b")
 
 
 def modal_classes(text: str) -> frozenset[str]:
     f = fold(text)
     return frozenset(k for k, rx in MODAL_CLASSES.items() if rx.search(f))
+
+
+def has_norm(text: str) -> bool:
+    """Permission, prohibition or obligation (also negated: "darf nicht", "keine Pflicht") — what a may/must question asks."""
+    return bool(modal_classes(text) & {"obligation", "permission", "recommendation"} or PROHIBITION_RE.search(fold(text)))
 
 
 def entities(text: str) -> set[str]:

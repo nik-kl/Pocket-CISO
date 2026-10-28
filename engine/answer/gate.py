@@ -5,7 +5,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
-from .verify import entities, modal_classes, numeric_terms
+from .verify import PROHIBITION_RE, entities, modal_classes, numeric_terms
 from ..search.lexical import KeyTerm, QueryTerms, RoleView, coverage
 from ..search.normalize import FREQ_WORDS, INSTRUCTION_RE, R_STOP, _LEX, _edit_distance, cistem, fold, norm
 
@@ -49,7 +49,6 @@ VALUE_Q = re.compile(r"\b(?:wie (?:lange?|viele?\w*|oft|schnell|hoch|gross|fruh)
 WHO_Q = re.compile(r"\b(?:wer|wem|wen|who|whom)\b")
 # yes/no questions about permission or obligation are answered by a normative sentence (muss, darf, verboten, …)
 NORM_Q = re.compile(r"^(?:brauche\w*|can|am i|is it|are we|do i|do we)\b|\b(?:darf|durfen|muss|mussen|soll|sollen|may|must|erlaubt|zulassig|gestattet|verboten|untersagt|allowed|permitted|prohibited|forbidden|pflicht\w*|mandatory|required)\b")
-PROHIBITION_RE = re.compile(r"\b(?:untersagt\w*|verbot\w*|unzulassig\w*|prohibit\w*|forbidden|never|nie|niemals)\b")
 ANAPHOR = re.compile(r"^(?:er|sie|es|dies\w*|dabei|dazu|hierbei|this|these|it|they|he|she)(?![\w-])", re.I)  # not "IT-Bereitschaft"
 # at a section start a demonstrative with its noun ("Diese Richtlinie gilt …") refers to the heading, a bare pronoun to nothing
 HEADING_REF = re.compile(r"^(?:diese[mnrs]?|this|these)\s+\w", re.I)
