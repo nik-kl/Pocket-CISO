@@ -580,6 +580,10 @@ class PhrasingGuards(unittest.TestCase):
         self.assertNotIn("Anlegeleiter |", prompts[0])
         self.assertIn(compose.display_span(self.ROW[1]), [s.text for s in out if s.spans == ["r"] and s.source == "verbatim"])
 
+    def test_repeated_sentence_is_shown_once(self) -> None:
+        out, _ = self.compose("Anlegeleitern werden vor jeder Nutzung auf Schäden geprüft [S1]. Anlegeleitern werden vor jeder Nutzung auf Schäden geprüft [S1].")
+        self.assertEqual(len([s for s in out if s.spans == ["p"]]), 1)
+
     def test_echoed_question_falls_back_to_the_span(self) -> None:
         out, _ = self.compose("Werden Anlegeleitern vor jeder Nutzung geprüft? [S1]")
         echo = [s for s in out if s.spans == ["p"]][0]

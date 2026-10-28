@@ -76,6 +76,8 @@ def compose_sentences(q: str, spans: list[tuple[str, str]], vocab: Vocab, use_ll
     ids = [sid for sid, _ in prose]
     result: list[Sentence] = []
     for s in parse_phrased(out, ids)[:3]:
+        if any(" ".join(r.text.split()) == " ".join(s.text.split()) for r in result):
+            continue  # the model repeated a sentence (one copy per question part): show it once
         used = [sid for sid in s.spans if set(analyze(s.text, vocab)) & set(analyze(text_of[sid], vocab))]
         problems = verify_sentence(s.text, [text_of[sid] for sid in used], vocab)
         if s.text.rstrip().endswith("?"):
