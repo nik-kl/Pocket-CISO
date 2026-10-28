@@ -181,6 +181,41 @@ export interface QueryResult {
     engineMode?: string;
     rewriteBy?: string;
     answerBy?: string;
+    contradiction?: boolean;
+    retrievalCached?: boolean;
+    parts?: { text: string; answered: boolean; coverage: number; reason: string; features?: Record<string, unknown> | null }[];
+    sentences?: { text: string; source: string; verified: boolean; problems: string[] }[]; // span verifier per answer sentence
+  };
+}
+
+// Two-stage answers, stage 1 (query_fast): verbatim source sentences with a highlighted key sentence, no LLM. null = no stage 1
+// (local engine: stage 2 answers directly).
+export interface FastHit {
+  chunkId: string;
+  docName: string;
+  section: string;
+  sentences: string[];
+  key: number; // index of the key sentence in `sentences`
+  keySentence: string;
+  content: string;
+  source: "definition" | "window" | "ranked";
+  coverage: number;
+  dense: number | null;
+}
+
+export interface FastResult {
+  hits: FastHit[];
+  citations: Record<string, LiveChunk>;
+  trace: {
+    rbacFilter: string;
+    searched: number;
+    total: number;
+    injectionRemoved: boolean;
+    engineMode: string;
+    latencyMs: { rbac: number; retrieval: number; total: number };
+    retrievalScore: number;
+    lexicalSupport: number;
+    parts: { text: string; kind: "value" | "who" | "definition" | "other"; arg: string | null; coverage: number; lexicalOk: boolean; densePath: boolean; contradiction: boolean }[];
   };
 }
 
