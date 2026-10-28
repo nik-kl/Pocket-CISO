@@ -33,5 +33,19 @@ def names_actor(text: str) -> bool:
 
 
 def key_sentence(kind: str, arg: str | None, sentences: list[str], cov: list[float], section: str = "") -> int:
-    """Index of the key sentence: the highest key-term coverage, ties → the earlier sentence."""
-    return min(range(len(sentences)), key=lambda k: (-cov[k], k)) if sentences else 0
+    """Index of the key sentence. Value question → a sentence with a value of the asked dimension; who-question → a sentence
+    naming a role or organisational unit; definition → the explaining sentence (explains before passing mention); otherwise,
+    and when no sentence fits the type, the highest key-term coverage. Ties: higher coverage, then the earlier sentence."""
+    if not sentences:
+        return 0
+    order = sorted(range(len(sentences)), key=lambda k: (-cov[k], k))
+    if kind == "value":
+        fit = [k for k in order if has_value(arg or "value", sentences[k])]
+    elif kind == "who":
+        fit = [k for k in order if names_actor(sentences[k])]
+    elif kind == "definition" and arg:
+        ranks = {k: definition_text_rank(sentences[k], arg, section) for k in order}
+        fit = sorted((k for k in order if ranks[k] is not None), key=lambda k: (ranks[k], -cov[k], k))
+    else:
+        fit = []
+    return (fit or order)[0]
