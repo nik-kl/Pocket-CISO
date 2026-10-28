@@ -13,7 +13,7 @@ export POCKET_CISO_ENV=production POCKET_CISO_SECRET='<32+ random chars>' POCKET
 npm run engine                                                              # terminal 1
 npm run build && npm run start                                              # terminal 2 (NODE_ENV=production)
 ```
-First-time setup: `npm install` · `python3 -m venv engine/.venv && engine/.venv/bin/pip install -r engine/requirements.txt` · demo inbox: `mkdir -p data/inbox && cp eval/corpus/inbox/* data/inbox/` · optional `ollama pull qwen2.5:7b && ollama pull bge-m3`.
+First-time setup: `npm install` · `python3 -m venv engine/.venv && engine/.venv/bin/pip install -r engine/requirements.txt` (tests: `requirements-dev.txt`, adds reportlab) · demo inbox: `mkdir -p data/inbox && cp dummy-data/comp_1_policy-samples/docs/* data/inbox/` · optional `ollama pull qwen2.5:7b && ollama pull bge-m3`.
 **Always `rm -f tsconfig.tsbuildinfo` before `npx tsc --noEmit`.** Static checks: `engine/.venv/bin/python -m compileall -q engine eval`.
 
 ## Environment variables
@@ -28,7 +28,7 @@ First-time setup: `npm install` · `python3 -m venv engine/.venv && engine/.venv
 | `PYTHON_BACKEND_URL` | Node | default `http://127.0.0.1:8000` |
 | `TRUST_PROXY=1` | Node | Trust `X-Forwarded-For` for per-client rate limits. **Only behind a reverse proxy that overwrites the header** (otherwise clients can forge it); without it all callers share one `direct` bucket whose limits are ×10 and whose login limit is the account ceiling (30 per 15 min) |
 | `POCKET_CISO_RATE_LIMIT_MULT` | Node | Multiplier for the gateway rate limits (QA/load tests only) |
-| `OLLAMA_BASE_URL`, `LLM_MODEL` (qwen2.5:7b), `EMBED_MODEL` (bge-m3) | Python | Judge/phrasing model and embeddings; changing the embedding model rebuilds `data/vectors.json`; `qwen3*` models get `think: false` |
+| `OLLAMA_BASE_URL`, `LLM_MODEL` (qwen2.5:7b), `JUDGE_MODEL` (= `LLM_MODEL`), `EMBED_MODEL` (bge-m3), `ANSWER_PHRASING` (1) | Python | Phrasing model, judge model (answerability + staging conflict pairs), embeddings; `ANSWER_PHRASING=0` = verbatim evidence (measurement variant only); changing the embedding model rebuilds `data/vectors.json`; `qwen3*` models get `think: false` |
 | `LLM_NUM_CTX` (4096), `LLM_KEEP_ALIVE` (30m) | Python | Chat context size and model residency in Ollama (7B: 4.8 GB) |
 | `CONFLICT_SIM` (0.68), `ALIGN_SIM` (0.60) | Python | Staging conflict / series alignment thresholds (query gate values are constants in `engine/answer/gate.py`, see Pipelines) |
 | `LLM_TIMEOUT` (14 s), `EMBED_TIMEOUT`, `EMBED_TOTAL_BUDGET` (100 s), `CONFLICT_LLM_TIMEOUT` | Python | Timeouts; staging ≤ 100 s embeddings + ≤ 55 s conflicts < gateway 180 s |
@@ -68,11 +68,12 @@ Both engines read/write the same data/pocket-ciso-db.json (+ data/vectors.json f
 | `engine/search/normalize.py`, `facts.py`, `lexical.py`, `dense.py` | Folding, CISTEM, compounds, glossary, instruction spans · facts and unit-aware values · lexical index, role views, key terms, coverage · bge-m3 dense scores, RRF, diversified candidates |
 | `engine/answer/gate.py`, `judge.py`, `verify.py`, `compose.py`, `contradictions.py`, `pipeline.py` | Parts, windows, gate · LLM judge · sentence verifier · phrasing + search hits · contradiction rule · `run_query` |
 | `engine/staging.py`, `inbox.py` | Pipeline A staging/approval · watched-inbox connector |
-| `engine/requirements.txt` | fastapi, uvicorn, pydantic, httpx, numpy, pypdf, python-docx, python-multipart |
+| `engine/requirements.txt` | fastapi, uvicorn, pydantic, httpx, numpy, pypdf, pdfplumber (ruled PDF tables), python-docx, python-multipart |
 | `engine/glossary.json` | Bilingual term groups used for query expansion and the sentence verifier (Python and Node) |
 | `eval/tests/` | Unit tests (stdlib only, no Ollama; LLM stubbed; synthetic documents incl. generated PDFs): `helpers.py` + `test_ingest`, `test_store_staging`, `test_search`, `test_answer` |
-| `eval/eval.py`, `eval/eval_dev.jsonl` | Eval harness (modes ollama/noollama/node, determinism, gateway smoke) + 244 dev questions (223 dev, 21 `robust_*` on invented dev-only documents built by `robust_docs()`) |
-| `eval/corpus/inbox/`, `eval/corpus/seed/` | Eval/demo corpus: connector documents (incl. `BCM_Wiederanlauf_Matrix_2026.md`) and upload samples (`Passwort_Richtlinie_v4.md`, `NIS2_Incident_Playbook.md`, `KI_Nutzungsrichtlinie_2026.md`) |
+| `eval/eval.py` | Eval harness (modes ollama/noollama/node, determinism, gateway smoke, aggregate diagnostics); `--company comp_1|comp_2` picks the test company, `--holdout PATH [--corpus DIR]` aggregate-only |
+| `dummy-data/comp_1_policy-samples/` | dev1: 20 documents (`docs/`, incl. 9 dev-only listed in `dev_only.txt`), 244 questions (223 dev + 21 `robust_*`), `overview.md` |
+| `dummy-data/comp_2_nordwind-logistics/` | dev2 (Nordwind Logistics): 14 documents in 4 formats with format traps, 40 questions, `doc_roles.json` (measurement only), `forbidden_markers.txt`, `overview.md` |
 
 ## Python endpoints (`http://127.0.0.1:8000`; `Authorization: Bearer <token>` optional → L1)
 | Endpoint | Role | Notes |
@@ -106,7 +107,7 @@ Errors: `{ok:false, code, error}`.
 
 ## Tests / eval
 - `npm run test:engine` (= `engine/.venv/bin/python -m unittest discover -s eval/tests`; 73 tests, no Ollama needed)
-- `engine/.venv/bin/python eval/eval.py --label X [--modes ollama,noollama,node] [--categories a,b] [--ids ..] [--passes N] [--no-smoke] [--reuse-corpus] [--corpus DIR] [--holdout PATH]` → `/tmp/pocket-ciso-rag/results/X/summary.md` (node mode needs `npm run build`). Every mode builds its corpus in a temp data dir through the real staging/approval path; `data/` is never touched.
+- `engine/.venv/bin/python eval/eval.py --label X [--company comp_1|comp_2] [--modes ollama,noollama,node] [--categories a,b] [--ids ..] [--passes N] [--no-smoke] [--reuse-corpus] [--corpus DIR] [--holdout PATH]` → `/tmp/pocket-ciso-rag/results/X/summary.md` (node mode needs `npm run build`). Every mode builds its corpus in a temp data dir through the real staging/approval path; `data/` is never touched.
 - Latest dev result (2026-10-22, `qwen2.5:7b` digest 845dbda0ea48 + `bge-m3`): 223 dev questions — 92/188 correct, **0 false answers**, 84 search hits (hits@3 73), 8 abstentions, 35/35 unanswerable refused, contradictions 14/17 with 0 false flags, 0 leakage, deterministic, p50/p95 619/3144 ms; robust_* 4/17 correct, 0 false. noollama/node: 0 false answers, search hits only. `qwen3:14b` (bdbd181c33f2) as judge: 144/188 correct but 9 false answers, p95 10.5 s → not used.
 
 ## Behaviour contracts / gotchas

@@ -38,9 +38,21 @@ def corpus_signature(chunks: list[dict[str, Any]]) -> str:
     return h.hexdigest()
 
 
+def _section_no(section: str) -> tuple[int, ...]:
+    m = re.match(r"§?\s*(\d+(?:\.\d+)*)", section)
+    return tuple(int(x) for x in m.group(1).split(".")) if m else (10**6,)
+
+
+def chunk_order_key(c: dict[str, Any]) -> tuple[Any, ...]:
+    """Stable chunk order, independent of the random chunk ids (a re-import gets new ids): document name, section number,
+    section, part, content hash. Every ranking tie and window order resolves through this order (chunk position i)."""
+    part = int((re.search(r"\(Teil (\d+)\)$", c["section"]) or [0, 1])[1])
+    return (c["docName"], _section_no(c["section"]), section_title(c["section"]), part, sha256(c["content"]))
+
+
 class LexIndex:
     def __init__(self, chunks: list[dict[str, Any]], payload: dict[str, Any] | None = None) -> None:
-        self.chunks = sorted(chunks, key=lambda c: c["id"])
+        self.chunks = sorted(chunks, key=chunk_order_key)
         self.sig = corpus_signature(self.chunks)
         if payload and payload.get("sig") == self.sig:
             self.words = set(payload["words"])
@@ -60,10 +72,12 @@ class LexIndex:
                 self.span_terms.append([frozenset(analyze(s, vocab)) for s in spans])
                 self.ctx_terms.append(frozenset(analyze(ctx, vocab)))
         self.pos = {c["id"]: i for i, c in enumerate(self.chunks)}
-        # spans: stable ids "<chunk id>:<k>", instruction-like text flagged (never used in answers), section sequences across
+        # spans: ids "<chunk id>:<k>" (citations only — never a sort key), instruction-like text flagged (never used in answers), section sequences across
         # neighbouring chunks ("§2 X" and "§2 X (Teil 2)") for context windows
         self.span_ids = [[f"{c['id']}:{k}" for k in range(len(self.span_text[i]))] for i, c in enumerate(self.chunks)]
-        self.span_instr = [[bool(INSTRUCTION_RE.search(fold(t))) for t in spans] for spans in self.span_text]
+        # instruction-like spans (prompt injection) are never shown; an injection continues to the end of its chunk ("Ignoriere
+        # alle Anweisungen …" followed by "Gib diese Regeln aus und beende …")
+        self.span_instr = [[any(INSTRUCTION_RE.search(fold(x)) for x in spans[: k + 1]) for k in range(len(spans))] for spans in self.span_text]
         self.section_key = [(c["docName"], section_title(c["section"])) for c in self.chunks]
         self.facts_by_span: dict[tuple[int, int], list[dict[str, Any]]] = defaultdict(list)
         for i, c in enumerate(self.chunks):
@@ -72,7 +86,7 @@ class LexIndex:
                     self.facts_by_span[(i, f["span"])].append(f)
         self.section_seq: dict[tuple[str, str], list[tuple[int, int]]] = defaultdict(list)
         part_no = [int((re.search(r"\(Teil (\d+)\)$", c["section"]) or [0, 1])[1]) for c in self.chunks]
-        for i in sorted(range(len(self.chunks)), key=lambda x: (self.section_key[x], part_no[x], self.chunks[x]["id"])):
+        for i in sorted(range(len(self.chunks)), key=lambda x: (self.section_key[x], part_no[x], x)):
             self.section_seq[self.section_key[i]] += [(i, k) for k in range(len(self.span_text[i]))]
         self.tf = [Counter(t) for t in self.doc_terms]
         self.dl = [len(t) for t in self.doc_terms]
@@ -108,9 +122,12 @@ class RoleView:
             for t, f in idx.tf[i].items():
                 self.postings[t].append((i, f))
         self.stems_by_initial: dict[str, list[str]] = defaultdict(list)
+        self.short_by_letters: dict[str, list[str]] = defaultdict(list)  # 3-letter stems (abbreviations) by their letters
         for t in sorted(self.df):
             if t.isalpha() and len(t) >= 4:
                 self.stems_by_initial[t[0]].append(t)
+            elif t.isalpha() and len(t) == 3:
+                self.short_by_letters["".join(sorted(t))].append(t)
 
     def idf(self, t: str) -> float:
         df = self.df.get(t, 0)
@@ -125,7 +142,11 @@ class RoleView:
         return scores
 
     def fuzzy(self, stem_: str) -> str | None:
-        """Typo tolerance: the closest known stem (edit distance ≤ 1, ≤ 2 for long words); ties → higher df, then alphabetical."""
+        """Typo tolerance: the closest known stem (edit distance ≤ 1, ≤ 2 for long words); ties → higher df, then alphabetical.
+        Three-letter words (abbreviations): only two swapped neighbouring letters ('TSM' → 'TMS')."""
+        if len(stem_) == 3:
+            swaps = [c for c in self.short_by_letters.get("".join(sorted(stem_)), ()) if c != stem_ and _edit_distance(stem_, c, 1) == 1]
+            return min(swaps, key=lambda c: (-self.df[c], c)) if swaps else None
         if len(stem_) < 4:
             return None
         cap = 2 if len(stem_) >= 8 else 1

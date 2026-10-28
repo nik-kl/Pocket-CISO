@@ -1,6 +1,7 @@
-"""Document parsing: PDF (layout mode, tables with and without blank lines between rows), DOCX, Markdown/TXT."""
+"""Document parsing: PDF (pdfplumber tables + layout-mode text, pypdf fallback), DOCX, Markdown/TXT."""
 from __future__ import annotations
 
+import html
 import io
 import re
 import unicodedata
@@ -44,10 +45,10 @@ def parse_document(filename: str, data: bytes) -> str:
     if ext in (".md", ".txt"):
         for enc in ("utf-8-sig", "cp1252"):
             try:
-                return data.decode(enc)
+                return _clean_text(data.decode(enc))
             except UnicodeDecodeError:
                 continue
-        return data.decode("utf-8", errors="replace")
+        return _clean_text(data.decode("utf-8", errors="replace"))
     if ext == ".pdf":
         try:
             from pypdf import PdfReader
@@ -55,7 +56,11 @@ def parse_document(filename: str, data: bytes) -> str:
             reader = PdfReader(io.BytesIO(data))
             if reader.is_encrypted:
                 raise ApiError(422, "PDF_ENCRYPTED", "Verschlüsselte PDFs werden nicht unterstützt.")
-            return "\n\n".join(_pdf_page_text(p) for p in reader.pages[:300])
+            pages = reader.pages[:300]
+            try:
+                return "\n\n".join(_plumber_pages(data, pages))
+            except Exception:  # noqa: BLE001 — pdfplumber failed on this file: pypdf layout heuristics for every page
+                return "\n\n".join(_pdf_page_text(p) for p in pages)
         except ApiError:
             raise
         except Exception as e:  # noqa: BLE001
@@ -65,6 +70,102 @@ def parse_document(filename: str, data: bytes) -> str:
         return _docx_to_text(data)
     except Exception as e:  # noqa: BLE001
         raise ApiError(422, "DOCX_UNREADABLE", f"DOCX konnte nicht gelesen werden: {type(e).__name__}")
+
+
+# ── plain text / Markdown: export remnants and text tables ──
+# Intranet/HTML exports leave entities and line-break tags ("&nbsp;", "&amp;", "<br>"); text tables come as Markdown pipe
+# tables with blank lines between rows and wrapped cells, or as ASCII tables without outer pipes ("a | b" over "---+---").
+# Both are normalised to one Markdown table so the chunker writes one "Spalte: Wert" statement per row.
+HTML_BREAK = re.compile(r"<\s*(?:br|/p|p)\s*/?\s*>", re.I)
+PIPE_ROW = re.compile(r"^\s*\|.*\|\s*$")
+MD_SEP = re.compile(r"^\s*\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)*\|?\s*$")
+ASCII_SEP = re.compile(r"^\s*[-=]{3,}(?:\s*[+|]\s*[-=]{3,})+\s*$")
+
+
+def _clean_text(text: str) -> str:
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    if re.search(r"&(?:[a-z]+|#\d+);|<\s*(?:br|p)\b", text, re.I):
+        text = html.unescape(HTML_BREAK.sub("\n", text)).replace("\xa0", " ")
+    return _text_tables("\n".join(_ascii_tables(text.split("\n"))))
+
+
+def _cells(line: str) -> list[str]:
+    return [c.strip() for c in line.strip().strip("|").split("|")]
+
+
+def _ascii_tables(lines: list[str]) -> list[str]:
+    """'Header | Header' over a '----+----' line and rows with the same number of ' | ' → Markdown pipe table."""
+    out: list[str] = []
+    i = 0
+    while i < len(lines):
+        head = lines[i]
+        if i + 1 < len(lines) and " | " in head and not PIPE_ROW.match(head) and ASCII_SEP.match(lines[i + 1]):
+            n = len(_cells(head))
+            j = i + 2
+            rows = []
+            while j < len(lines) and " | " in lines[j] and len(_cells(lines[j])) == n:
+                rows.append(_cells(lines[j]))
+                j += 1
+            if rows:
+                out += ["| " + " | ".join(_cells(head)) + " |", "|" + "---|" * n] + ["| " + " | ".join(r) + " |" for r in rows]
+                i = j
+                continue
+        out.append(head)
+        i += 1
+    return out
+
+
+def _merge_cells(rows: list[list[str]]) -> list[str]:
+    merged = [""] * max(len(r) for r in rows)
+    for r in rows:
+        for k, c in enumerate(r):
+            merged[k] = _join_cell(merged[k], c) if c else merged[k]
+    return merged
+
+
+def _text_tables(text: str) -> str:
+    """Markdown pipe tables: blank lines between rows are dropped; with blank lines the lines between two blank lines are
+    one row (wrapped cells), without them a line with an empty first cell continues the row above."""
+    lines = text.split("\n")
+    out: list[str] = []
+    i = 0
+    while i < len(lines):
+        if not (PIPE_ROW.match(lines[i]) and i + 1 < len(lines) and MD_SEP.match(lines[i + 1])):
+            out.append(lines[i])
+            i += 1
+            continue
+        n = len(_cells(lines[i]))
+        groups: list[list[list[str]]] = [[]]
+        j, gaps = i + 2, False
+        while j < len(lines):
+            if PIPE_ROW.match(lines[j]) and len(_cells(lines[j])) == n:
+                groups[-1].append(_cells(lines[j]))
+                j += 1
+            elif not lines[j].strip():
+                k = j
+                while k < len(lines) and not lines[k].strip():
+                    k += 1
+                if k < len(lines) and PIPE_ROW.match(lines[k]) and len(_cells(lines[k])) == n and not MD_SEP.match(lines[k]):
+                    gaps, j = True, k
+                    if groups[-1]:
+                        groups.append([])
+                else:
+                    break
+            else:
+                break
+        groups = [g for g in groups if g]
+        if gaps:
+            body = [_merge_cells(g) for g in groups]
+        else:
+            body = []
+            for r in (r for g in groups for r in g):
+                if body and not r[0] and any(r):
+                    body[-1] = _merge_cells([body[-1], r])
+                else:
+                    body.append(r)
+        out += [lines[i], lines[i + 1]] + ["| " + " | ".join(r) + " |" for r in body]
+        i = j
+    return "\n".join(out)
 
 
 PAGE_FOOTER = re.compile(r"\b(?:Seite|Page)\s+\d+\s+(?:von|of)\s+\d+\s*$", re.I)
@@ -150,15 +251,20 @@ def _row_groups(block: list[str], starts: list[int], header: bool) -> list[list[
 
 
 def _pdf_page_text(page: Any) -> str:
-    """Layout-mode extraction keeps table columns: blocks with ≥ 3 aligned cells become Markdown tables (header + one row
-    per blank-line separated block), two-line KPI boxes (values over UPPERCASE labels) become one-row tables, page footers
-    are dropped. Falls back to plain extraction when the layout mode yields nothing."""
+    """pypdf page → text via layout mode (_layout_md); plain extraction when the layout mode yields nothing."""
     try:
         raw = page.extract_text(extraction_mode="layout") or ""
     except Exception:  # noqa: BLE001 — older pypdf / odd fonts
         raw = ""
     if not raw.strip():
         return page.extract_text() or ""
+    return _layout_md(raw)
+
+
+def _layout_md(raw: str) -> str:
+    """Layout-mode text keeps table columns: blocks with ≥ 3 aligned cells become Markdown tables (header + one row
+    per blank-line separated block), two-line KPI boxes (values over UPPERCASE labels) become one-row tables, page footers
+    are dropped."""
     blocks: list[list[str]] = []
     cur: list[str] = []
     for line in raw.split("\n"):
@@ -213,6 +319,197 @@ def _pdf_page_text(page: Any) -> str:
         out += [re.sub(r"\s{2,}", " ", ln.strip()) for ln in head] + [""]
         i += 1
     return "\n".join(out)
+
+
+# ── pdfplumber tables (class b: ruled tables with wrapped cells and headers fall apart in the layout text) ──
+# Per page: ruled tables (lines strategy). Cells are joined across line breaks, a header spread over two rows is merged, a
+# table continued on the next page (same column positions, first on the page) keeps its header (a repeated header row is
+# dropped). Text above/between/below tables goes through the layout heuristics as before; a page without ruled tables, or
+# a pdfplumber error, uses the pypdf path unchanged. pdfplumber's text strategy is not used: on borderless tables it cut
+# words across columns and assigned uncertain rows ("kau | m spuerbar"), where the layout heuristics keep running text.
+LINES = {"vertical_strategy": "lines", "horizontal_strategy": "lines"}
+
+
+def _cell(text: str | None) -> str:
+    out = ""
+    for part in (text or "").split("\n"):
+        out = _join_cell(out, part.strip()) if part.strip() else out
+    return out.replace("|", "\\|")
+
+
+def _table_rows(raw: list[list[str | None]]) -> list[list[str]]:
+    """Clean rows: a merged cell (None) inherits the value above (row span) or, in the first row, the value to its left
+    (column span of a header); empty columns are dropped."""
+    rows: list[list[str]] = []
+    for r in raw:
+        row = [_cell(c) if c is not None else (rows[-1][k] if rows and k < len(rows[-1]) else "") for k, c in enumerate(r)]
+        if not rows:
+            row = [c or (row[k - 1] if k and r[k] is None else c) for k, c in enumerate(row)]
+        if any(row):
+            rows.append(row)
+    keep = [k for k in range(len(rows[0])) if any(r[k] for r in rows)] if rows else []
+    return [[r[k] for k in keep] for r in rows]
+
+
+def _header_rows(rows: list[list[str]], raw: list[list[str | None]]) -> int:
+    """1, or 2 when the first row has merged/empty cells over a second row of labels without numbers (two-row header)."""
+    if len(rows) >= 3 and (None in raw[0] or "" in raw[0]) and all(c and not re.search(r"\d", c) for c in rows[1]):
+        return 2
+    return 1
+
+
+def _md_table(header: list[str], body: list[list[str]]) -> list[str]:
+    header = [h or f"Spalte {k + 1}" for k, h in enumerate(header)]
+    return ["", "| " + " | ".join(header) + " |", "|" + "---|" * len(header)] + ["| " + " | ".join(r) + " |" for r in body] + [""]
+
+
+def _plumber_pages(data: bytes, pypdf_pages: list[Any]) -> list[str]:
+    import pdfplumber
+
+    out: list[str] = []
+    prev: dict[str, Any] | None = None  # last table of the previous page: header + column x positions
+    with pdfplumber.open(io.BytesIO(data)) as pdf:
+        for n, page in enumerate(pdf.pages[: len(pypdf_pages)]):
+            tables = []
+            for t in sorted(page.find_tables(LINES), key=lambda t: t.bbox[1]):
+                raw = t.extract()
+                rows = _table_rows(raw)
+                if len(rows) < 2 or len(rows[0]) < 2:
+                    continue  # a single ruled box (callout) is running text
+                cols = [round(c[0]) for c in t.rows[0].cells if c is not None]
+                tables.append((t.bbox, rows, raw, cols))
+            if not tables:
+                runs = _column_runs(page)
+                out.append(_columns_text(page, runs) if runs else _pdf_page_text(pypdf_pages[n]))
+                prev = None
+                continue
+            parts: list[str] = []
+            top = 0.0
+            for k, (bbox, rows, raw, cols) in enumerate(tables):
+                above = _band_text(page, top, bbox[1])
+                if above.strip():
+                    parts.append(above)
+                first_on_page = k == 0 and len([ln for ln in above.splitlines() if ln.strip()]) <= 1
+                if prev and first_on_page and len(rows[0]) == len(prev["header"]) and \
+                        all(abs(a - b) <= 3 for a, b in zip(cols, prev["cols"])) and len(cols) == len(prev["cols"]):
+                    header, body = prev["header"], rows[1:] if rows[0] == prev["header"] else rows  # continued table
+                else:
+                    h = _header_rows(rows, raw)
+                    header = rows[0] if h == 1 else [_join_cell(a, b) if a != b else a for a, b in zip(rows[0], rows[1])]
+                    body = rows[h:]
+                if body:
+                    parts += _md_table(header, body)
+                prev = {"header": header, "cols": cols}
+                top = bbox[3]
+            below = _band_text(page, top, page.height)
+            if below.strip():
+                parts.append(below)
+                prev = None  # running text after the table: the next page's table is a new one
+            out.append("\n".join(parts))
+    return out
+
+
+def _lines(words: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
+    lines: list[list[dict[str, Any]]] = []
+    for w in sorted(words, key=lambda w: (round(w["top"]), w["x0"])):
+        if lines and abs(w["top"] - lines[-1][0]["top"]) <= 3:
+            lines[-1].append(w)
+        else:
+            lines.append([w])
+    return lines
+
+
+def _column_runs(page: Any) -> list[tuple[float, float, float]]:
+    """Two-column regions (class: two-column pages whose lines run into each other in the layout text) → [(top, bottom,
+    gutter x)]: ≥ 6 consecutive lines that leave a common vertical gap ≥ 8 pt free in the middle 30–70 % of the page,
+    each side carrying text in ≥ half of the lines with ≥ 3 words per line (prose; the columns' lines need not be at the
+    same height). Borderless tables have short cells and stay with the layout path."""
+    width = float(page.width)
+    grid = [x for x in range(int(0.3 * width), int(0.7 * width), 2)]
+    runs: list[tuple[float, float, float]] = []
+    cur: list[list[dict[str, Any]]] = []
+    free: set[int] = set()
+
+    def close() -> None:
+        if len(cur) < 6 or not free:
+            return
+        xs = sorted(free)
+        best, start = (0, 0), xs[0]
+        for a, b in zip(xs, xs[1:] + [None]):
+            if b != a + 2:
+                if a - start > best[1] - best[0]:
+                    best = (start, a)
+                start = b if b is not None else a
+        if best[1] - best[0] < 8:
+            return
+        g = (best[0] + best[1]) / 2
+        left = [sum(1 for w in ln if w["x1"] <= g) for ln in cur]
+        right = [sum(1 for w in ln if w["x0"] >= g) for ln in cur]
+        l_lines, r_lines = [a for a in left if a], [b for b in right if b]
+        if len(l_lines) >= 0.5 * len(cur) and len(r_lines) >= 0.5 * len(cur) and \
+                sum(l_lines) / len(l_lines) >= 3 and sum(r_lines) / len(r_lines) >= 3:
+            runs.append((min(w["top"] for w in cur[0]) - 1, max(w["bottom"] for w in cur[-1]) + 1, g))
+
+    last_free: set[int] = set()
+    for ln in _lines(page.extract_words()):
+        line_free = {x for x in grid if not any(w["x0"] - 4 < x < w["x1"] + 4 for w in ln)}
+        if cur and free & line_free:
+            cur.append(ln)
+            free &= line_free
+        else:
+            close()
+            # the previous line may open the next region (a column heading line right after full-width text)
+            cur, free = ([cur[-1], ln], last_free & line_free) if cur and last_free & line_free else ([ln], line_free)
+        last_free = line_free
+    close()
+    return runs
+
+
+def _columns_text(page: Any, runs: list[tuple[float, float, float]]) -> str:
+    """Page with two-column regions: full-width text above/between/below, each region left column then right column."""
+    parts: list[str] = []
+    top = 0.0
+    for r_top, r_bottom, g in runs:
+        for t in (_band_text(page, top, r_top), _band_text(page, r_top, r_bottom, 0, g), _band_text(page, r_top, r_bottom, g, None)):
+            if t.strip():
+                parts.append(t)
+        top = r_bottom
+    rest = _band_text(page, top, page.height)
+    if rest.strip():
+        parts.append(rest)
+    return "\n\n".join(parts)
+
+
+def _band_text(page: Any, top: float, bottom: float, left: float = 0.0, right: float | None = None) -> str:
+    """Text of a horizontal band as layout text for _layout_md: words placed at column x / median character width (a gap
+    below 0.6 × font height is one space), lines by word top (± 3 pt), a blank line where the gap exceeds 1.5 × the usual
+    line pitch (paragraph break), as in pypdf's layout mode."""
+    if bottom - top < 1:
+        return ""
+    band = page.crop((left, max(0.0, top), page.width if right is None else right, min(page.height, bottom)))
+    words = band.extract_words()
+    if not words:
+        return ""
+    widths = sorted((c["x1"] - c["x0"]) for c in page.chars if c.get("text", " ").strip()) or [5.0]
+    xd = max(widths[len(widths) // 2], 1.0)
+    lines = _lines(words)
+    tops = [ln[0]["top"] for ln in lines]
+    gaps = sorted(b - a for a, b in zip(tops, tops[1:]) if b - a > 0)
+    pitch = gaps[len(gaps) // 2] if gaps else 12.0
+    raw: list[str] = []
+    for n, ln in enumerate(lines):
+        if n and tops[n] - tops[n - 1] > 1.5 * pitch:
+            raw.append("")
+        text, last = "", None
+        for w in sorted(ln, key=lambda w: w["x0"]):
+            if last is not None and w["x0"] - last["x1"] < 0.6 * (w["bottom"] - w["top"]):
+                text += " " + w["text"]  # word gap (larger fonts have wider spaces): one space, never a column gap
+            else:
+                col = round((w["x0"] - left) / xd)
+                text = text.ljust(max(col, len(text) + 1) if text else col) + w["text"]
+            last = w
+        raw.append(text)
+    return _layout_md("\n".join(raw))
 
 
 def _docx_paragraph_line(p: Any) -> str:

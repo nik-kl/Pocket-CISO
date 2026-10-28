@@ -7,7 +7,7 @@ from typing import Any
 
 from .verify import entities, modal_classes, numeric_terms
 from ..search.lexical import KeyTerm, QueryTerms, RoleView, coverage
-from ..search.normalize import FREQ_WORDS, INSTRUCTION_RE, _LEX, fold, norm
+from ..search.normalize import FREQ_WORDS, INSTRUCTION_RE, R_STOP, _LEX, _edit_distance, cistem, fold, norm
 
 
 NO_ANSWER = "Keine belegbare Antwort im freigegebenen Bestand."
@@ -53,6 +53,21 @@ PROHIBITION_RE = re.compile(r"\b(?:untersagt\w*|verbot\w*|unzulassig\w*|prohibit
 ANAPHOR = re.compile(r"^(?:er|sie|es|dies\w*|dabei|dazu|hierbei|this|these|it|they|he|she)\b", re.I)
 
 
+def fix_function_words(question: str, view: RoleView) -> str:
+    """Folded question with typos of function/question words corrected for the question-type rules ('wie lnage' → 'wie
+    lange'): a word unknown to the role's corpus within one edit of a stop word of similar length (same rule key_terms
+    uses to drop such typos from the search terms)."""
+    out = []
+    for w in fold(question).split():
+        core = re.sub(r"\W", "", w)
+        if len(core) >= 4 and core not in R_STOP and cistem(core) not in view.df:
+            fix = next((s for s in sorted(R_STOP) if len(s) >= 4 and abs(len(s) - len(core)) <= 1 and _edit_distance(core, s, 1) <= 1), None)
+            if fix:
+                w = w.replace(core, fix)
+        out.append(w)
+    return " ".join(out)
+
+
 @dataclass
 class Part:
     text: str
@@ -70,6 +85,8 @@ class Part:
     contradiction: list[tuple[list[tuple[int, int]], dict[str, set[float]]]] | None = None
     coverage: float = 0.0
     answered: bool = False
+    flag_text: str = ""  # folded question with function-word typos fixed (question-type rules)
+    shown: list[list[tuple[int, int]]] = field(default_factory=list)  # spans shown per window (answered parts)
     reason: str = ""
 
 
@@ -143,7 +160,7 @@ def dense_window(idx: "LexIndex", view: RoleView, part: Part, dense: dict[int, f
     or the whole chunk when it has ≤ 2 spans and none shares one; must pass window_ok (value/role present)."""
     if not dense:
         return None
-    i = min(dense, key=lambda j: (-dense[j], idx.chunks[j]["id"]))
+    i = min(dense, key=lambda j: (-dense[j], j))
     if dense[i] < DENSE_GATE:
         return None
     ks = [k for k in range(len(idx.span_text[i])) if not idx.span_instr[i][k]]
@@ -156,10 +173,10 @@ def fact_chunks(idx: "LexIndex", view: RoleView, part: Part, limit: int = 6) -> 
     """Exact fact lookup for value questions: spans that carry an extracted fact (table cell, value sentence), ranked by
     key-term coverage over the whole allowed corpus — independent of the fused top-k."""
     allowed = set(view.allowed)
-    scored = sorted((-coverage(part.qt, idx.span_terms[i][k], idx.ctx_terms[i]), idx.span_ids[i][k], i)
+    scored = sorted((-coverage(part.qt, idx.span_terms[i][k], idx.ctx_terms[i]), i, k)
                     for (i, k) in idx.facts_by_span if i in allowed and not idx.span_instr[i][k])
     out: list[int] = []
-    for _, _, i in scored:
+    for _, i, _ in scored:
         if i not in out:
             out.append(i)
         if len(out) >= limit:
@@ -189,7 +206,7 @@ def select_windows(idx: "LexIndex", view: RoleView, part: Part, ranked: list[int
         normative = 0.08 if part.norm and (modal_classes(text) or PROHIBITION_RE.search(text)) else 0.0
         # coverage first (+ small bonuses: better fused rank, normative sentence for yes/no questions), then shorter
         # window, rank, span id (deterministic)
-        return (-(cov + 0.1 / (1 + rank) + normative), -cov, len(w), rank, idx.span_ids[w[-1][0]][w[-1][1]])
+        return (-(cov + 0.1 / (1 + rank) + normative), -cov, len(w), rank, w[-1])
 
     scored = []
     for w in cands:
@@ -238,3 +255,91 @@ def select_windows(idx: "LexIndex", view: RoleView, part: Part, ranked: list[int
             got = got | window_terms(idx, w)
     part.windows = chosen
     part.coverage = max(base, coverage(part.qt, got, idx.ctx_terms[first[-1][0]]))
+
+
+# Definition questions (class a): "was heißt/bedeutet X", "wofür steht X", "what does X stand for/mean". A span that spells
+# the term out — "Langform (X)", "X (Langform)" or a table row with X as a cell next to a cell of several words (glossary
+# table) — answers the question deterministically; the phrasing still goes through the verifier.
+DEF_Q = re.compile(r"\b(?:was (?:heisst|bedeutet|meint)|wofur steht|was steht\b.*\bfur|bedeutung (?:von|der|des)|abkurzung|ausgeschrieben|"
+                   r"langform|what does\b.*\b(?:stand for|mean)|what is meant by|meaning of|stands? for|abbreviation|full form)\b")
+TERM_RE = re.compile(r"[„\"'‚]([^“\"'‘]{2,40})[“\"'‘]|\b([A-ZÄÖÜ][A-Za-z0-9ÄÖÜäöü]*[A-Z0-9][A-Za-z0-9]*(?:-[A-Za-z0-9]+)*)\b")
+
+
+def definition_term(question: str) -> str | None:
+    """The asked term of a definition question: a quoted term, else an acronym-like word (≥ 2 capitals, e.g. ISMS, NIS-2)."""
+    if not DEF_Q.search(fold(question)):
+        return None
+    for m in TERM_RE.finditer(question):
+        term = m.group(1) or m.group(2)
+        if m.group(1) or sum(ch.isupper() for ch in term) >= 2:
+            return term.strip()
+    return None
+
+
+def _spells(long_form: str, term: str) -> bool:
+    """An abbreviation's letters occur in order in the long form, starting at the first letter of one of its last words
+    ('Recovery Time Objective' → RTO, 'Informationssicherheitsmanagementsystem' → ISMS); other terms: any long form."""
+    letters = [ch for ch in fold(term) if ch.isalnum()]
+    if sum(ch.isupper() for ch in term) < 2:
+        return True
+    words = long_form.split()
+    for start in range(len(words) - 1, -1, -1):
+        cand, pos = fold(" ".join(words[start:])), 0
+        if not cand.startswith(letters[0]):
+            continue
+        for ch in letters:
+            pos = cand.find(ch, pos) + 1
+            if not pos:
+                break
+        else:
+            return True
+    return False
+
+
+def defines(span: str, term: str) -> bool:
+    """Does the span spell out `term`? 'Recovery Time Objective (RTO)', 'RTO (Recovery Time Objective)', or a table row
+    'Kürzel: RTO | Bedeutung: Recovery Time Objective'."""
+    t = re.escape(term)
+    long_form = r"([A-Za-zÄÖÜäöüß][\w&-]*(?:[ -][\w&-]+){0,7})"
+    for m in re.finditer(long_form + r"\s*\(\s*" + t + r"\s*\)", span):
+        if _spells(m.group(1), term):
+            return True
+    for m in re.finditer(r"\b" + t + r"\s*\(\s*" + long_form + r"\s*\)", span):
+        if len(m.group(1)) >= 6 and _spells(m.group(1), term):
+            return True
+    if span.startswith("Tabelle ["):
+        cells = [c.split(": ", 1)[-1].strip(" .") for c in span.split(": ", 1)[-1].split(" | ")]
+        return any(fold(c) == fold(term) for c in cells) and any(len(c.split()) >= 2 and fold(term) not in fold(c) for c in cells)
+    return False
+
+
+GLOSSARY_SECTION = re.compile(r"glossar|begriff|abkurzung|definition|glossary|abbreviation|terms|terminolog")
+# "X ist ein/eine/der …", "X bezeichnet …", "X stands for …": a defining sentence that explains, not a passing mention
+EXPLAINS = r"(?:\s*\([^)]*\))?\s+(?:bezeichnet|bedeutet|meint|steht fur|umfasst|is defined as|means|refers to|stands for|denotes|describes|" \
+           r"(?:ist|sind|is|are)\s+(?:ein|eine|einer|der|die|das|a|an|the)\b)\s+\S+(?:\s+\S+){2,}"
+
+
+def definition_rank(idx: "LexIndex", i: int, k: int, term: str) -> int | None:
+    """0 = defines and explains the term (glossary table row, span in a glossary/abbreviation section, 'X ist ein …'),
+    1 = spells it out in passing ('… die Langform (X) …'), None = no definition."""
+    text = idx.span_text[i][k]
+    explains = bool(re.search(r"\b" + re.escape(fold(term)) + EXPLAINS, fold(text)))
+    if not (explains or defines(text, term)):
+        return None
+    glossary = text.startswith("Tabelle [") or bool(GLOSSARY_SECTION.search(fold(idx.chunks[i]["section"])))
+    return 0 if explains or glossary else 1
+
+
+def definition_window(idx: "LexIndex", view: RoleView, ranked: list[int], term: str) -> list[tuple[int, int]] | None:
+    """Best span for a definition question: an explaining definition anywhere in the role's allowed chunks before a
+    passing mention; within a rank, fused order first, then the stable chunk order. A passing mention is used only when
+    nothing explains the term."""
+    folded = fold(term)
+    rest = [i for i in view.allowed if i not in ranked and folded in fold(idx.chunks[i]["content"])]
+    best: tuple[int, int, tuple[int, int]] | None = None
+    for n, i in enumerate(list(ranked) + sorted(rest)):
+        for k in range(len(idx.span_text[i])):
+            r = None if idx.span_instr[i][k] else definition_rank(idx, i, k, term)
+            if r is not None and (best is None or (r, n) < best[:2]):
+                best = (r, n, (i, k))
+    return [best[2]] if best else None

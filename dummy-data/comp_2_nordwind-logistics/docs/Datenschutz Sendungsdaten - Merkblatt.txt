@@ -1,0 +1,48 @@
+MERKBLATT DATENSCHUTZ – UMGANG MIT SENDUNGSDATEN
+================================================
+Nordwind Logistics GmbH | Datenschutzbeauftragte: Mag.a Julia Wimmer | datenschutz@nordwind-logistics.example
+Stand: 01/2025 | gilt für: Disposition, Kundenservice, Lager, Fahrerinnen und Fahrer (eigene und Subunternehmer)
+
+
+Sendungsdaten sind alle Informationen, die wir zur Abholung, Lagerung und Zustellung einer Sendung verarbeiten – also Name und Adresse von Absender und Empfänger, Telefonnummer und E-Mail-Adresse für die Avisierung, Zustellzeitfenster, Abstellgenehmigungen, Zustellnachweise (Unterschrift, Foto) und Sonderhinweise wie „Schlüssel bei Nachbarin Top 4". Viele dieser Daten sind personenbezogen im Sinne der DSGVO, und sie sind nach unserer Klassifizierung mindestens VERTRAULICH. Wir verwenden sie ausschließlich für die Abwicklung des Auftrags, die Avisierung, die Bearbeitung von Reklamationen und zur Erfüllung gesetzlicher Pflichten (z. B. Zoll, Abrechnung). Eine Nutzung für Werbung oder eine Weitergabe an Dritte, die nicht an der Zustellung beteiligt sind, ist nicht erlaubt.
+
+Zugriff auf Sendungsdaten im TMS haben nur Disposition, Kundenservice und Abrechnung, jeweils im notwendigen Umfang. Fahrerinnen und Fahrer sehen in der Fahrer-App NordDrive nur die Sendungen der eigenen Tour; die Daten werden 24 Stunden nach Tourabschluss automatisch vom Tablet entfernt. Empfänger-Telefonnummern dürfen nicht auf privaten Mobiltelefonen gespeichert werden – Anrufe erfolgen ausschließlich über die Anruffunktion in NordDrive (Rufnummernmaskierung). Auch das Abfotografieren von Ladelisten oder Bildschirmen mit dem Privathandy ist verboten.
+
+Papier-Ladelisten und ausgedruckte Tourlisten werden nach Tourende in der Niederlassung in die verschlossenen Datenschutzbehälter (Aktenvernichtung) eingeworfen – nicht in den Altpapiercontainer und nicht im Fahrzeug liegen lassen. Bei Zustellfotos (Abstellgenehmigung) werden nur die Sendung und der Abstellort fotografiert; Personen, Kfz-Kennzeichen und Briefkastenbeschriftungen dürfen nicht im Bild sein.
+
+Die Positionsdaten der Fahrzeuge (GPS über die Telematikbox) werden für Disposition, Sendungsverfolgung und Diebstahlschutz verwendet. Eine Auswertung zur individuellen Leistungs- oder Verhaltenskontrolle von Fahrerinnen und Fahrern ist nur im Rahmen der Betriebsvereinbarung „Telematik" zulässig.
+
+
+AUFBEWAHRUNG UND LÖSCHUNG
+
+Datenart                                    | Aufbewahrung / Löschung
+--------------------------------------------+------------------------------------------------
+Sendungsdaten im TMS (Empfänger, Adresse)   | 6 Monate nach Zustellung, danach pseudonymisiert
+Zustellnachweis (Unterschrift, Foto)        | 3 Jahre ab Zustellung
+Avisierungs-Logs (E-Mail/SMS)               | 90 Tage
+GPS-Positionsdaten Fahrzeuge (Telematik)    | 90 Tage
+Reklamations- und Schadensfälle             | 3 Jahre nach Abschluss des Falls
+Abrechnungsrelevante Daten (Rechnungen)     | gesetzliche Frist des jeweiligen Landes (AT: 7 Jahre)
+Sendungsdaten auf dem Fahrzeug-Tablet       | 24 Stunden nach Tourabschluss
+Papier-Ladelisten                           | Vernichtung am Tag des Tourabschlusses
+
+
+WAS TUN, WENN ...
+
+1) ... ein Empfänger Auskunft über seine gespeicherten Daten verlangt?
+   Nicht selbst beantworten! Anfrage an die Datenschutzbeauftragte weiterleiten (datenschutz@nordwind-logistics.example). Die Auskunft muss innerhalb eines Monats erteilt werden (Art. 15 DSGVO).
+
+2) ... eine Ladeliste verloren geht, eine Sendung an den falschen Empfänger geht oder ein Tablet gestohlen wird?
+   Sofort den IT-Servicedesk (4444) bzw. – als Fahrer – die Disposition informieren. Die DSB prüft, ob eine Meldung an die Datenschutzbehörde innerhalb von 72 Stunden erforderlich ist.
+
+3) ... die Polizei oder eine andere Behörde telefonisch Auskunft über eine Sendung oder einen Empfänger möchte?
+   Keine telefonische Auskunft. Um eine schriftliche Anfrage bitten und diese an die DSB weiterleiten.
+
+4) ... ein Kunde uns Empfängerlisten unverschlüsselt per E-Mail schickt?
+   Daten verarbeiten, aber den zuständigen Key Account informieren, damit künftig der sichere Datenaustausch (SFTP / Kundenportal) genutzt wird.
+
+5) ... ein Empfänger möchte, dass seine Telefonnummer gelöscht wird?
+   Anfrage an den Kundenservice; dieser löscht die Nummer im TMS, sofern die Sendung zugestellt ist.
+
+
+Fragen? Datenschutzbeauftragte, Mag.a Julia Wimmer, Durchwahl 4180

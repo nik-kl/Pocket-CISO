@@ -19,6 +19,23 @@ export const STOP = new Set(
     "a an and are as at be been being but by can does for from have how i if in is it may my of on or our the their them these they this to us was we what who with").split(" ")
 );
 
+// Instruction-like text (prompt injection) is never shown — same patterns as INSTRUCTION_RE in engine/search/normalize.py,
+// matched on the folded sentence; an injection continues to the end of its chunk, so the hit shows only the text before it.
+const INSTRUCTION = new RegExp(
+  "(\\bignor\\w*\\s+(?:alle\\w*|all|any|the|previous|prior|vorherig\\w*|bisherig\\w*|obig\\w*)\\b|\\bvergiss\\s+(?:alle\\w*|die|deine|your)\\b" +
+    "|\\bforget\\s+(?:all|everything|your|the)\\b|system\\s*-?\\s*prompt|^\\s*system\\s*:|\\bdu bist (?:jetzt|nun|ab sofort)\\b|\\byou are now\\b" +
+    "|\\b(?:antworte|answer|respond|reply)\\w*\\b.{0,40}\\b(?:nur|only|ausschliesslich|exclusively|everything|alles|jede\\w*|every)\\b" +
+    "|\\bact as\\b|\\bpretend\\b|\\bassistenzsystem\\w*|\\bjailbreak\\b" +
+    "|\\b\\w*(?:hinweis|anweisung|instruktion|instruction|message|note|notice)\\w*\\s+(?:fur|for|an|to)\\s+(?:alle\\s+|all\\s+)?(?:ki|ai|chatbot|sprachmodell|language model|llm)" +
+    "|\\b(?:beende|beendet|end|finish|schliess\\w*)\\s+(?:jede|jeder|each|every|all|deine|your)\\w*\\s+(?:antwort|answer|response|reply)\\w*)",
+  "i"
+);
+export function withoutInjection(content: string): string {
+  const sentences = content.split(/(?<=[.!?])\s+/);
+  const cut = sentences.findIndex((x) => INSTRUCTION.test(norm(x)));
+  return (cut < 0 ? sentences : sentences.slice(0, cut)).join(" ").trim();
+}
+
 // General domain glossary shared with the Python engine (engine/glossary.json): German/English pairs and abbreviations.
 // Each single-word member expands to the other single-word members of its group (no question-specific hints).
 let glossaryCache: Map<string, string[]> | null = null;
@@ -96,12 +113,12 @@ export function runQuery(token: string | null, question: string): Promise<R<{ re
     if (best && best.cov >= coverageThreshold) {
       // 4 — search hits only: this engine never composes an answer (the Python engine does, with a verifier)
       const t4 = performance.now();
-      const top = accessible.filter((s) => s.cov >= coverageThreshold && s.cov >= best.cov - 0.15).slice(0, 3);
+      const top = accessible.filter((s) => s.cov >= coverageThreshold && s.cov >= best.cov - 0.15 && withoutInjection(s.c.content)).slice(0, 3);
       const segments: AnswerSegment[] = [{ type: "text", text: `${SEARCH_LABEL}:` }];
       const citations: Record<string, LiveChunk> = {};
       const scores: Record<string, number> = {};
       // table rows as the Python engine shows them: no "Tabelle [§…]:" chunker label, "Spalte: Wert; Spalte: Wert"
-      const readable = (t: string) => t.replace(/Tabelle \[[^\]]*\]:\s*/g, "").split(" | ").join("; ");
+      const readable = (t: string) => withoutInjection(t).replace(/Tabelle \[[^\]]*\]:\s*/g, "").split(" | ").join("; ");
       top.forEach((s) => {
         segments.push({ type: "text", text: ` ${s.c.docName} ${s.c.section.split(" ")[0]}: ${readable(s.c.content)} ` }, { type: "cite", chunkId: s.c.id });
         citations[s.c.id] = s.c;

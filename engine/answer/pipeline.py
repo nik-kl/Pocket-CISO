@@ -9,9 +9,10 @@ from .compose import CONTRADICTION_LABEL, compose_sentences, display_span, relat
 from .contradictions import find_contradiction
 from .gate import (
     GATE_COVERAGE, GATE_MISSING, NORM_Q, NO_ANSWER, Part, SEARCH_LABEL, UNCONFIRMED_LABEL, VALUE_Q,
-    WHO_Q, dense_window, fact_chunks, question_parts, select_windows, window_ok, window_terms,
+    WHO_Q, definition_term, fix_function_words, definition_window, dense_window, fact_chunks, question_parts, select_windows, window_ok, window_terms,
 )
 from .judge import judge_answerable
+from .verify import has_value, value_dim
 from ..config import ApiError, ROLE_RANK
 from ..llm import OLLAMA, engine_label
 from ..search.dense import dense_scores, diversify, fuse
@@ -32,7 +33,7 @@ def _restricted_match(db: dict[str, Any], role: str, question: str) -> dict[str,
         return None
     qt = key_terms(question, full)
     bm = {i: s for i, s in full.bm25(qt.weights).items() if i in restricted}
-    for i in sorted(bm, key=lambda i: (-bm[i], idx.chunks[i]["id"]))[:3]:
+    for i in sorted(bm, key=lambda i: (-bm[i], i))[:3]:
         if coverage(qt, frozenset(idx.doc_terms[i]), idx.ctx_terms[i]) >= GATE_COVERAGE:
             return idx.chunks[i]
     return None
@@ -67,8 +68,8 @@ def run_query(token: str | None, question: str) -> dict[str, Any]:
     candidate_docs: list[str] = []
     for ptext in texts:
         qt = key_terms(ptext, view)
-        f = fold(ptext)
-        part = Part(ptext, qt, bool(VALUE_Q.search(f) or qt.unit_cues), bool(WHO_Q.search(f)), [], bool(NORM_Q.search(f)))
+        f = fix_function_words(ptext, view)
+        part = Part(ptext, qt, bool(VALUE_Q.search(f) or qt.unit_cues), bool(WHO_Q.search(f)), [], bool(NORM_Q.search(f)), flag_text=f)
         if not qt.keys or not view.n:
             part.reason = "keine Suchbegriffe" if view.n else "keine Fundstelle"
             parts.append(part)
@@ -135,6 +136,35 @@ def run_query(token: str | None, question: str) -> dict[str, Any]:
                 p.windows, p.answered, p.reason = ws, True, ""
                 p.coverage = max(p.coverage, coverage(p.qt, frozenset().union(*(window_terms(idx, w) for w in ws))))
                 p.features = {**(p.features or {}), "pool": True}
+    # definition questions (class a): a span spelling out the asked term ("Langform (X)", glossary table row) is the answer
+    # even when the judge said NEIN; LLM mode only — without LLM every mode returns search hits
+    if use_llm:
+        for p in parts:
+            term = None if p.answered or p.contradiction else definition_term(p.text)
+            w = definition_window(idx, view, p.ranked, term) if term else None
+            if w:
+                p.windows, p.answered, p.reason = [w], True, ""
+                p.features = {**(p.features or {}), "definition": term}
+    # value questions: the shown spans must carry a value of the asked dimension (duration, count, deadline, frequency). The
+    # value sentence of a confirmed window can be dropped by related_spans (its key term already in the section title) →
+    # it is added back; a confirmed window without such a value is no answer to a value question → search hit / note.
+    for p in parts:
+        if not p.answered:
+            continue
+        p.shown = [related_spans(idx, p, w) for w in p.windows]
+        if not p.value:
+            continue
+        dim = value_dim(p.flag_text or p.text)
+        if any(has_value(dim, idx.span_text[i][k]) for ws in p.shown for i, k in ws):
+            continue
+        add = next(((n, x) for n, w in enumerate(p.windows) for x in reversed(w) if has_value(dim, idx.span_text[x[0]][x[1]])), None)
+        if add:
+            n, x = add
+            p.shown[n] = [y for y in p.windows[n] if y in p.shown[n] or y == x]
+            p.features = {**(p.features or {}), "valueSpan": "added"}
+        else:
+            p.answered, p.reason = False, f"kein Wert der gefragten Art ({dim})"
+            p.features = {**(p.features or {}), "valueSpan": "missing"}
     lat["retrieval"] = int((time.perf_counter() - t) * 1000)
 
     label = engine_label()
@@ -201,12 +231,15 @@ def run_query(token: str | None, question: str) -> dict[str, Any]:
     t = time.perf_counter()
     ordered: list[tuple[str, str]] = []
     for p in answered:
-        for w in p.windows:
-            for i, k in related_spans(idx, p, w):
+        for ws in p.shown:
+            for i, k in ws:
                 sid = idx.span_ids[i][k]
                 if sid not in dict(ordered):
                     ordered.append((sid, idx.span_text[i][k]))
     sentences, answer_by = compose_sentences(q, ordered, view.vocab, use_llm)
+    said = " ".join(s.text for s in sentences)
+    if any(p.value and not has_value(value_dim(p.flag_text or p.text), said) for p in answered):  # phrasing dropped the value → verbatim spans
+        sentences, answer_by = compose_sentences(q, ordered, view.vocab, False)[0], "verbatim (Wert fehlte in der Formulierung)"
     lat["generation"] = int((time.perf_counter() - t) * 1000)
 
     span_chunk = {idx.span_ids[i][k]: i for i in range(len(idx.chunks)) for k in range(len(idx.span_ids[i]))}
@@ -218,7 +251,7 @@ def run_query(token: str | None, question: str) -> dict[str, Any]:
     unanswered = [p for p in parts if not p.answered]
     for p in unanswered:  # after a pool check the cited spans may touch the point: no claim that nothing exists
         segments.append({"type": "note", "text": f"Zu „{p.text}“ wurde keine Aussage als Antwort bestätigt; bitte die zitierten Stellen prüfen."
-                         if p.pooled else f"Zu „{p.text}“ enthält der freigegebene Bestand keine belegbare Aussage."})
+                         if p.pooled or (p.features or {}).get("valueSpan") else f"Zu „{p.text}“ enthält der freigegebene Bestand keine belegbare Aussage."})
     cited_chunks = list(dict.fromkeys(s["chunkId"] for s in segments if s["type"] == "cite"))
     by_id = {c["id"]: c for c in idx.chunks}
     spans_out = {sid: {"chunkId": idx.chunks[span_chunk[sid]]["id"], "text": text} for sid, text in ordered}

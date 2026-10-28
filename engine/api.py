@@ -97,7 +97,7 @@ def service_status() -> dict:
     return {
         "ok": True, "status": "ok", "service": "pocket-ciso-rag", "version": rag.VERSION, "python": True,
         "dbReady": db is not None,
-        "ollama": {"connected": names is not None, "baseUrl": OLLAMA_BASE_URL, "llmModel": rag.OLLAMA.llm_model(), "embedModel": rag.OLLAMA.embed_model(), "models": names or []},
+        "ollama": {"connected": names is not None, "baseUrl": OLLAMA_BASE_URL, "llmModel": rag.OLLAMA.llm_model(), "judgeModel": rag.OLLAMA.judge_model(), "embedModel": rag.OLLAMA.embed_model(), "models": names or []},
         "engineMode": rag.engine_label(), "vectorCount": rag.VECTORS.count(), "vectorEngine": rag.VECTORS.engine,
         "autoSync": AUTO_SYNC, "autoSyncSeconds": AUTO_SYNC_SECONDS if AUTO_SYNC else None,
         "liveChunks": len(db["live_chunks"]) if db else 0, "pendingDiffs": sum(1 for d in db["staged_diffs"] if d["status"] == "pending") if db else 0,

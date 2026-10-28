@@ -100,5 +100,5 @@ def find_contradiction(idx: "LexIndex", view: RoleView, part: "Part", ranked: li
             per_doc[doc] = (cov, w, vals)
     if not per_doc:
         return []
-    others = sorted(per_doc.values(), key=lambda x: (-x[0], idx.span_ids[x[1][-1][0]][x[1][-1][1]]))[:4]
+    others = sorted(per_doc.values(), key=lambda x: (-x[0], x[1][-1]))[:4]
     return [(best, best_vals)] + [(w, v) for _, w, v in others]

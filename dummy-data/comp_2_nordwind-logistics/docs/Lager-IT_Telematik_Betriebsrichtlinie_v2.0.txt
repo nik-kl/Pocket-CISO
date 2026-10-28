@@ -1,0 +1,105 @@
+NORDWIND LOGISTICS GMBH
+BETRIEBSRICHTLINIE LAGER-IT UND TELEMATIK
+Version 2.0 - Stand 2025-03-03 - Owner: IT-Betrieb (S. Hofbauer) / Fuhrpark & Telematik (J. Haslinger)
+Klassifizierung: INTERN
+---------------------------------------------------------------------------------------------
+
+
+1. ZWECK UND GELTUNGSBEREICH
+
+Diese Betriebsrichtlinie regelt den sicheren Betrieb der Lager-IT (WMS, Hallen-WLAN, MDE, Staplerterminals,
+Etikettendruck, Foerdertechnik) und der Telematik (Telematikboxen, Plattform TeleNord, Fahrer-App NordDrive)
+an allen Standorten. Sie richtet sich an IT-Betrieb, Fuhrpark, Haustechnik und externe Dienstleister.
+
+
+2. SYSTEMLANDSCHAFT UND KRITIKALITAET
+
+| System               | Funktion                          | Owner            | Kritikalitaet | RTO    | Betriebszeit       |
+|----------------------|-----------------------------------|------------------|---------------|--------|--------------------|
+
+| WMS "Kranich"        | Lagerverwaltung, Kommissionierung,| G. Brandstaetter | sehr hoch     | 8 h    | 24/7               |
+|                      | Bestandsfuehrung                  |                  |               |        |                    |
+
+| TMS Routio           | Disposition, Tourenplanung,       | C. Reisinger     | hoch          | 24 h   | Mo-Sa 04:00-22:00  |
+|                      | Sendungsverfolgung                |                  |               |        |                    |
+
+| TeleNord             | Telematikplattform, Ortung,       | J. Haslinger     | mittel        | 48 h   | 24/7               |
+|                      | Backend der Fahrer-App NordDrive  |                  |               |        |                    |
+
+| Hallen-WLAN NWL-SCAN | Netz fuer MDE und Staplerterminals| IT-Betrieb       | sehr hoch     | 2 h    | 24/7               |
+
+| Foerdertechnik-SPS   | Sorter und Foerderstrecken        | Haustechnik /    | hoch          | lt.    | 24/7               |
+| (nur Linz-Hafen)     | Linz-Hafen                        | Hersteller       |               | Vertrag|                    |
+|                      |                                   |                  |               | (6 h   |                    |
+|                      |                                   |                  |               | vor    |                    |
+|                      |                                   |                  |               | Ort)   |                    |
+
+Hinweis: WMS und LVS bezeichnen dasselbe System ("Kranich", Basis Lagerix WMS 9).
+
+
+3. NETZWERKSEGMENTIERUNG
+
+  VLAN 10 - Office (Arbeitsplaetze, Drucker)
+  VLAN 30 - Lager (MDE, Staplerterminals, Etikettendrucker); kein Internetzugang
+  VLAN 40 - OT / Foerdertechnik; Zugriff nur ueber Jump-Host
+  VLAN 50 - Management (Netzwerkkomponenten, Server-Management)
+
+Zwischen den Segmenten filtert die zentrale Firewall. Die Firewall-Regeln werden halbjaehrlich durch den
+IT-Betrieb ueberprueft; nicht mehr benoetigte Regeln werden entfernt.
+
+
+4. TELEMATIK
+
+4.1 In allen eigenen Lkw (ca. 380 Fahrzeuge) ist eine Telematikbox (OBU) vom Typ TBX-3 verbaut. Die
+    Kommunikation zur Plattform TeleNord erfolgt ueber Mobilfunk mit privatem APN und ist mit TLS 1.2
+    verschluesselt. Die SIM-Karten sind nur fuer Datenverbindungen freigeschaltet.
+4.2 Firmware-Updates der OBU werden quartalsweise "over the air" (OTA) in Abstimmung mit dem Fuhrpark
+    eingespielt.
+4.3 Positionsdaten werden waehrend der Fahrt alle 60 Sekunden uebertragen. Speicherdauer siehe Merkblatt
+    Datenschutz Sendungsdaten.
+4.4 Zugriff auf TeleNord: Disposition lesend, Fuhrpark Vollzugriff, Hersteller-Support nur ueber den
+    Jump-Host (siehe 5.).
+
+
+5. FERNWARTUNG DURCH DIENSTLEISTER
+
+- Fernwartung (Remote Maintenance) ausschliesslich ueber den Jump-Host JH-LNZ-01.
+- Anmeldung am Jump-Host nur mit MFA.
+- Alle Sitzungen werden aufgezeichnet (Session Recording); Aufbewahrung der Aufzeichnungen 90 Tage.
+- Freischaltung je Sitzung durch den IT-Betrieb auf Basis eines Tickets bzw. Change Requests.
+- Fernwartung an der Foerdertechnik zusaetzlich nur im vereinbarten Wartungsfenster und nach Abstimmung
+  mit der Haustechnik vor Ort.
+
+
+6. PATCH- UND UPDATE-MANAGEMENT
+
+  Server (WMS, TMS, TeleNord) ......... kritisch (CVSS >= 9.0): innerhalb von 7 Tagen
+                                         hoch (CVSS 7.0 - 8.9): innerhalb von 30 Tagen
+                                         sonstige: monatlicher Patchzyklus
+  Leitstand- und Lager-PCs ............ monatlich (Patchday + 1 Woche)
+  MDE / Fahrzeug-Tablets .............. ueber MDM, siehe Richtlinie Mobile Endgeraete
+  OBU-Firmware ........................ quartalsweise (OTA)
+  Foerdertechnik-SPS .................. nur durch Hersteller im Wartungsfenster
+
+
+7. CHANGE-MANAGEMENT
+
+7.1 Changes am WMS "Kranich" werden nur im Wartungsfenster Sonntag 02:00-06:00 Uhr durchgefuehrt.
+7.2 Emergency Changes benoetigen die Freigabe der IT-Leitung und werden innerhalb von 2 Arbeitstagen
+    nachdokumentiert.
+7.3 Change Freeze Weihnachtsgeschaeft: vom 15.11. bis 06.01. sind nur Emergency Changes zulaessig.
+
+
+8. MONITORING UND BEREITSCHAFT
+
+Alle Systeme aus Kapitel 2 werden 24/7 ueberwacht. Die IT-Bereitschaft ist unter +43 732 000 4400
+erreichbar. Dauert ein Ausfall des WMS laenger als 30 Minuten, informiert die IT-Bereitschaft den
+Notfallmanager.
+
+
+9. PROTOKOLLIERUNG
+
+System- und Sicherheitsprotokolle werden zentral gesammelt und 12 Monate aufbewahrt.
+
+
+--- Ende des Dokuments ---

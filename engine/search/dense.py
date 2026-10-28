@@ -50,15 +50,15 @@ def dense_scores(db: dict[str, Any], view: RoleView, texts: list[str]) -> dict[i
 
 
 def fuse(view: RoleView, *scores: dict[int, float] | None) -> list[int]:
-    """Reciprocal rank fusion (k = 60); deterministic tie-break by chunk id."""
+    """Reciprocal rank fusion (k = 60); ties broken by the stable chunk order (index position), never by the chunk id."""
     fused: dict[int, float] = defaultdict(float)
     for sc in scores:
         if not sc:
             continue
-        ranking = sorted((i for i in sc if sc[i] > 0), key=lambda i: (-sc[i], view.idx.chunks[i]["id"]))
+        ranking = sorted((i for i in sc if sc[i] > 0), key=lambda i: (-sc[i], i))
         for r, i in enumerate(ranking):
             fused[i] += 1.0 / (RRF_K + r + 1)
-    return sorted(fused, key=lambda i: (-fused[i], view.idx.chunks[i]["id"]))
+    return sorted(fused, key=lambda i: (-fused[i], i))
 
 
 CAND_K, CAND_PER_DOC = 12, 3

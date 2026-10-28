@@ -6,7 +6,7 @@ from typing import Any
 
 from .gate import ANAPHOR, Part
 from .verify import Sentence, verify_sentence
-from ..config import LLM_TIMEOUT
+from ..config import ANSWER_PHRASING, LLM_TIMEOUT
 from ..llm import OLLAMA
 from ..search.lexical import coverage
 from ..search.normalize import TABLE_LABEL, Vocab, analyze, split_sentences
@@ -64,6 +64,8 @@ def compose_sentences(q: str, spans: list[tuple[str, str]], vocab: Vocab, use_ll
     verbatim = [Sentence(display_span(t), [sid], "verbatim") for sid, t in spans]
     if not use_llm or not spans:
         return verbatim, "verbatim"
+    if not ANSWER_PHRASING:  # measurement variant: the answer is the verbatim evidence spans
+        return verbatim, "verbatim (Formulierung aus)"
     text_of = dict(spans)
     # the model keeps the 'Spalte: Wert | Spalte: Wert' row form (with '; ' it picked single cells of the wrong column)
     prompt = "Frage: " + q + "\nTextstellen:\n" + "\n".join(f"[S{k + 1}] {TABLE_LABEL.sub('', t)}" for k, (_, t) in enumerate(spans)) + "\nAntwort:"
@@ -93,10 +95,14 @@ def search_hits(idx: "LexIndex", parts: list[Part], per_part: int = 3) -> list[d
         if not ((p.lexical_ok and not p.capped_only) or p.dense_ok):
             continue
         cand = [(w[-1][0], " ".join(display_span(idx.span_text[i][k]) for i, k in related_spans(idx, p, w))) for w in p.windows]
-        for i in p.ranked:  # further chunks: only their sentences that share a key term (whole chunk when none does)
-            best = max((coverage(p.qt, terms) for terms in idx.span_terms[i]), default=0.0)
-            rel = [display_span(t) for t, terms in zip(idx.span_text[i], idx.span_terms[i]) if best > 0 and coverage(p.qt, terms) >= 0.5 * best]
-            cand.append((i, " ".join(rel) or display_span(idx.chunks[i]["content"])))
+        for i in p.ranked:  # further chunks: only their sentences that share a key term (all sentences when none does);
+            # instruction-like spans (prompt injection) are never shown, as in answers
+            ok = [k for k in range(len(idx.span_text[i])) if not idx.span_instr[i][k]]
+            best = max((coverage(p.qt, idx.span_terms[i][k]) for k in ok), default=0.0)
+            rel = [display_span(idx.span_text[i][k]) for k in ok if best > 0 and coverage(p.qt, idx.span_terms[i][k]) >= 0.5 * best]
+            text = " ".join(rel) or " ".join(display_span(idx.span_text[i][k]) for k in ok)
+            if text:
+                cand.append((i, text))
         n = 0
         for i, text in cand:
             if n >= per_part or any(h["chunkId"] == idx.chunks[i]["id"] for h in hits):
