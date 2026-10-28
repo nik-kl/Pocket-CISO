@@ -185,7 +185,8 @@ The FastAPI service exposes:
 | Endpoint | Purpose |
 |---|---|
 | `GET /health` | Backend, Ollama, model, vector, and database status |
-| `POST /query` | Stateless RBAC-filtered RAG query with citations and telemetry |
+| `POST /query-fast` | Stage 1 of a two-stage answer: verbatim search hits with a highlighted key sentence, no LLM |
+| `POST /query` | Stateless RBAC-filtered RAG query with citations and telemetry (stage 2) |
 | `POST /stage-file` | Upload or stage policy text for semantic diff and conflict scanning |
 | `POST /sync-inbox` | Scan and stage changed watched-inbox documents |
 | `POST /approve/{diff_id}` | Approve a staged diff and merge it into the live collection |
