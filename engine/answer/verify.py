@@ -134,6 +134,16 @@ def has_value(dim: str, text: str) -> bool:
     return bool(vals) or time or freq
 
 
+# Organisational units that answer a who-question without a role noun ("die Rechtsabteilung", "das Facility Management",
+# "the Works Council"): generic suffixes only, never names from a corpus. Used for the key sentence and the who-check on a judge JA.
+ORG_UNIT_RE = re.compile(r"\b[\wäöüß-]*(?:abteilung|bereich|referat|gremium|ausschuss|management|verwaltung|zentrale|dienst|stelle|"
+                         r"(?:betriebs|personal|bei|aufsichts)rat|department|division|unit|committee|board|council|center|centre)\b", re.I)
+
+
+def names_actor(text: str) -> bool:
+    return bool(entities(text) or ORG_UNIT_RE.search(text))
+
+
 # Safety checks on a judge JA (the LLM confirms spans that answer something else); general wording only, no corpus terms.
 IDENT_RE = re.compile(r"\b[A-ZÄÖÜ]{2,}s?\b|\b[A-Za-z]+\d[\w.]*\b")  # acronyms and identifiers of the question ('PINs', 'TLS1.3')
 EXCEPTION_RE = re.compile(r"\b(?:abweichend\w*|ausnahme\w*|sonderregel\w*|exception\w*|deviat\w*|notwithstanding)\b")
@@ -147,13 +157,16 @@ def _stems(text: str) -> set[str]:
 
 def span_problem(question: str, kind: str, dim: str | None, span: str, path: str) -> str | None:
     """Why one span cannot carry the answer: an acronym/identifier of the question is missing from span and outline path;
-    a glossary definition for a question that asks no definition; a table row whose asked value sits under a column
-    label unrelated to the question (value question)."""
+    a glossary definition for a question that asks no definition; a who-question without a role or organisational unit
+    in the span (as for the key sentence); a table row whose asked value sits under a column label unrelated to the
+    question (value question)."""
     if any(fold(a).rstrip("s") not in fold(span + " " + path) for a in IDENT_RE.findall(question)):
         return "Kennung fehlt"
     table = span.startswith("Tabelle [")
     if kind != "definition" and not table and GLOSSARY_LINE.search(span):
         return "Definition statt Antwort"
+    if kind == "who" and not names_actor(span):
+        return "kein Akteur"
     if kind == "value" and table:
         cells = [c.split(": ", 1) for c in TABLE_LABEL.sub("", span).split(" | ") if ": " in c]
         if not any(has_value(dim or "value", v) and _stems(question) & _stems(label) for label, v in cells):

@@ -618,3 +618,13 @@ class OpenAIBackend(unittest.TestCase):
         self.assertEqual(out, ["JA", "JA"])
         self.assertEqual(["reasoning_effort" in s for s in sent], [True, False, False])
         self.assertEqual(len(logs.records), 1)
+
+
+class WhoVeto(unittest.TestCase):
+    """Sixth safety check: a who-question needs a role or organisational unit in a confirmed span (invented example)."""
+
+    def test_who_question_needs_an_actor(self) -> None:
+        q, path = "Wer gibt den Hallenkran frei?", "Betriebsanweisung › Kran"
+        self.assertEqual(verify.judge_veto(q, "who", None, [("Der Hallenkran wird jährlich geprüft.", path)]), "kein Akteur")
+        self.assertIsNone(verify.judge_veto(q, "who", None, [("Den Hallenkran gibt die Schichtleitung frei.", path)]))
+        self.assertIsNone(verify.judge_veto(q, "who", None, [("Die Freigabe erteilt die Instandhaltungsabteilung.", path)]))
