@@ -1,8 +1,12 @@
 """Pipeline B: stateless, RBAC-filtered query → answer / labelled search hits / fallback, with trace."""
 from __future__ import annotations
 
+import copy
 import re
+import threading
 import time
+from collections import OrderedDict
+from dataclasses import dataclass
 from typing import Any
 
 from .compose import CONTRADICTION_LABEL, compose_sentences, display_span, related_spans, search_hits
@@ -12,6 +16,7 @@ from .gate import (
     WHO_Q, definition_term, fix_function_words, definition_window, dense_window, fact_chunks, question_parts, select_windows, window_ok, window_terms,
 )
 from .judge import judge_answerable
+from .keysentence import key_sentence, question_kind
 from .verify import has_value, value_dim
 from ..config import ApiError, ROLE_RANK
 from ..llm import OLLAMA, engine_label
@@ -39,30 +44,66 @@ def _restricted_match(db: dict[str, Any], role: str, question: str) -> dict[str,
     return None
 
 
-def run_query(token: str | None, question: str) -> dict[str, Any]:
-    t_all = time.perf_counter()
+@dataclass
+class Retrieval:
+    """Deterministic part of Pipeline B (no LLM): question parts, candidates, windows, lexical floor, dense path,
+    contradiction rule. Stage 1 (run_fast) shows it as search hits; stage 2 (run_query) judges it."""
+    texts: list[str]
+    context: list[str]
+    injection: bool
+    parts: list[Part]
+    dense_on: bool
+    best_dense: float
+    candidate_docs: list[str]
+    ms: int
+    cached: bool = False
+
+
+# retrieval of stage 1 reused by stage 2 of the same question: key = (corpus signature, role, question, embedding model),
+# so a merge, another role or another embedding model never hits a stale entry; LRU, deep-copied on every read
+_RET_CACHE: "OrderedDict[tuple[str, str, str, str], Retrieval]" = OrderedDict()
+_RET_LOCK = threading.Lock()
+RET_CACHE_SIZE = 64
+
+
+def reset_retrieval_cache() -> None:
+    with _RET_LOCK:
+        _RET_CACHE.clear()
+
+
+def _check_question(question: str) -> str:
     q = (question or "").strip()
     if not 3 <= len(q) <= 500:
         raise ApiError(400, "BAD_QUESTION", "Die Frage muss zwischen 3 und 500 Zeichen lang sein.")
-    lat: dict[str, int] = {}
-    db = cached_db()
-    actor = actor_for(db, token)
-    role = actor["role"]
+    return q
 
+
+def retrieve(db: dict[str, Any], idx: "LexIndex", view: "RoleView", role: str, q: str) -> Retrieval:
+    key = (idx.sig, role, q, OLLAMA.embed_model() or "")
+    with _RET_LOCK:
+        hit = _RET_CACHE.get(key)
+        if hit is not None:
+            _RET_CACHE.move_to_end(key)
+            return copy.deepcopy(hit)
+    r = _retrieve(db, idx, view, q)
+    if key[3] and not r.dense_on and r.texts and view.n:
+        return r  # embedding call failed: not cached, the next request retries the dense path
+    with _RET_LOCK:
+        _RET_CACHE[key] = copy.deepcopy(r)
+        _RET_CACHE[key].cached = True
+        while len(_RET_CACHE) > RET_CACHE_SIZE:
+            _RET_CACHE.popitem(last=False)
+    return r
+
+
+def _retrieve(db: dict[str, Any], idx: "LexIndex", view: "RoleView", q: str) -> Retrieval:
     t = time.perf_counter()
-    idx = lexical_index(db)
-    view = idx.view(role)  # RBAC pre-filter before any scoring
     texts, context, injection = question_parts(q)
-    lat["rbac"] = int((time.perf_counter() - t) * 1000)
-
-    t = time.perf_counter()
     ctx_weights: dict[str, float] = {}
     for c in context:
         for x, w in key_terms(c, view).weights.items():
             ctx_weights[x] = max(ctx_weights.get(x, 0.0), 0.3 * w)
     dense_all = dense_scores(db, view, texts) if texts and view.n else None
-    use_llm = bool(OLLAMA.llm_model())
-    ctx_note = f" (Kontext: {' '.join(context)})" if context else ""  # the judge needs the scenario to resolve "sie", "das"
     parts: list[Part] = []
     best_dense = 0.0
     candidate_docs: list[str] = []
@@ -97,17 +138,15 @@ def run_query(token: str | None, question: str) -> dict[str, Any]:
             "missingMax": round(max(unmatched, default=0.0) / total_w, 4),
         }
         part.ranked = ranked
+        part.dense_of = {i: round(dense[i], 4) for i in ranked if i in dense} if dense else {}
         part.lexical_ok = bool(part.windows) and part.coverage >= GATE_COVERAGE and part.features["missingMax"] <= GATE_MISSING
         # the floor reached only because unknown words were capped: the judge decides, but a NEIN yields no search hits
         # ("Wie ist das Wetter in Wien?" must not list policy sentences)
         raw_total = sum(k.raw_weight or k.weight for k in qt.keys)
         part.capped_only = part.lexical_ok and raw_total > total_w and (total_w - sum(unmatched)) < GATE_COVERAGE * raw_total
         if part.lexical_ok:
-            # a contradiction is reported only when the judge confirms every listed window on its own (no new false flags)
             # deterministic contradiction rule (step 4, same with and without LLM): never an answer, shown as search hits
             part.contradiction = find_contradiction(idx, view, part, ranked) or None
-            if use_llm and not part.contradiction:
-                part.features["judge"] = judge_answerable(ptext + ctx_note, [idx.span_text[i][k] for w in part.windows for i, k in w][:6])
         # dense path only below the lexical floor: a second judge call after a NEIN on the lexical window gave the 7B judge a
         # second chance to say JA and produced 2 false answers on the dev set (I-1, R-10) → never retried
         if dense and not part.lexical_ok:
@@ -115,12 +154,36 @@ def run_query(token: str | None, question: str) -> dict[str, Any]:
             if dw:
                 part.dense_ok, part.windows = True, [dw[0]]
                 part.features["densePath"] = round(dw[1], 4)
-                if use_llm:
-                    part.features["judge"] = judge_answerable(ptext + ctx_note, [idx.span_text[i][k] for i, k in dw[0]])
-        part.answered = (part.lexical_ok or part.dense_ok) and part.features.get("judge") is True and not part.contradiction
+        parts.append(part)
+    return Retrieval(texts, context, injection, parts, dense_all is not None, best_dense, candidate_docs, int((time.perf_counter() - t) * 1000))
+
+
+def run_query(token: str | None, question: str) -> dict[str, Any]:
+    t_all = time.perf_counter()
+    q = _check_question(question)
+    lat: dict[str, int] = {}
+    db = cached_db()
+    actor = actor_for(db, token)
+    role = actor["role"]
+
+    t = time.perf_counter()
+    idx = lexical_index(db)
+    view = idx.view(role)  # RBAC pre-filter before any scoring
+    lat["rbac"] = int((time.perf_counter() - t) * 1000)
+
+    t = time.perf_counter()
+    ret = retrieve(db, idx, view, role, q)
+    texts, context, injection, parts = ret.texts, ret.context, ret.injection, ret.parts
+    best_dense, candidate_docs = ret.best_dense, ret.candidate_docs
+    dense_all = {} if ret.dense_on else None
+    use_llm = bool(OLLAMA.llm_model())
+    ctx_note = f" (Kontext: {' '.join(context)})" if context else ""  # the judge needs the scenario to resolve "sie", "das"
+    for part in parts:
+        if use_llm and (part.lexical_ok and not part.contradiction or part.dense_ok):
+            part.features["judge"] = judge_answerable(part.text + ctx_note, [idx.span_text[i][k] for w in part.windows for i, k in w][:6])
+        part.answered = (part.lexical_ok or part.dense_ok) and (part.features or {}).get("judge") is True and not part.contradiction
         if not part.answered and part.windows:
             part.reason = ("Abdeckung zu gering" if not (part.lexical_ok or part.dense_ok) else "Antwortbarkeitsprüfung: nein" if use_llm else "kein LLM: nur Fundstellen")
-        parts.append(part)
     # shared evidence pool: before a part is reported as unsupported, the judge checks it against the windows already selected
     # for the answered parts (e.g. "… und wer nimmt die Anmeldung entgegen?" answered by the cited registration sentence),
     # so the answer never cites a sentence and calls the same point unsupported
@@ -172,6 +235,7 @@ def run_query(token: str | None, question: str) -> dict[str, Any]:
         "original": q, "rewrite": " | ".join(texts) if texts else q, "rbacFilter": f"min_role <= {role}", "searched": view.n, "total": len(idx.chunks),
         "nliVerified": False, "temperature": 0.0, "confidence": 0.0, "topScore": 0.0, "latencyMs": lat, "engineMode": label,
         "rewriteBy": "rules (Teilfragen)", "answerBy": "none", "injectionRemoved": injection, "candidateDocs": list(dict.fromkeys(candidate_docs)),
+        "retrievalCached": ret.cached,
         "parts": [{"text": p.text, "answered": p.answered, "coverage": round(p.coverage, 3), "value": p.value, "who": p.who, "reason": p.reason,
                    "features": p.features} for p in parts],
         "denseTop": round(best_dense, 3) if dense_all is not None else None, "contradiction": False, "partial": False,
@@ -264,3 +328,92 @@ def run_query(token: str | None, question: str) -> dict[str, Any]:
     })
     scores = {cid: round(max((p.coverage for p in answered), default=0.0), 3) for cid in cited_chunks}
     return done("answer", segments, {cid: by_id[cid] for cid in cited_chunks}, scores, spans_out)
+
+
+# ── stage 1: search hits with a key sentence, no LLM ──
+
+FAST_HITS = 3
+
+
+def _hit(idx: "LexIndex", part: Part, spans: list[tuple[int, int]], kind: str, arg: str | None, source: str) -> dict[str, Any]:
+    i = spans[-1][0]
+    texts = [idx.span_text[x][k] for x, k in spans]
+    cov = [coverage(part.qt, idx.span_terms[x][k]) for x, k in spans]
+    key = key_sentence(kind, arg, texts, cov, idx.chunks[i]["section"])
+    sentences = [display_span(t) for t in texts]
+    c = idx.chunks[i]
+    return {"chunkId": c["id"], "docName": c["docName"], "section": c["section"], "sentences": sentences,
+            "spanIds": [idx.span_ids[x][k] for x, k in spans], "key": key, "keySentence": sentences[key], "content": " ".join(sentences),
+            "source": source, "coverage": round(coverage(part.qt, frozenset().union(*(idx.span_terms[x][k] for x, k in spans)), idx.ctx_terms[i]), 3),
+            "dense": part.dense_of.get(i)}
+
+
+def _chunk_spans(idx: "LexIndex", part: Part, i: int, kind: str, arg: str | None) -> list[tuple[int, int]]:
+    """Shown sentences of a further ranked chunk: the key sentence (chosen over all its sentences) and the sentences sharing
+    most key terms (coverage ≥ half the best), ≤ 3 in document order; instruction-like spans are never shown."""
+    ok = [k for k in range(len(idx.span_text[i])) if not idx.span_instr[i][k]]
+    if not ok:
+        return []
+    cov = [coverage(part.qt, idx.span_terms[i][k]) for k in ok]
+    key = ok[key_sentence(kind, arg, [idx.span_text[i][k] for k in ok], cov, idx.chunks[i]["section"])]
+    best = max(cov)
+    rel = sorted((k for k, cv in zip(ok, cov) if best > 0 and cv >= 0.5 * best), key=lambda k: (-cov[ok.index(k)], k))
+    keep = sorted(list(dict.fromkeys([key] + rel))[:3])
+    return [(i, k) for k in keep]
+
+
+def fast_hits(idx: "LexIndex", view: "RoleView", parts: list[Part], limit: int = FAST_HITS) -> list[dict[str, Any]]:
+    """Stage-1 hits: per part the defining span of a definition question, its selected windows, then further ranked chunks
+    (same floor as search_hits: lexical floor without capped-only matches, or the dense gate); parts interleaved, ≤ `limit`
+    chunks. RBAC-filtered by construction (windows and ranks come from the role view only)."""
+    per_part: list[list[dict[str, Any]]] = []
+    for p in parts:
+        kind, arg = question_kind(p.text, p.value, p.who, p.flag_text)
+        cands: list[dict[str, Any]] = []
+        if kind == "definition":
+            w = definition_window(idx, view, p.ranked, arg)
+            if w:
+                cands.append(_hit(idx, p, w, kind, arg, "definition"))
+        if (p.lexical_ok and not p.capped_only) or p.dense_ok:
+            cands += [_hit(idx, p, w, kind, arg, "window") for w in p.windows]
+            for i in p.ranked:
+                spans = _chunk_spans(idx, p, i, kind, arg)
+                if spans:
+                    cands.append(_hit(idx, p, spans, kind, arg, "ranked"))
+                if len(cands) >= limit + len(p.windows) + 1:
+                    break
+        per_part.append(cands)
+    hits: list[dict[str, Any]] = []
+    for n in range(max((len(c) for c in per_part), default=0)):
+        for cands in per_part:
+            if n < len(cands) and len(hits) < limit and all(h["chunkId"] != cands[n]["chunkId"] for h in hits):
+                hits.append(cands[n])
+    return hits
+
+
+def run_fast(token: str | None, question: str) -> dict[str, Any]:
+    """Stage 1 (≤ 1.5 s): retrieval + RBAC + injection filter + key sentence, no LLM; verbatim source sentences only. Never
+    writes audit entries — a restricted match is logged once, by stage 2 (run_query)."""
+    t_all = time.perf_counter()
+    q = _check_question(question)
+    db = cached_db()
+    role = actor_for(db, token)["role"]
+    t = time.perf_counter()
+    idx = lexical_index(db)
+    view = idx.view(role)
+    lat = {"rbac": int((time.perf_counter() - t) * 1000)}
+    ret = retrieve(db, idx, view, role, q)
+    lat["retrieval"] = ret.ms if not ret.cached else 0
+    hits = fast_hits(idx, view, ret.parts)
+    lat["total"] = int((time.perf_counter() - t_all) * 1000)
+    kinds = [question_kind(p.text, p.value, p.who, p.flag_text) for p in ret.parts]
+    best_cov = max((p.coverage for p in ret.parts), default=0.0)
+    by_id = {c["id"]: c for c in idx.chunks}
+    return {"ok": True, "fast": {
+        "hits": hits, "citations": {h["chunkId"]: by_id[h["chunkId"]] for h in hits},
+        "trace": {"original": q, "rewrite": " | ".join(ret.texts) if ret.texts else q, "rbacFilter": f"min_role <= {role}", "searched": view.n,
+                  "total": len(idx.chunks), "injectionRemoved": ret.injection, "engineMode": engine_label(), "latencyMs": lat,
+                  "retrievalScore": round(ret.best_dense if ret.dense_on else best_cov, 3), "lexicalSupport": round(best_cov, 2),
+                  "parts": [{"text": p.text, "kind": k, "arg": a, "coverage": round(p.coverage, 3), "lexicalOk": p.lexical_ok, "densePath": p.dense_ok,
+                             "contradiction": bool(p.contradiction), "features": p.features} for p, (k, a) in zip(ret.parts, kinds)]},
+    }}

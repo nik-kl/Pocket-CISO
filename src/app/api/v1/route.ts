@@ -14,6 +14,7 @@ export const runtime = "nodejs";
 const PY = (process.env.PYTHON_BACKEND_URL ?? "http://127.0.0.1:8000").replace(/\/$/, "");
 const HEALTH_TIMEOUT_MS = 3000;
 const QUERY_TIMEOUT_MS = 25_000;
+const FAST_TIMEOUT_MS = 5_000;
 const STAGE_TIMEOUT_MS = 180_000; // Python: embeddings <= 100 s + conflict scan <= 55 s; a retry after a timeout is idempotent (duplicate pending diffs are returned)
 const APPROVE_TIMEOUT_MS = 15_000;
 const SYNC_TIMEOUT_MS = 120_000;
@@ -51,6 +52,7 @@ async function readJsonBody(req: NextRequest): Promise<{ ok: true; body: unknown
 const RATE_MULT = Math.max(1, Number(process.env.POCKET_CISO_RATE_LIMIT_MULT) || 1);
 const RATE_RULES: Record<string, [max: number, windowMs: number]> = {
   query: [20, 60_000],
+  query_fast: [20, 60_000], // stage 1 of the same question: own bucket, so a question still costs one "query" hit
   authenticate: [10, 60_000],
   create_ticket: [5, 600_000],
   stage_policy: [20, 60_000],
@@ -271,6 +273,13 @@ export async function POST(req: NextRequest) {
         const st = await backendStatus();
         const viaPy = st.mode === "python" ? await viaPython("/query", jsonInit(token, { question: s("question") }), QUERY_TIMEOUT_MS, true) : null;
         return viaPy ?? reply(await db.runQuery(token, s("question")));
+      }
+
+      case "query_fast": {
+        // stage 1 (no LLM, no audit entry); without Python there is no stage 1 — the local engine answers stage 2 directly
+        const st = await backendStatus();
+        const viaPy = st.mode === "python" ? await viaPython("/query-fast", jsonInit(token, { question: s("question") }), FAST_TIMEOUT_MS, true) : null;
+        return viaPy ?? NextResponse.json({ ok: true, fast: null, served: "local" }, { headers: NO_STORE });
       }
 
       case "stage_policy": {
