@@ -552,7 +552,13 @@ class JudgeVeto(unittest.TestCase):
     def test_value_must_sit_in_a_column_related_to_the_question(self) -> None:
         q, row = "Wie schnell ist ein Glasbruch zu melden?", "Tabelle [Schäden]: Schaden: Glasbruch | Sofortmaßnahme: Sofortige Absperrung"
         self.assertEqual(self.veto(q, "value", "deadline", [(row, "Hausordnung › Schäden")]), "Wert aus anderer Tabellenspalte")
-        self.assertIsNone(self.veto(q, "value", "deadline", [(row + " | Meldefrist: 2 Stunden", "Hausordnung › Schäden")]))
+        self.assertIsNone(self.veto(q, "value", "deadline", [(row + " | Meldefrist: 2 Stunden", "Hausordnung › Schäden")], rag.Vocab({"melde", "frist"})))
+
+    def test_column_match_uses_stems_and_compound_parts(self) -> None:
+        row = [("Tabelle [Schäden]: Schaden: Glasbruch | Sofortmaßnahme: Absperren | Meldefrist: 2 Stunden", "Hausordnung › Schäden")]
+        vocab = rag.Vocab({"melde", "frist", "sofort", "massnahme"})
+        self.assertIsNone(self.veto("Bis wann muss ein Glasbruch gemeldet werden?", "value", "deadline", row, vocab))
+        self.assertEqual(self.veto("Bis wann muss ein Glasbruch repariert werden?", "value", "deadline", row, vocab), "Wert aus anderer Tabellenspalte")
 
 
 class PhrasingGuards(unittest.TestCase):
