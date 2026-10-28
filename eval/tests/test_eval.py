@@ -35,5 +35,27 @@ class ForbiddenMarkers(unittest.TestCase):
         self.assertEqual(s["forbidden"], [])
 
 
+class DisclosedGap(unittest.TestCase):
+    """A missed fact of a part the answer itself marks as unconfirmed is an incomplete answer, never a hidden false one."""
+    Q = {"id": "T-2", "role": "L2", "question": "Wie lange gilt die Frist und wer genehmigt sie?", "expect": "answer",
+         "facts": ["Teamleitung"], "fact_parts": ["wer genehmigt"], "must_not": [], "source": "Urlaub", "category": "t"}
+    NOTE = "Zu „wer genehmigt sie?“ wurde keine Aussage als Antwort bestätigt; bitte die zitierten Stellen prüfen."
+
+    def score(self, said: str, note: bool = True) -> str:
+        segs = [{"type": "text", "text": said}, {"type": "cite", "chunkId": "c1", "spanId": "c1:0"}] + ([{"type": "note", "text": self.NOTE}] if note else [])
+        res = {"result": {"kind": "answer", "segments": segs, "citations": {"c1": {"docName": "Urlaubsordnung.md", "content": "Die Frist beträgt 14 Tage."}},
+                          "spans": {"c1:0": {"text": "Die Frist beträgt 14 Tage."}}, "trace": {}, "hits": []}}
+        return ev.score_one(self.Q, res, [], {}, [])["outcome"]
+
+    def test_disclosed_part_is_incomplete(self) -> None:
+        self.assertEqual(self.score("Die Frist beträgt 14 Tage."), "incomplete_disclosed")
+
+    def test_disclosed_but_wrong_value_in_the_answered_part_is_false(self) -> None:
+        self.assertEqual(self.score("Die Frist beträgt 30 Tage."), "false_answer")
+
+    def test_undisclosed_gap_is_false(self) -> None:
+        self.assertEqual(self.score("Die Frist beträgt 14 Tage.", note=False), "false_answer")
+
+
 if __name__ == "__main__":
     unittest.main()
