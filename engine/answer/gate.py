@@ -42,6 +42,7 @@ PART_SPLIT = re.compile(r",?\s+(?:und|sowie|oder|and|or)\s+(?=" + INTERROG + r"\
                         r"darf|durfen|muss|mussen|kann|konnen|how|who|whom|what|where|when|which|can|may|must)\b)")
 _SPLIT_FOLD = str.maketrans("äöüÄÖÜß", "aouaous")
 QUESTION_START = re.compile(r"^\s*(?:und\s+|and\s+)?" + INTERROG + r"\b")
+WH_START = re.compile(r"^\s*(?:und\s+|and\s+)?(?:wie|wer|wem|wen|was|wo\w*|wann|welche\w*|warum|wieso|weshalb|what|which|who|whom|when|where|why|how)\b")
 VALUE_Q = re.compile(r"\b(?:wie (?:lange?|viele?\w*|oft|schnell|hoch|gross|fruh)|bis wann|ab wann|ab welche\w*|bis zu welche\w*|innerhalb welche\w*|"
                      r"binnen welche\w*|in welche\w* (?:frist|zeit|intervall)|welche\w* (?:frist|intervall|wert|hohe|dauer|zeit|lange|mindestlange|gultigkeit)|"
                      r"nach wie viel\w*|wieviele?|how (?:long|many|much|often|quickly|soon|fast)|within how|what is the (?:maximum|minimum|deadline|sla|interval)|"
@@ -50,6 +51,9 @@ WHO_Q = re.compile(r"\b(?:wer|wem|wen|who|whom)\b")
 # yes/no questions about permission or obligation are answered by a normative sentence (muss, darf, verboten, …)
 NORM_Q = re.compile(r"^(?:brauche\w*|can|am i|is it|are we|do i|do we)\b|\b(?:darf|durfen|muss|mussen|soll|sollen|may|must|erlaubt|zulassig|gestattet|verboten|untersagt|allowed|permitted|prohibited|forbidden|pflicht\w*|mandatory|required)\b")
 ANAPHOR = re.compile(r"^(?:er|sie|es|dies\w*|dabei|dazu|hierbei|this|these|it|they|he|she)(?![\w-])", re.I)  # not "IT-Bereitschaft"
+# words that always point back to a sentence; "es/it/sie" open policy sentences as dummy subject or address ("Es ist
+# untersagt …", "It is prohibited …", "Sie müssen …") and need no antecedent
+BACK_REF = re.compile(r"^(?:dies\w*|dabei|dazu|hierbei|hierfur|hierzu|this|these)(?![\w-])", re.I)
 # at a section start a demonstrative with its noun ("Diese Richtlinie gilt …") refers to the heading, a bare pronoun to nothing
 HEADING_REF = re.compile(r"^(?:diese[mnrs]?|this|these)\s+\w", re.I)
 
@@ -117,7 +121,7 @@ def question_parts(question: str) -> tuple[list[str], list[str], bool]:
 
 def refers_back(idx: "LexIndex", s: tuple[int, int]) -> bool:
     t = idx.span_text[s[0]][s[1]]
-    return bool(ANAPHOR.match(t)) and not t.startswith("Tabelle [")
+    return bool(BACK_REF.match(fold(t))) and not t.startswith("Tabelle [")
 
 
 def closed_start(idx: "LexIndex", seq: list[tuple[int, int]], pos: int) -> int | None:

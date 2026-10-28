@@ -13,7 +13,7 @@ from .compose import CONTRADICTION_LABEL, compose_sentences, display_span, relat
 from .contradictions import find_contradiction
 from .gate import (
     GATE_COVERAGE, GATE_MISSING, NORM_Q, NO_ANSWER, Part, SEARCH_LABEL, UNCONFIRMED_LABEL, VALUE_Q,
-    WHO_Q, definition_term, fix_function_words, definition_window, dense_window, fact_chunks, question_parts, select_windows, window_ok, window_terms,
+    WH_START, WHO_Q, definition_term, fix_function_words, definition_window, dense_window, fact_chunks, question_parts, select_windows, window_ok, window_terms,
 )
 from .judge import judge_answerable
 from .keysentence import key_sentence, question_kind
@@ -227,7 +227,7 @@ def run_query(token: str | None, question: str) -> dict[str, Any]:
                 p.features = {**(p.features or {}), "definition": term}
     # value questions: the shown spans must carry a value of the asked dimension (duration, count, deadline, frequency);
     # yes/no may/must questions a norm (permission, prohibition, obligation — "Dies gilt auch für …" alone is neither yes nor
-    # no; "bis wann muss …" / "wer muss …" ask for the value / role, a table row "Frist: 14 Tage" carries no modal verb).
+    # no; "bis wann / wer / wo / welche … muss …" ask for a value, role or place: a table row "Frist: 14 Tage" has no modal verb).
     # Such a sentence of a confirmed window can be dropped by related_spans (its key term already in the section title) →
     # it is added back; a confirmed window without one is no answer → search hit / note.
     for p in parts:
@@ -236,7 +236,7 @@ def run_query(token: str | None, question: str) -> dict[str, Any]:
         p.shown = [related_spans(idx, p, w) for w in p.windows]
         dim = value_dim(p.flag_text or p.text)
         needs = ([("valueSpan", f"kein Wert der gefragten Art ({dim})", lambda t: has_value(dim, t))] if p.value else []) + \
-            ([("normSpan", "keine Erlaubnis, kein Verbot, keine Pflicht in der Fundstelle", has_norm)] if p.norm and not (p.value or p.who) else [])
+            ([("normSpan", "keine Erlaubnis, kein Verbot, keine Pflicht in der Fundstelle", has_norm)] if p.norm and not (p.value or p.who or WH_START.match(p.flag_text or fold(p.text))) else [])
         for feature, reason, has in needs:
             if any(has(idx.span_text[i][k]) for ws in p.shown for i, k in ws):
                 continue

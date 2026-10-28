@@ -22,6 +22,8 @@ MODAL_CLASSES = {
 }
 
 YES_NO = re.compile(r"^\s*(?:ja|nein|yes|no)\b")
+# beyond the modal verbs: need ("Brauche ich …?" is a NORM_Q), release/approval as permission, "ist/sind … zu prüfen" as obligation
+NORM_EXTRA = re.compile(r"\b(?:brauch\w*|benotig\w*|needs?|needed|freigegeben|genehmigt|zugelassen|approved)\b|\b(?:ist|sind)\b[^.;]{0,80}\b(?:zu\s+\w+en|(?:an|ab|auf|aus|bei|ein|fest|frei|mit|nach|um|vor|weiter|zuruck)zu\w+en)\b")
 PROHIBITION_RE = re.compile(r"\b(?:untersagt\w*|verbot\w*|unzulassig\w*|prohibit\w*|forbidden|never|nie|niemals)\b")
 
 
@@ -32,7 +34,8 @@ def modal_classes(text: str) -> frozenset[str]:
 
 def has_norm(text: str) -> bool:
     """Permission, prohibition or obligation (also negated: "darf nicht", "keine Pflicht") — what a may/must question asks."""
-    return bool(modal_classes(text) & {"obligation", "permission", "recommendation"} or PROHIBITION_RE.search(fold(text)))
+    f = fold(text)
+    return bool(modal_classes(text) & {"obligation", "permission", "recommendation"} or PROHIBITION_RE.search(f) or NORM_EXTRA.search(f))
 
 
 def entities(text: str) -> set[str]:
