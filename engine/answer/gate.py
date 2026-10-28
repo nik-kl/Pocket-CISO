@@ -50,7 +50,9 @@ WHO_Q = re.compile(r"\b(?:wer|wem|wen|who|whom)\b")
 # yes/no questions about permission or obligation are answered by a normative sentence (muss, darf, verboten, …)
 NORM_Q = re.compile(r"^(?:brauche\w*|can|am i|is it|are we|do i|do we)\b|\b(?:darf|durfen|muss|mussen|soll|sollen|may|must|erlaubt|zulassig|gestattet|verboten|untersagt|allowed|permitted|prohibited|forbidden|pflicht\w*|mandatory|required)\b")
 PROHIBITION_RE = re.compile(r"\b(?:untersagt\w*|verbot\w*|unzulassig\w*|prohibit\w*|forbidden|never|nie|niemals)\b")
-ANAPHOR = re.compile(r"^(?:er|sie|es|dies\w*|dabei|dazu|hierbei|this|these|it|they|he|she)\b", re.I)
+ANAPHOR = re.compile(r"^(?:er|sie|es|dies\w*|dabei|dazu|hierbei|this|these|it|they|he|she)(?![\w-])", re.I)  # not "IT-Bereitschaft"
+# at a section start a demonstrative with its noun ("Diese Richtlinie gilt …") refers to the heading, a bare pronoun to nothing
+HEADING_REF = re.compile(r"^(?:diese[mnrs]?|this|these)\s+\w", re.I)
 
 
 def fix_function_words(question: str, view: RoleView) -> str:
@@ -114,26 +116,49 @@ def question_parts(question: str) -> tuple[list[str], list[str], bool]:
     return parts[:MAX_PARTS], context, removed
 
 
+def refers_back(idx: "LexIndex", s: tuple[int, int]) -> bool:
+    t = idx.span_text[s[0]][s[1]]
+    return bool(ANAPHOR.match(t)) and not t.startswith("Tabelle [")
+
+
+def closed_start(idx: "LexIndex", seq: list[tuple[int, int]], pos: int) -> int | None:
+    """First position of the shortest window ending at seq[pos] that does not open with a reference word ("Dies gilt
+    auch für …" needs the sentence it refers to: judge, verifier, key sentence and answer see it); None = no antecedent."""
+    start = pos
+    while start > 0 and refers_back(idx, seq[start]):
+        start -= 1
+    t = idx.span_text[seq[start][0]][seq[start][1]]
+    return None if refers_back(idx, seq[start]) and not HEADING_REF.match(t) else start
+
+
+def section_seq(idx: "LexIndex", view: RoleView, i: int) -> list[tuple[int, int]]:
+    allowed = set(view.allowed)
+    return [s for s in idx.section_seq[idx.section_key[i]] if s[0] in allowed and not idx.span_instr[s[0]][s[1]]]
+
+
 def span_windows(idx: "LexIndex", view: RoleView, chunk_ids: list[int]) -> list[list[tuple[int, int]]]:
-    """Candidate windows: one span, or a span with up to two preceding spans of the same section (neighbouring chunks included)."""
+    """Candidate windows: one span (with the sentence a reference word points to), or with up to two more preceding spans
+    of the same section (neighbouring chunks included)."""
     seen: set[tuple[tuple[int, int], ...]] = set()
     out: list[list[tuple[int, int]]] = []
-    allowed = set(view.allowed)
     for i in chunk_ids:
-        seq = [s for s in idx.section_seq[idx.section_key[i]] if s[0] in allowed and not idx.span_instr[s[0]][s[1]]]
+        seq = section_seq(idx, view, i)
         for pos, anchor in enumerate(seq):
             if anchor[0] != i:
                 continue
-            if pos + 1 < len(seq) and ANAPHOR.match(idx.span_text[seq[pos + 1][0]][seq[pos + 1][1]]) and \
+            start = closed_start(idx, seq, pos)
+            if start is None:
+                continue  # a reference word without antecedent: the span is never an answer
+            if start == pos and pos + 1 < len(seq) and refers_back(idx, seq[pos + 1]) and \
                     not idx.span_text[anchor[0]][anchor[1]].startswith("Tabelle ["):
                 fw = (anchor, seq[pos + 1])
                 if fw not in seen:
                     seen.add(fw)
                     out.append(list(fw))
             for back in range(0, 3):
-                if pos - back < 0:
+                if start - back < 0:
                     break
-                w = tuple(seq[pos - back : pos + 1])
+                w = tuple(seq[start - back : pos + 1])
                 if back and any(idx.span_text[x][y].startswith("Tabelle [") for x, y in w):
                     break  # table rows are self-contained statements; context windows are for running text only
                 if w not in seen:
@@ -166,7 +191,10 @@ def dense_window(idx: "LexIndex", view: RoleView, part: Part, dense: dict[int, f
         return None
     ks = [k for k in range(len(idx.span_text[i])) if not idx.span_instr[i][k]]
     hit = [k for k in ks if coverage(part.qt, idx.span_terms[i][k]) > 0][:3]
-    w = [(i, k) for k in (hit or (ks if len(ks) <= 2 else []))]
+    seq, w = section_seq(idx, view, i), []
+    for k in hit or (ks if len(ks) <= 2 else []):
+        start = closed_start(idx, seq, seq.index((i, k)))
+        w += [x for x in seq[start : seq.index((i, k)) + 1] if x not in w] if start is not None else []
     return (w, dense[i]) if w and window_ok(idx, part, w) else None
 
 
@@ -214,8 +242,10 @@ def select_windows(idx: "LexIndex", view: RoleView, part: Part, ranked: list[int
         alone = coverage(part.qt, idx.span_terms[w[-1][0]][w[-1][1]], idx.ctx_terms[w[-1][0]])
         if alone <= 0:
             continue  # the answering span itself must match the question
-        if len(w) > 1 and coverage(part.qt, window_terms(idx, w), idx.ctx_terms[w[-1][0]]) < alone + 0.1:
-            continue  # a preceding span must add coverage, otherwise the shorter window wins
+        m = 1 + next((n for n in range(len(w) - 1) if not refers_back(idx, w[-1 - n])), len(w) - 1)  # spans the anchor needs
+        if len(w) > m and coverage(part.qt, window_terms(idx, w), idx.ctx_terms[w[-1][0]]) < \
+                coverage(part.qt, window_terms(idx, w[-m:]), idx.ctx_terms[w[-1][0]]) + 0.1:
+            continue  # a further preceding span must add coverage, otherwise the shorter window wins
         scored.append((key(w), w))
     scored.sort(key=lambda x: x[0])
     good = [w for _, w in scored if window_ok(idx, part, w)]

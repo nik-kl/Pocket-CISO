@@ -653,3 +653,28 @@ class WhoVeto(unittest.TestCase):
             with stub_llm("JA"):
                 res = rag.run_query(token("L1"), q)
             self.assertEqual(res["result"]["kind"], kind, text)
+
+
+class ReferenceWord(unittest.TestCase):
+    """A span opening with a reference word is used only together with the sentence it refers to (invented examples)."""
+
+    def ask(self, docs: list[tuple], q: str) -> dict:
+        fresh_db(docs)
+        lexical._LEX_CACHE = None
+        with stub_llm("JA"):
+            return rag.run_query(token("L1"), q)
+
+    def test_antecedent_comes_with_the_reference_sentence(self) -> None:
+        res = self.ask([("Geraete.md", "§3 Speichermedien", "L1", "Private Speichermedien dürfen an Dienstgeräten nicht verwendet werden. "
+                         "Dies gilt auch für Kameras mit Speicherkarte.")], "Darf ich eine Kamera mit Speicherkarte anschließen?")
+        self.assertEqual(res["result"]["kind"], "answer")
+        self.assertIn("nicht verwendet", res["answer"])
+
+    def test_reference_word_without_antecedent_is_no_answer(self) -> None:
+        res = self.ask([("Geraete.md", "§4 Drohnen", "L1", "Dies gilt auch für Drohnen mit Kamera.")], "Darf ich Drohnen mit Kamera nutzen?")
+        self.assertNotEqual(res["result"]["kind"], "answer")
+
+    def test_demonstrative_at_section_start_refers_to_the_heading(self) -> None:
+        res = self.ask([("Richtlinie.md", "§1 Geltungsbereich", "L1", "Diese Richtlinie gilt für alle Mitarbeitenden und Praktikanten.")],
+                       "Für wen gilt die Richtlinie?")
+        self.assertEqual(res["result"]["kind"], "answer")
