@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import httpx
+import logging
 import math
 import numpy as np
 import threading
@@ -15,9 +16,14 @@ from .config import (
     LLM_NUM_CTX, LLM_TIMEOUT, OLLAMA_BASE_URL,
 )
 
+from .search.normalize import content_stems
+
 OPENAI = LLM_API == "openai"
 HEADERS = {"Authorization": f"Bearer {LLM_API_KEY}"} if LLM_API_KEY else {}
-from .search.normalize import content_stems
+# not part of the OpenAI API; a server that rejects one gets it dropped (one warning) instead of every call failing (= NEIN)
+OPENAI_OPTIONAL = {"reasoning_effort": "none",  # thinking models would spend the 3-token judge budget on reasoning
+                   "num_ctx": LLM_NUM_CTX}
+log = logging.getLogger(__name__)
 
 
 class OllamaClient:
@@ -27,6 +33,7 @@ class OllamaClient:
         self._lock = threading.Lock()
         self._tags: list[str] | None = None
         self._tags_at = 0.0
+        self._dropped: set[str] = set()  # OPENAI_OPTIONAL parameters the server rejected
 
     def tags(self, force: bool = False) -> list[str] | None:
         with self._lock:
@@ -141,10 +148,18 @@ class OllamaClient:
     def _chat_openai(self, model: str, system: str, user: str, timeout: float, max_tokens: int) -> str | None:
         # no response_format: servers disagree on json_object support; callers already extract JSON from plain text
         payload = {"model": model, "stream": False, "temperature": 0.0, "seed": 7, "max_tokens": max_tokens,
-                   "reasoning_effort": "none",  # thinking models would spend the 3-token judge budget on reasoning
-                   "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]}
+                   "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
+                   **{k: v for k, v in OPENAI_OPTIONAL.items() if k not in self._dropped}}
         try:
-            r = httpx.post(f"{OLLAMA_BASE_URL}/chat/completions", headers=HEADERS, json=payload, timeout=timeout)
+            while True:
+                r = httpx.post(f"{OLLAMA_BASE_URL}/chat/completions", headers=HEADERS, json=payload, timeout=timeout)
+                rejected = [k for k in OPENAI_OPTIONAL if k in payload and k in r.text] if r.status_code in (400, 422) else []
+                if not rejected:
+                    break
+                log.warning("LLM server rejected %s; sending without it from now on", ", ".join(rejected))
+                self._dropped.update(rejected)
+                for k in rejected:
+                    payload.pop(k)
             r.raise_for_status()
             return ((r.json().get("choices") or [{}])[0].get("message", {}).get("content") or "").strip() or None
         except httpx.ConnectError:

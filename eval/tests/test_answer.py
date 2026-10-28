@@ -5,8 +5,11 @@ import json
 import unittest
 from unittest import mock
 
+import httpx
+
 from helpers import fresh_db, rag, stub_llm, token
-from engine.answer import pipeline, verify
+from engine import llm
+from engine.answer import compose, judge, pipeline, verify
 from engine.search import lexical
 
 
@@ -550,3 +553,68 @@ class JudgeVeto(unittest.TestCase):
         q, row = "Wie schnell ist ein Glasbruch zu melden?", "Tabelle [Schäden]: Schaden: Glasbruch | Sofortmaßnahme: Sofortige Absperrung"
         self.assertEqual(self.veto(q, "value", "deadline", [(row, "Hausordnung › Schäden")]), "Wert aus anderer Tabellenspalte")
         self.assertIsNone(self.veto(q, "value", "deadline", [(row + " | Meldefrist: 2 Stunden", "Hausordnung › Schäden")]))
+
+
+class PhrasingGuards(unittest.TestCase):
+    """bbc1a95: table rows stay verbatim, an echoed question is replaced by the verbatim span (invented examples)."""
+    ROW = ("r", "Tabelle [Prüfplan]: Gerät: Anlegeleiter | Prüfung: jährlich durch die Haustechnik")
+    PROSE = ("p", "Anlegeleitern werden vor jeder Nutzung auf Schäden geprüft.")
+
+    def compose(self, reply: str) -> tuple[list, list[str]]:
+        prompts: list[str] = []
+        def chat(system: str, user: str, **_: object) -> str:
+            prompts.append(user)
+            return reply
+        with mock.patch.object(compose.OLLAMA, "chat", side_effect=chat):
+            out, _ = compose.compose_sentences("Wie werden Leitern geprüft?", [self.ROW, self.PROSE], rag.Vocab(set()), True)
+        return out, prompts
+
+    def test_table_row_is_never_phrased(self) -> None:
+        out, prompts = self.compose("Anlegeleitern werden vor jeder Nutzung auf Schäden geprüft [S1].")
+        self.assertNotIn("Anlegeleiter |", prompts[0])
+        self.assertIn(compose.display_span(self.ROW[1]), [s.text for s in out if s.spans == ["r"] and s.source == "verbatim"])
+
+    def test_echoed_question_falls_back_to_the_span(self) -> None:
+        out, _ = self.compose("Werden Anlegeleitern vor jeder Nutzung geprüft? [S1]")
+        echo = [s for s in out if s.spans == ["p"]][0]
+        self.assertEqual((echo.source, echo.text), ("verbatim", compose.display_span(self.PROSE[1])))
+        self.assertIn("question echoed", echo.reasons)
+
+
+class OpenAIBackend(unittest.TestCase):
+    """LLM_API=openai against a mocked server: determinism parameters, no reply = NEIN, rejected optional parameter."""
+    URL = httpx.Request("POST", "http://llm.test/v1/chat/completions")
+
+    def reply(self, content: str | None = "JA", status: int = 200, text: str = "") -> httpx.Response:
+        if status != 200:
+            return httpx.Response(status, text=text, request=self.URL)
+        return httpx.Response(200, json={"choices": [{"message": {"content": content}}]}, request=self.URL)
+
+    def run_chats(self, client: llm.OllamaClient, replies: list[httpx.Response], n: int = 1) -> tuple[list, list[dict]]:
+        sent: list[dict] = []
+        def post(url: str, **kw: object) -> httpx.Response:
+            sent.append(dict(kw["json"]))  # copy: the client drops rejected keys from the same payload
+            return replies.pop(0)
+        with mock.patch.object(llm, "OPENAI", True), mock.patch.object(client, "judge_model", return_value="m"), \
+                mock.patch.object(llm.httpx, "post", side_effect=post):
+            return [client.chat("s", "u", max_tokens=3, judge=True) for _ in range(n)], sent
+
+    def test_determinism_parameters_are_sent(self) -> None:
+        out, sent = self.run_chats(llm.OllamaClient(), [self.reply()])
+        self.assertEqual(out, ["JA"])
+        self.assertEqual({k: sent[0][k] for k in ("temperature", "seed", "max_tokens", "num_ctx")}, {"temperature": 0.0, "seed": 7, "max_tokens": 3, "num_ctx": llm.LLM_NUM_CTX})
+
+    def test_no_reply_or_server_error_is_no_yes(self) -> None:
+        out, _ = self.run_chats(llm.OllamaClient(), [self.reply(""), self.reply(status=500, text="boom")], n=2)
+        self.assertEqual(out, [None, None])
+        with mock.patch.object(rag.OLLAMA, "chat", return_value=None):
+            self.assertIsNot(judge.judge_answerable("Gilt das?", ["Das gilt."]), True)
+
+    def test_rejected_parameter_is_dropped_once_with_one_warning(self) -> None:
+        client = llm.OllamaClient()
+        replies = [self.reply(status=400, text="unknown parameter: reasoning_effort"), self.reply(), self.reply()]
+        with self.assertLogs(llm.log, "WARNING") as logs:
+            out, sent = self.run_chats(client, replies, n=2)
+        self.assertEqual(out, ["JA", "JA"])
+        self.assertEqual(["reasoning_effort" in s for s in sent], [True, False, False])
+        self.assertEqual(len(logs.records), 1)
