@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import html
 import io
+import logging
 import re
 import unicodedata
 import zipfile
@@ -10,6 +11,8 @@ from pathlib import Path
 from typing import Any
 
 from ..config import ApiError, MAX_UPLOAD_BYTES
+
+logging.getLogger("pdfminer").setLevel(logging.ERROR)  # "Could not get FontBBox …" warnings flood the import output
 
 
 ALLOWED_EXT = {".pdf", ".docx", ".md", ".txt"}
