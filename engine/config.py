@@ -16,6 +16,9 @@ IS_PRODUCTION = os.getenv("NODE_ENV") == "production" or os.getenv("POCKET_CISO_
 DEMO_MODE = not IS_PRODUCTION and (os.getenv("POCKET_CISO_DEMO") == "1" or os.getenv("POCKET_CISO_DEMO_MODE") == "1")
 
 OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/")
+# "openai" = any OpenAI-compatible server (LM Studio, vLLM, llama.cpp); OLLAMA_BASE_URL then ends in /v1
+LLM_API = os.getenv("LLM_API", "ollama").lower()
+LLM_API_KEY = os.getenv("LLM_API_KEY", "")
 LLM_MODEL = os.getenv("LLM_MODEL", "qwen2.5:7b")  # answer phrasing
 # answerability judge and staging conflict pairs; may be a larger model than the phrasing one, falls back to LLM_MODEL
 JUDGE_MODEL = os.getenv("JUDGE_MODEL") or LLM_MODEL

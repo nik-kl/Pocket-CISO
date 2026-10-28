@@ -11,9 +11,12 @@ from collections import Counter
 from typing import Any
 
 from .config import (
-    EMBED_MODEL, EMBED_TIMEOUT, EMBED_TOTAL_BUDGET, HASH_ID, JUDGE_MODEL, LLM_KEEP_ALIVE, LLM_MODEL, LLM_NUM_CTX, LLM_TIMEOUT,
-    OLLAMA_BASE_URL,
+    EMBED_MODEL, EMBED_TIMEOUT, EMBED_TOTAL_BUDGET, HASH_ID, JUDGE_MODEL, LLM_API, LLM_API_KEY, LLM_KEEP_ALIVE, LLM_MODEL,
+    LLM_NUM_CTX, LLM_TIMEOUT, OLLAMA_BASE_URL,
 )
+
+OPENAI = LLM_API == "openai"
+HEADERS = {"Authorization": f"Bearer {LLM_API_KEY}"} if LLM_API_KEY else {}
 from .search.normalize import content_stems
 
 
@@ -31,9 +34,14 @@ class OllamaClient:
             if not force and time.monotonic() - self._tags_at < ttl:
                 return self._tags
             try:
-                r = httpx.get(f"{OLLAMA_BASE_URL}/api/tags", timeout=2.0)
-                r.raise_for_status()
-                self._tags = [m["name"] for m in r.json().get("models", [])]
+                if OPENAI:
+                    r = httpx.get(f"{OLLAMA_BASE_URL}/models", headers=HEADERS, timeout=2.0)
+                    r.raise_for_status()
+                    self._tags = [m["id"] for m in r.json().get("data", [])]
+                else:
+                    r = httpx.get(f"{OLLAMA_BASE_URL}/api/tags", timeout=2.0)
+                    r.raise_for_status()
+                    self._tags = [m["name"] for m in r.json().get("models", [])]
             except Exception:
                 self._tags = None
             self._tags_at = time.monotonic()
@@ -79,6 +87,11 @@ class OllamaClient:
                 if time.monotonic() > budget_end:
                     raise TimeoutError("embedding budget exceeded")
                 batch = texts[i : i + 16]
+                if OPENAI:
+                    r = httpx.post(f"{OLLAMA_BASE_URL}/embeddings", headers=HEADERS, json={"model": model, "input": batch}, timeout=EMBED_TIMEOUT)
+                    r.raise_for_status()
+                    out.extend(d["embedding"] for d in sorted(r.json()["data"], key=lambda d: d["index"]))
+                    continue
                 r = httpx.post(f"{OLLAMA_BASE_URL}/api/embed", json={"model": model, "input": batch}, timeout=EMBED_TIMEOUT)
                 if r.status_code == 404:  # older Ollama: single-prompt endpoint
                     for t in batch:
@@ -102,6 +115,8 @@ class OllamaClient:
         model = self.judge_model() if judge else self.llm_model()
         if not model:
             return None
+        if OPENAI:
+            return self._chat_openai(model, system, user, timeout, max_tokens)
         payload: dict[str, Any] = {
             "model": model,
             "stream": False,
@@ -122,6 +137,21 @@ class OllamaClient:
             return None
         except Exception:
             return None  # timeout / bad response: caller falls back to rules, Ollama stays "connected"
+
+    def _chat_openai(self, model: str, system: str, user: str, timeout: float, max_tokens: int) -> str | None:
+        # no response_format: servers disagree on json_object support; callers already extract JSON from plain text
+        payload = {"model": model, "stream": False, "temperature": 0.0, "seed": 7, "max_tokens": max_tokens,
+                   "reasoning_effort": "none",  # thinking models would spend the 3-token judge budget on reasoning
+                   "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]}
+        try:
+            r = httpx.post(f"{OLLAMA_BASE_URL}/chat/completions", headers=HEADERS, json=payload, timeout=timeout)
+            r.raise_for_status()
+            return ((r.json().get("choices") or [{}])[0].get("message", {}).get("content") or "").strip() or None
+        except httpx.ConnectError:
+            self.mark_down()
+            return None
+        except Exception:
+            return None
 
 
 OLLAMA = OllamaClient()
@@ -174,5 +204,5 @@ def engine_label(engine_id: str | None = None) -> str:
     emb = eid.split(":", 1)[1] if eid.startswith("ollama:") else "Hash-Ngram"
     if llm:
         judge = OLLAMA.judge_model()
-        return f"Ollama {llm}" + (f" (Judge {judge})" if judge and judge != llm else "") + f" + {emb}"
+        return f"{'OpenAI-API' if OPENAI else 'Ollama'} {llm}" + (f" (Judge {judge})" if judge and judge != llm else "") + f" + {emb}"
     return f"Rule-based + {emb}" + (" (Ollama offline)" if OLLAMA.tags() is None else "")
