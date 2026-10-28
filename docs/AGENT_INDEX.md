@@ -41,8 +41,8 @@ Browser ─► /api/v1 (route.ts gateway) ─┬─► Python FastAPI :8000  (qu
                                        └─► src/lib/db/ (local TS engine, ALWAYS available)
 Both engines read/write the same data/pocket-ciso-db.json (+ data/vectors.json for Python) under a cross-process mkdir lock (data/.db.lock/, owner token, safe steal).
 ```
-- Routing: `stage_policy`, `stage_file`, `sync_inbox`, `approve`, `query` → Python whenever it is up, else local. Without Ollama, Python answers queries with labelled search hits only (BM25, no LLM); the local engine (Python down) also returns search hits only, never composed answers. Timeout/5xx on **mutations are not replayed locally** (504/502); re-submitting a pending identical diff is idempotent. Everything else (`authenticate`, `logout`, `create_ticket`, `create_sync_ticket`, `resolve_ticket`, `reject`, `reset_demo`, `export_report`, snapshot) is always local.
-- Gateway protections (`route.ts`): per-client/per-action sliding-window rate limits (query 20/min, authenticate 10/min, create_ticket 5/10 min, stage 20/min, sync 10/min, snapshot 180/min, other 60/min → 429 + `Retry-After`); multipart needs `Content-Length` (411) ≤ 10.25 MB (413) and an L2 token **before** `formData()` is read; JSON bodies are read with a hard 256 KB cap (413, also without/with a wrong `Content-Length`); non-object JSON bodies → 400; config errors → generic 503 (env names only in the server log); held DB lock → 503 `DB_LOCKED`.
+- Routing: `stage_policy`, `stage_file`, `sync_inbox`, `approve`, `query`, `query_fast` → Python whenever it is up, else local (`query_fast` locally → `{fast: null}`, no stage 1). Without Ollama, Python answers queries with labelled search hits only (BM25, no LLM); the local engine (Python down) also returns search hits only, never composed answers. Timeout/5xx on **mutations are not replayed locally** (504/502); re-submitting a pending identical diff is idempotent. Everything else (`authenticate`, `logout`, `create_ticket`, `create_sync_ticket`, `resolve_ticket`, `reject`, `reset_demo`, `export_report`, snapshot) is always local.
+- Gateway protections (`route.ts`): per-client/per-action sliding-window rate limits (query 20/min, query_fast 20/min, authenticate 10/min, create_ticket 5/10 min, stage 20/min, sync 10/min, snapshot 180/min, other 60/min → 429 + `Retry-After`); multipart needs `Content-Length` (411) ≤ 10.25 MB (413) and an L2 token **before** `formData()` is read; JSON bodies are read with a hard 256 KB cap (413, also without/with a wrong `Content-Length`); non-object JSON bodies → 400; config errors → generic 503 (env names only in the server log); held DB lock → 503 `DB_LOCKED`.
 - Python re-checks size/auth before parsing (`engine/api.py /stage-file`: 411/413, `check_role` L2, then `request.form()`); DOCX is size-checked as ZIP (64 MB uncompressed) before parsing.
 - Backend status: `GET /api/v1` → `backend` (cached 4 s; `POST health` ≥ 1 s). Sidebar `data-testid="backend-status"` (`data-mode=python|fallback`): `Python FastAPI + Ollama (Connected)` · `Python FastAPI · Rule Engine (Ollama offline)` · `Local Fallback Engine (Active)`.
 - Responses carry `served: "python"|"local"`.
@@ -55,7 +55,7 @@ Both engines read/write the same data/pocket-ciso-db.json (+ data/vectors.json f
 | `next.config.mjs` | Security headers (CSP in production, XFO, nosniff, Referrer-Policy, Permissions-Policy, COOP, HSTS in production), `agentRules:false` (valid in Next 16.4) |
 | `src/app/page.tsx`, `layout.tsx`, `globals.css` | Shell, RBAC switcher (OIDC group labels), status box, theme tokens |
 | `src/app/api/v1/route.ts` | Hybrid gateway (above) |
-| `src/components/StatelessChatView.tsx` | Pipeline B UI: telemetry shows **Retrieval-Score** and the real verification mode (`NLI` vs `Wörtlicher Auszug`), citation drawer, fallback ticket |
+| `src/components/StatelessChatView.tsx` | Pipeline B UI, two stages: `query_fast` → card with verbatim hits + highlighted key sentence ("wird geprüft"), then `query` → "bestätigte Antwort" / "nicht als Antwort bestätigt" (8 s without stage 2 → "Prüfung nicht abgeschlossen"); L1 card only, L2/L3 collapsible details (stage-1 scores, judge per part, verifier per sentence, latencies); citation drawer, fallback ticket. `data-testid`: `answer-card` (`data-status`), `hit`, `key-sentence`, `details` |
 | `src/components/CisoDiffDashboard.tsx` | Pipeline A UI: queue, StageModal, word diff, conflicts, Sync-Tickets, **override needs a reason (≥ 10 chars)**, a conflict only counts as handled once its ticket is resolved, Sync Inbox |
 | `src/components/KnowledgeAndAuditView.tsx` | Chunks, hash-chained audit log (last 200 shown, total in tab), tickets + webhook inspector + resolve, JSON/CSV export (incl. tickets, `hashVersion`, recomputed content hashes), printable attestation |
 | `src/components/ui-primitives.tsx` | Button, Badge, Modal, SidePanel, ThemeSwitcher, Toast, ElevationModal |
@@ -66,12 +66,12 @@ Both engines read/write the same data/pocket-ciso-db.json (+ data/vectors.json f
 | `engine/config.py`, `llm.py`, `store.py` | Env/config + ApiError · Ollama client, hash embeddings, engine label · JSON DB + lock, vector store (+ stash), audit, tokens, RBAC |
 | `engine/ingest/parse.py`, `chunk.py` | PDF (layout tables) / DOCX / text parsing · heading-based chunker with table row statements |
 | `engine/search/normalize.py`, `facts.py`, `lexical.py`, `dense.py` | Folding, CISTEM, compounds, glossary, instruction spans · facts and unit-aware values · lexical index, role views, key terms, coverage · bge-m3 dense scores, RRF, diversified candidates |
-| `engine/answer/gate.py`, `judge.py`, `verify.py`, `compose.py`, `contradictions.py`, `pipeline.py` | Parts, windows, gate · LLM judge · sentence verifier · phrasing + search hits · contradiction rule · `run_query` |
+| `engine/answer/gate.py`, `judge.py`, `verify.py`, `compose.py`, `contradictions.py`, `keysentence.py`, `pipeline.py` | Parts, windows, gate · LLM judge · sentence verifier · phrasing + search hits · contradiction rule · key sentence per question type · `retrieve` (cached, no LLM), `run_fast` (stage 1), `run_query` (stage 2) |
 | `engine/staging.py`, `inbox.py` | Pipeline A staging/approval · watched-inbox connector |
 | `engine/requirements.txt` | fastapi, uvicorn, pydantic, httpx, numpy, pypdf, pdfplumber (ruled PDF tables), python-docx, python-multipart |
 | `engine/glossary.json` | Bilingual term groups used for query expansion and the sentence verifier (Python and Node) |
-| `eval/tests/` | Unit tests (stdlib only, no Ollama; LLM stubbed; synthetic documents incl. generated PDFs): `helpers.py` + `test_ingest`, `test_store_staging`, `test_search`, `test_answer` |
-| `eval/eval.py` | Eval harness (modes ollama/noollama/node, determinism, gateway smoke, aggregate diagnostics); `--company comp_1|comp_2` picks the test company, `--holdout PATH [--corpus DIR]` aggregate-only |
+| `eval/tests/` | Unit tests (stdlib only, no Ollama; LLM stubbed; synthetic documents incl. generated PDFs): `helpers.py` + `test_ingest`, `test_store_staging`, `test_search`, `test_answer`, `test_fast` |
+| `eval/eval.py` | Eval harness (modes ollama/noollama/node, determinism, gateway smoke, aggregate diagnostics; every question runs stage 1 then stage 2 — key sentence hit top-1/top-3, stage-1 latency; `--no-fast` = single-stage reference); `--company comp_1|comp_2` picks the test company, `--holdout PATH [--corpus DIR]` aggregate-only |
 | `dummy-data/comp_1_policy-samples/` | dev1: 20 documents (`docs/`, incl. 9 dev-only listed in `dev_only.txt`), 244 questions (223 dev + 21 `robust_*`), `overview.md` |
 | `dummy-data/comp_2_nordwind-logistics/` | dev2 (Nordwind Logistics): 14 documents in 4 formats with format traps, 40 questions, `doc_roles.json` (measurement only), `forbidden_markers.txt`, `overview.md` |
 
@@ -79,6 +79,7 @@ Both engines read/write the same data/pocket-ciso-db.json (+ data/vectors.json f
 | Endpoint | Role | Notes |
 |---|---|---|
 | `GET /health` | – | status, models, vector count |
+| `POST /query-fast {question}` | any | Stage 1: `fast{hits[]{chunkId,docName,section,sentences[],key,keySentence,source,coverage,dense}, citations, trace{parts[]{kind,arg,…}, latencyMs, retrievalScore}}`; no LLM, no audit entry; retrieval cached for stage 2 |
 | `POST /query {question}` | any | Pipeline B, stateless. Returns `result` (kind `answer`\|`search`\|`fallback`; restricted-only matches look like no match), `hits[]` for search, `trace{parts[], retrievalScore, lexicalSupport, contradiction, contradictionValues, sentences, verification}` |
 | `POST /stage-file` (multipart or JSON) | L2 | 411/413/403 before parsing; idempotent for identical pending diffs |
 | `POST /sync-inbox` | L2 | connector → `SyncReport` |
@@ -86,7 +87,7 @@ Both engines read/write the same data/pocket-ciso-db.json (+ data/vectors.json f
 Errors: `{ok:false, code, error}`.
 
 ## Gateway actions (`POST /api/v1`)
-`health` · `authenticate{role,password}` · `logout` · `query{question}` · `create_ticket{question,reason}` (L1 allowed by design: idempotent per question, ≤ 100 open per actor) · `stage_policy{title,targetDoc,newText,minRole}` (L2; text 10–2000 chars) · `stage_file` (multipart, L2) · `create_sync_ticket{diffId,conflictId}` (L3) · `resolve_ticket{ticketId,resolutionNote}` (L2+) · `sync_inbox` (L2+) · `approve{diffId,override?,overrideReason?}` (L3) · `reject{diffId,reason}` (L3) · `export_report` (L2+; audited) · `reset_demo` (L3, demo mode only, else 403 `DISABLED_IN_PRODUCTION`).
+`health` · `authenticate{role,password}` · `logout` · `query_fast{question}` (stage 1) · `query{question}` · `create_ticket{question,reason}` (L1 allowed by design: idempotent per question, ≤ 100 open per actor) · `stage_policy{title,targetDoc,newText,minRole}` (L2; text 10–2000 chars) · `stage_file` (multipart, L2) · `create_sync_ticket{diffId,conflictId}` (L3) · `resolve_ticket{ticketId,resolutionNote}` (L2+) · `sync_inbox` (L2+) · `approve{diffId,override?,overrideReason?}` (L3) · `reject{diffId,reason}` (L3) · `export_report` (L2+; audited) · `reset_demo` (L3, demo mode only, else 403 `DISABLED_IN_PRODUCTION`).
 
 ## DB schema (`data/pocket-ciso-db.json`, owner-only 0600)
 `meta{liveVersion,nextTicket,nextAudit,seededAt,ingestedFiles{file→sha256},auditAnchor}` · `users[]` (`passwordHash` is just the marker `"env-managed"`: credentials live in the environment) · `live_chunks[]{id,docName,section,minRole,content,updatedAt,sha256,approvedBy}` · `staged_diffs[]{…,hunks[],removedChunkIds[],conflicts[]}` · `tickets[]` · `audit_logs[]`.
@@ -106,8 +107,9 @@ Errors: `{ok:false, code, error}`.
 **A (stage):** parse → table-aware chunking (KPI lines such as `2 Stunden` are content, not headings) → embeddings → series alignment → hunks + removed chunks → conflict scan (rules: same unit/different value on shared topic; Python additionally cosine ≥ `CONFLICT_SIM` and optional LLM verdict, both with `verifiedBy`) → pending diff (author = verified session; a client-supplied name is shown as "angegeben: …").
 
 ## Tests / eval
-- `npm run test:engine` (= `engine/.venv/bin/python -m unittest discover -s eval/tests`; 73 tests, no Ollama needed)
+- `npm run test:engine` (= `engine/.venv/bin/python -m unittest discover -s eval/tests`; 110 tests incl. `test_fast` (key sentence rules, stage 1), no Ollama needed)
 - `engine/.venv/bin/python eval/eval.py --label X [--company comp_1|comp_2] [--modes ollama,noollama,node] [--categories a,b] [--ids ..] [--passes N] [--no-smoke] [--reuse-corpus] [--corpus DIR] [--holdout PATH]` → `/tmp/pocket-ciso-rag/results/X/summary.md` (node mode needs `npm run build`). Every mode builds its corpus in a temp data dir through the real staging/approval path; `data/` is never touched.
+- Two-stage answers (2026-10-28, branch two-stage-answers): stage 2 identical to the single-stage run per question (comp_1 244/244, comp_2 40/40); stage 1 p50/p95 36/72 ms (comp_1), 43/60 ms (comp_2); key sentence hit top-1/top-3 163/205 · 175/205 (comp_1), 19/30 · 23/30 (comp_2); 0 false answers, 0 leakage, 0 injection errors, deterministic.
 - Latest dev result (2026-10-22, `qwen2.5:7b` digest 845dbda0ea48 + `bge-m3`): 223 dev questions — 92/188 correct, **0 false answers**, 84 search hits (hits@3 73), 8 abstentions, 35/35 unanswerable refused, contradictions 14/17 with 0 false flags, 0 leakage, deterministic, p50/p95 619/3144 ms; robust_* 4/17 correct, 0 false. noollama/node: 0 false answers, search hits only. `qwen3:14b` (bdbd181c33f2) as judge: 144/188 correct but 9 false answers, p95 10.5 s → not used.
 
 ## Behaviour contracts / gotchas

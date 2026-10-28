@@ -81,6 +81,7 @@ class Part:
     pooled: bool = False  # judged against the windows of the answered parts
     dense_ok: bool = False
     ranked: list[int] = field(default_factory=list)
+    dense_of: dict[int, float] = field(default_factory=dict)  # dense cosine of the ranked chunks (stage-1 details)
     features: dict[str, Any] | None = None
     contradiction: list[tuple[list[tuple[int, int]], dict[str, set[float]]]] | None = None
     coverage: float = 0.0
@@ -322,11 +323,15 @@ EXPLAINS = r"(?:\s*\([^)]*\))?\s+(?:bezeichnet|bedeutet|meint|steht fur|umfasst|
 def definition_rank(idx: "LexIndex", i: int, k: int, term: str) -> int | None:
     """0 = defines and explains the term (glossary table row, span in a glossary/abbreviation section, 'X ist ein …'),
     1 = spells it out in passing ('… die Langform (X) …'), None = no definition."""
-    text = idx.span_text[i][k]
+    return definition_text_rank(idx.span_text[i][k], term, idx.chunks[i]["section"])
+
+
+def definition_text_rank(text: str, term: str, section: str = "") -> int | None:
+    """definition_rank on plain text (also used for the key sentence of a search hit)."""
     explains = bool(re.search(r"\b" + re.escape(fold(term)) + EXPLAINS, fold(text)))
     if not (explains or defines(text, term)):
         return None
-    glossary = text.startswith("Tabelle [") or bool(GLOSSARY_SECTION.search(fold(idx.chunks[i]["section"])))
+    glossary = text.startswith("Tabelle [") or bool(GLOSSARY_SECTION.search(fold(section)))
     return 0 if explains or glossary else 1
 
 

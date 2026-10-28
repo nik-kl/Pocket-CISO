@@ -143,6 +143,14 @@ def worker(args: argparse.Namespace) -> None:
             rag.reset_query_caches()  # second pass must not be served from in-process caches
         for k, q in enumerate(questions):
             token = sign_token(q["role"])
+            fast, fast_ms = None, None
+            if not args.no_fast and hasattr(rag, "run_fast"):  # two-stage answers: stage 1 first, as the UI calls it
+                t0 = time.perf_counter()
+                try:
+                    fast = rag.run_fast(token, q["question"])
+                except rag.ApiError as e:
+                    fast = {"ok": False, "code": e.code, "error": e.error}
+                fast_ms = round((time.perf_counter() - t0) * 1000, 1)
             t0 = time.perf_counter()
             try:
                 res = rag.run_query(token, q["question"])
@@ -150,7 +158,7 @@ def worker(args: argparse.Namespace) -> None:
             except rag.ApiError as e:
                 res, err = {"ok": False, "code": e.code, "error": e.error}, e.code
             ms = (time.perf_counter() - t0) * 1000
-            out_rows.append({"pass": p, "id": q["id"], "ms": round(ms, 1), "error": err, "response": res})
+            out_rows.append({"pass": p, "id": q["id"], "ms": round(ms, 1), "error": err, "response": res, "fast": fast, "fast_ms": fast_ms})
             if (k + 1) % 25 == 0:
                 say(f"pass {p + 1}: {k + 1}/{len(questions)}")
     db = rag.read_db()
@@ -265,8 +273,8 @@ def ensure_next_build() -> None:
     subprocess.run(["npm", "run", "build"], cwd=ROOT, check=True, stdout=subprocess.DEVNULL)
 
 
-def gateway_query(base: str, question: str, role: str, retries: int = 3) -> tuple[dict[str, Any], float]:
-    body = json.dumps({"action": "query", "question": question}).encode()
+def gateway_query(base: str, question: str, role: str, retries: int = 3, action: str = "query") -> tuple[dict[str, Any], float]:
+    body = json.dumps({"action": action, "question": question}).encode()
     headers = {"Content-Type": "application/json"}
     token = sign_token(role)
     if token:
@@ -299,8 +307,11 @@ def run_gateway(workdir: Path, mode: str, questions: list[dict[str, Any]], passe
         wait_http(f"{base}/api/v1")
         for p in range(passes):
             for q in questions:
+                fast, fast_ms = gateway_query(base, q["question"], q["role"], action="query_fast")  # stage 1, as the UI calls it
                 res, ms = gateway_query(base, q["question"], q["role"])
-                rows.append({"pass": p, "id": q["id"], "ms": round(ms, 1), "error": None if res.get("ok") else res.get("code"), "response": res})
+                rows.append({"pass": p, "id": q["id"], "ms": round(ms, 1), "error": None if res.get("ok") else res.get("code"), "response": res,
+                             "fast": fast if fast.get("fast") else None, "fast_ms": round(fast_ms, 1) if fast.get("fast") else None,
+                             "fast_served": fast.get("served"), "fast_ok": fast.get("ok")})
     finally:
         stop(proc)
     return {"rows": rows}
@@ -388,6 +399,10 @@ def extract(res: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def canonical_fast(fast: dict[str, Any] | None) -> str:
+    return json.dumps([[h["docName"], h["section"], h["sentences"], h["key"]] for h in fast_hits_of(fast)], ensure_ascii=False)
+
+
 def canonical(res: dict[str, Any]) -> str:
     x = extract(res)
     r = res.get("result") or {}
@@ -404,9 +419,14 @@ def leak_markers(chunks: list[dict[str, Any]], role: str) -> list[str]:
     return list(dict.fromkeys(markers))
 
 
+def fast_hits_of(fast: dict[str, Any] | None) -> list[dict[str, Any]]:
+    return ((fast or {}).get("fast") or {}).get("hits") or []
+
+
 def score_one(q: dict[str, Any], res: dict[str, Any], chunks: list[dict[str, Any]], leak_cache: dict[str, list[str]],
-              markers: list[str] = ()) -> dict[str, Any]:
+              markers: list[str] = (), fast: dict[str, Any] | None = None) -> dict[str, Any]:
     x = extract(res)
+    fh = fast_hits_of(fast)
     answered = x["kind"] == "answer"
     flags = re.I | re.M
     facts_hit = [bool(re.search(f, x["answer"], flags)) for f in q["facts"]]
@@ -415,11 +435,11 @@ def score_one(q: dict[str, Any], res: dict[str, Any], chunks: list[dict[str, Any
     errs = independent_errors(x["answer"], x["cited_spans"]) if answered else []
     if q["role"] not in leak_cache:
         leak_cache[q["role"]] = leak_markers(chunks, q["role"])
-    blob = json.dumps(res, ensure_ascii=False)
+    blob = json.dumps(res, ensure_ascii=False) + json.dumps(fast, ensure_ascii=False)  # stage 1 is shown to the user too
     leaks = [m for m in leak_cache[q["role"]] if m in blob]
     # forbidden markers (company forbidden_markers.txt, e.g. an injection canary): never in any text the user sees —
     # answer, notes or search hits; a hit is an injection error, and an answer showing one is a false answer
-    visible = " ".join([x["answer"], *x["notes"], *(h["content"] for h in x["hits"])])
+    visible = " ".join([x["answer"], *x["notes"], *(h["content"] for h in x["hits"]), *(t for h in fh for t in h.get("sentences", []))])
     forbidden = [m for m in markers if m.casefold() in visible.casefold()]
     if forbidden and answered:
         outcome = "false_answer"
@@ -440,7 +460,15 @@ def score_one(q: dict[str, Any], res: dict[str, Any], chunks: list[dict[str, Any
     if x["kind"] == "search" and q["expect"] == "answer":
         top = x["hits"][:3]
         hit_ok = any((not q["source"] or re.search(q["source"], h["docName"], re.I)) and all(re.search(f, h["content"], flags) for f in q["facts"][:1]) for h in top)
+    # key sentence hit (stage 1): the highlighted sentence of the top-1 / one of the top-3 hits contains the first fact
+    key_top1 = key_top3 = fact_in_fast = None
+    if fast is not None and q["expect"] == "answer" and q["facts"]:
+        f0 = q["facts"][0]
+        key_top1 = bool(fh) and bool(re.search(f0, fh[0].get("keySentence", ""), flags))
+        key_top3 = any(re.search(f0, h.get("keySentence", ""), flags) for h in fh[:3])
+        fact_in_fast = any(re.search(f0, h.get("content", ""), flags) for h in fh[:3])
     return {"id": q["id"], "category": q["category"], "role": q["role"], "expect": q["expect"], "outcome": outcome, "kind": x["kind"],
+            "key_top1": key_top1, "key_top3": key_top3, "fact_in_fast": fact_in_fast, "fast_hits": len(fh),
             "facts_hit": facts_hit, "must_not_hit": must_not_hit, "forbidden": forbidden, "source_ok": source_ok, "errors": errs, "leaks": leaks,
             "contradiction_expected": bool(q.get("contradiction")), "contradiction_flag": x["contradiction"], "partial": x["partial"],
             "citation_precision": precision, "hit_ok": hit_ok, "answer": x["answer"], "cited_docs": x["cited_docs"], "trace": x["trace"]}
@@ -486,21 +514,29 @@ def metrics(mode: str, questions: list[dict[str, Any]], raw: dict[str, Any], pas
     chunks = raw.get("meta", {}).get("chunks") or []
     by_pass: dict[int, dict[str, Any]] = defaultdict(dict)
     lat: list[float] = []
+    fast_lat: list[float] = []
+    both_lat: list[float] = []
     for row in raw["rows"]:
         by_pass[row["pass"]][row["id"]] = row
         if row["pass"] == 0:
             lat.append(row["ms"])
+            if row.get("fast_ms") is not None:
+                fast_lat.append(row["fast_ms"])
+                both_lat.append(row["fast_ms"] + row["ms"])
     leak_cache: dict[str, list[str]] = {}
     scored = []
     for q in questions:
         row = by_pass[0].get(q["id"])
         if row is None:
             continue
-        s = score_one(q, row["response"], chunks, leak_cache, markers)
+        s = score_one(q, row["response"], chunks, leak_cache, markers, row.get("fast"))
         s["ms"] = row["ms"]
         s["failure_class"] = classify_failure(s, q)
         scored.append(s)
-    nondet = [q["id"] for q in questions if passes > 1 and q["id"] in by_pass[1] and canonical(by_pass[0][q["id"]]["response"]) != canonical(by_pass[1][q["id"]]["response"])]
+    nondet = [q["id"] for q in questions if passes > 1 and q["id"] in by_pass[1] and (
+        canonical(by_pass[0][q["id"]]["response"]) != canonical(by_pass[1][q["id"]]["response"])
+        or canonical_fast(by_pass[0][q["id"]].get("fast")) != canonical_fast(by_pass[1][q["id"]].get("fast")))]
+    keyed = [s for s in scored if s["key_top1"] is not None]
     ans = [s for s in scored if s["expect"] == "answer"]
     abst = [s for s in scored if s["expect"] == "abstain"]
     c = Counter(s["outcome"] for s in scored)
@@ -535,6 +571,10 @@ def metrics(mode: str, questions: list[dict[str, Any]], raw: dict[str, Any], pas
         "fallback_unanswerable": sum(1 for s in abst if s["kind"] in ("fallback", "denied")),
         "nondeterministic": nondet, "determinism_checked": passes > 1,
         "latency_p50_ms": round(quantile(lat, 0.5)), "latency_p95_ms": round(quantile(lat, 0.95)), "latency_max_ms": round(max(lat) if lat else 0),
+        "fast_checked": bool(fast_lat), "key_n": len(keyed), "key_top1": sum(1 for s in keyed if s["key_top1"]),
+        "key_top3": sum(1 for s in keyed if s["key_top3"]), "fact_in_fast": sum(1 for s in keyed if s["fact_in_fast"]),
+        "fast_p50_ms": round(quantile(fast_lat, 0.5)), "fast_p95_ms": round(quantile(fast_lat, 0.95)), "fast_max_ms": round(max(fast_lat) if fast_lat else 0),
+        "both_p50_ms": round(quantile(both_lat, 0.5)), "both_p95_ms": round(quantile(both_lat, 0.95)),
         "per_category": per_cat, "scored": scored,
     }
 
@@ -619,6 +659,9 @@ def summary_table(ms: list[dict[str, Any]]) -> str:
         ("contradictions handled", lambda m: f"{m['contradiction_handled']}/{m['contradiction_n']} (false flags {m['false_contradiction_flags']})"),
         ("deterministic", lambda m: ("yes" if not m["nondeterministic"] else f"NO ({len(m['nondeterministic'])})") if m["determinism_checked"] else "not checked"),
         ("latency p50 / p95 ms", lambda m: f"{m['latency_p50_ms']} / {m['latency_p95_ms']}"),
+        ("key sentence hit top-1 / top-3 (fact in stage-1 hits)", lambda m: f"{m['key_top1']}/{m['key_n']} / {m['key_top3']}/{m['key_n']} ({m['fact_in_fast']})" if m["fast_checked"] else "–"),
+        ("stage 1 latency p50 / p95 ms (max)", lambda m: f"{m['fast_p50_ms']} / {m['fast_p95_ms']} ({m['fast_max_ms']})" if m["fast_checked"] else "–"),
+        ("stage 1+2 latency p50 / p95 ms", lambda m: f"{m['both_p50_ms']} / {m['both_p95_ms']}" if m["fast_checked"] else "–"),
     ]
     head = "| metric | " + " | ".join(m["mode"] for m in ms) + " |\n|---|" + "---|" * len(ms) + "\n"
     return head + "\n".join(f"| {name} | " + " | ".join(fn(m) for m in ms) + " |" for name, fn in keys)
@@ -640,12 +683,14 @@ def category_table(ms: list[dict[str, Any]]) -> str:
 
 # ───────────────────────── orchestration ─────────────────────────
 
-def run_python_mode(mode: str, workdir: Path, qfile: Path, passes: int, spec: dict[str, Any], skip_build: bool) -> dict[str, Any]:
+def run_python_mode(mode: str, workdir: Path, qfile: Path, passes: int, spec: dict[str, Any], skip_build: bool, no_fast: bool = False) -> dict[str, Any]:
     out = workdir / "raw.json"
     cmd = [sys.executable, str(Path(__file__).resolve()), "--_worker", mode, "--workdir", str(workdir), "--questions", str(qfile), "--out", str(out),
            "--passes", str(passes), "--import-spec", json.dumps(spec, ensure_ascii=False)]
     if skip_build:
         cmd.append("--skip-build")
+    if no_fast:
+        cmd.append("--no-fast")
     subprocess.run(cmd, env=base_env(workdir, mode), check=True)
     return json.loads(out.read_text(encoding="utf-8"))
 
@@ -666,11 +711,12 @@ def smoke(workdir: Path, questions: list[dict[str, Any]], inproc: dict[str, Any]
         gw = run_gateway(workdir, "ollama", questions, 1, f"http://127.0.0.1:{port}")
     finally:
         stop(py)
-    ref = {r["id"]: r["response"] for r in inproc["rows"] if r["pass"] == 0}
+    ref = {r["id"]: r for r in inproc["rows"] if r["pass"] == 0}
     out = []
     for row in gw["rows"]:
         served = row["response"].get("served")
-        same = canonical(row["response"]) == canonical(ref.get(row["id"], {}))
+        same = canonical(row["response"]) == canonical(ref.get(row["id"], {}).get("response") or {}) and \
+            canonical_fast(row.get("fast")) == canonical_fast(ref.get(row["id"], {}).get("fast"))  # stage 1 through the gateway too
         out.append({"id": row["id"], "served": served, "same_as_inprocess": same, "ms": row["ms"]})
     return {"checked": len(out), "served_python": sum(1 for o in out if o["served"] == "python"), "identical": sum(1 for o in out if o["same_as_inprocess"]), "rows": out}
 
@@ -688,6 +734,7 @@ def main() -> None:
     ap.add_argument("--corpus", default="", help="directory with pdf/docx/md/txt used instead of <company>/docs")
     ap.add_argument("--reuse-corpus", action="store_true", help="skip the corpus build when the mode's workdir already has one")
     ap.add_argument("--no-smoke", action="store_true")
+    ap.add_argument("--no-fast", action="store_true", help="skip stage 1 (run_fast) before every query (single-stage reference run)")
     ap.add_argument("--show-failures", type=int, default=60)
     # worker-only
     ap.add_argument("--_worker", default=None)
@@ -752,7 +799,7 @@ def main() -> None:
             db = json.loads((workdir / "data" / "pocket-ciso-db.json").read_text(encoding="utf-8"))
             raw["meta"] = {"chunks": [{k: c[k] for k in ("id", "docName", "section", "minRole", "content")} for c in db["live_chunks"]]}
         else:
-            raw = run_python_mode(mode, workdir, qfile, args.passes, spec, reuse)
+            raw = run_python_mode(mode, workdir, qfile, args.passes, spec, reuse, args.no_fast)
             if mode == "ollama" and not args.no_smoke and not holdout:
                 pick = [q for q in questions if q["role"] != "L1"][:6] + [q for q in questions if q["role"] == "L1"][:2]
                 smoke_result = smoke(workdir, pick, raw)

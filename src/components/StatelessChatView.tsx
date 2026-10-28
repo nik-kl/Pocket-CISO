@@ -1,13 +1,13 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 import {
-  AlertTriangle, ArrowUpRight, Check, ChevronDown, ChevronRight, CornerDownLeft, FileText, Loader2, Lock,
+  AlertTriangle, ArrowUpRight, Check, ChevronDown, ChevronRight, Clock, CornerDownLeft, FileText, Loader2, Lock,
   RotateCcw, ShieldCheck, ShieldX, Ticket as TicketIcon, X,
 } from "lucide-react";
 import {
   QUICK_ACTIONS, ROLE_RANK, callApi, citationLabel, formatTime,
-  type QueryResult, type Role, type Session, type Snapshot, type Ticket,
+  type FastHit, type FastResult, type QueryResult, type Role, type Session, type Snapshot, type Ticket,
 } from "@/lib/mock-store";
 import { Badge, Button, SidePanel } from "./ui-primitives";
 
@@ -19,10 +19,16 @@ interface Props {
 }
 
 // Pipeline B UI: every submit is an isolated query — only the question (never history) is sent to /api/v1.
+// Two stages: query_fast shows verbatim source sentences with the key sentence highlighted (no LLM), then query confirms an
+// answer or not; after CHECK_TIMEOUT_MS without stage 2 the status reads "Prüfung nicht abgeschlossen".
+const CHECK_TIMEOUT_MS = 8000;
+
 export default function StatelessChatView({ session, snap, notify, onElevate }: Props) {
   const [input, setInput] = useState("");
   const [submitted, setSubmitted] = useState<{ text: string; nonce: number } | null>(null);
   const [result, setResult] = useState<QueryResult | null>(null);
+  const [fast, setFast] = useState<FastResult | null | undefined>(undefined); // undefined = stage 1 pending, null = none
+  const [timedOut, setTimedOut] = useState(false);
   const [loading, setLoading] = useState(false);
   const [telemetryOpen, setTelemetryOpen] = useState(false);
   const [openChunkId, setOpenChunkId] = useState<string | null>(null);
@@ -34,14 +40,24 @@ export default function StatelessChatView({ session, snap, notify, onElevate }: 
     if (!submitted) return;
     let off = false;
     setLoading(true);
-    callApi<{ result: QueryResult }>("query", { question: submitted.text }, session.token).then((r) => {
+    setFast(undefined);
+    setResult(null);
+    setTimedOut(false);
+    const timer = setTimeout(() => !off && setTimedOut(true), CHECK_TIMEOUT_MS);
+    (async () => {
+      const f = await callApi<{ fast: FastResult | null }>("query_fast", { question: submitted.text }, session.token);
       if (off) return;
+      setFast(f.ok ? f.fast : null);
+      const r = await callApi<{ result: QueryResult }>("query", { question: submitted.text }, session.token);
+      if (off) return;
+      clearTimeout(timer);
       setLoading(false);
       if (r.ok) setResult(r.result);
       else notify(r.error, "bad");
-    });
+    })();
     return () => {
       off = true;
+      clearTimeout(timer);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [submitted, session.token, snap?.liveVersion]);
@@ -56,13 +72,14 @@ export default function StatelessChatView({ session, snap, notify, onElevate }: 
   const reset = () => {
     setSubmitted(null);
     setResult(null);
+    setFast(undefined);
     setOpenChunkId(null);
   };
 
   const createTicket = async () => {
-    if (!submitted || !result) return;
+    if (!submitted) return;
     setTicketBusy(true);
-    const r = await callApi<{ ticket: Ticket }>("create_ticket", { question: submitted.text, reason: result.kind === "denied" ? "RBAC" : "LOW_CONFIDENCE" }, session.token);
+    const r = await callApi<{ ticket: Ticket }>("create_ticket", { question: submitted.text, reason: result?.kind === "denied" ? "RBAC" : "LOW_CONFIDENCE" }, session.token);
     setTicketBusy(false);
     if (r.ok) {
       setTicket({ nonce: submitted.nonce, data: r.ticket });
@@ -70,8 +87,9 @@ export default function StatelessChatView({ session, snap, notify, onElevate }: 
     } else notify(r.error, "bad");
   };
 
-  const chunk = openChunkId && result ? result.citations[openChunkId] : null;
-  const score = chunk && result ? result.scores?.[chunk.id] : undefined;
+  const citations = { ...(fast?.citations ?? {}), ...(result?.citations ?? {}) };
+  const chunk = openChunkId ? citations[openChunkId] ?? null : null;
+  const score = chunk ? result?.scores?.[chunk.id] ?? fast?.hits.find((h) => h.chunkId === chunk.id)?.dense ?? undefined : undefined;
   const local = (result?.trace.engineMode ?? "").startsWith("Local");
   const activeTicket = ticket && submitted && ticket.nonce === submitted.nonce ? ticket.data : null;
 
@@ -81,13 +99,16 @@ export default function StatelessChatView({ session, snap, notify, onElevate }: 
         <div className="mx-auto w-full max-w-4xl px-6 py-8">
           {!submitted ? (
             <Hero role={session.role} onPick={ask} />
-          ) : !result ? (
+          ) : !result && fast === undefined ? (
             <div className="flex items-center justify-center gap-2 py-24 text-sm text-faint">
-              <Loader2 size={15} className="animate-spin" /> Pipeline B läuft …
+              <Loader2 size={15} className="animate-spin" /> Fundstellen werden gesucht …
             </div>
           ) : (
             <ResultView
+              key={submitted.nonce}
               result={result}
+              fast={fast ?? null}
+              timedOut={timedOut}
               question={submitted.text}
               nonce={submitted.nonce}
               role={session.role}
@@ -215,7 +236,9 @@ function Hero({ role, onPick }: { role: Role; onPick: (q: string) => void }) {
 }
 
 interface ResultProps {
-  result: QueryResult;
+  result: QueryResult | null;
+  fast: FastResult | null;
+  timedOut: boolean;
   question: string;
   nonce: number;
   role: Role;
@@ -230,59 +253,33 @@ interface ResultProps {
   onElevate: (r: Role) => void;
 }
 
+type Status = "checking" | "confirmed" | "unconfirmed" | "incomplete";
+
+const STATUS: Record<Status, { label: string; tone: "neutral" | "ok" | "warn"; icon: ReactNode }> = {
+  checking: { label: "wird geprüft", tone: "neutral", icon: <Loader2 size={11} className="animate-spin" /> },
+  confirmed: { label: "bestätigte Antwort", tone: "ok", icon: <Check size={11} /> },
+  unconfirmed: { label: "nicht als Antwort bestätigt", tone: "warn", icon: <AlertTriangle size={11} /> },
+  incomplete: { label: "Prüfung nicht abgeschlossen", tone: "warn", icon: <Clock size={11} /> },
+};
+
 function ResultView(p: ResultProps) {
-  const { result, role } = p;
-  const tr = result.trace;
-  const lat = tr.latencyMs;
-  const fmt = (n?: number) => (n === undefined ? "" : ` · ${n < 10 ? n.toFixed(1) : Math.round(n)} ms`);
-  const grounded = result.kind === "answer";
-  const denied = result.kind === "denied";
-  const search = result.kind === "search";
-  const sources = Object.values(result.citations);
+  const { result, fast, role } = p;
+  const details = ROLE_RANK[role] >= ROLE_RANK.L2; // L1 sees the simple card only
+  const status: Status = result ? (result.kind === "answer" ? "confirmed" : "unconfirmed") : p.timedOut ? "incomplete" : "checking";
+  const st = STATUS[status];
+  const citations = { ...(fast?.citations ?? {}), ...(result?.citations ?? {}) };
+  // stage-1 hits stay on screen; without stage 1 (local engine) the stage-2 search hits are shown the same way, without a key sentence
+  const hits: FastHit[] = fast?.hits.length
+    ? fast.hits
+    : (result?.hits ?? []).map((h) => ({ ...h, sentences: [h.content], key: -1, keySentence: "", source: "ranked" as const, coverage: 0, dense: null }));
+  const answer = result && (result.kind === "answer" || result.trace.contradiction);
+  const [sourcesOpen, setSourcesOpen] = useState(false); // after a confirmed answer the source sentences fold away
+  const showHits = !answer || sourcesOpen;
 
-  return (
-    <div className={`animate-fade-in space-y-4 transition-opacity ${p.loading ? "opacity-60" : ""}`}>
-      <div className="rounded-xl border border-line bg-surface p-4">
-        <div className="mb-2 flex items-center justify-between">
-          <span className="font-mono text-[10px] uppercase tracking-[0.12em] text-faint">Isolated Query · #{String(p.nonce).padStart(3, "0")}</span>
-          <div className="flex items-center gap-2">
-            <Badge tone={(result.trace.engineMode ?? "").startsWith("Local") ? "neutral" : "brand"} className="max-w-[16rem] truncate" >{result.trace.engineMode ?? "Engine"}</Badge>
-            <Badge><Lock size={10} /> No context carried</Badge>
-            <button onClick={p.onReset} className="inline-flex items-center gap-1 text-[11px] text-faint hover:text-fg">
-              <RotateCcw size={11} /> Neue Anfrage
-            </button>
-          </div>
-        </div>
-        <p className="text-base font-medium text-fg">{p.question}</p>
-      </div>
-
-      <div className="rounded-xl border border-line bg-surface">
-        <div className="flex flex-wrap items-center gap-1.5 px-3 py-2.5">
-          <span className="mr-1 text-[10px] font-semibold uppercase tracking-[0.12em] text-faint">Pipeline B Telemetry</span>
-          <Step ok label={`1. Query Rewritten${fmt(lat?.rewrite)}`} />
-          <Arrow />
-          <Step ok={!denied} label={`2. RBAC Filter (${role})${fmt(lat?.rbac)}`} />
-          <Arrow />
-          <Step ok={result.kind === "answer"} label={`3. Retrieval-Score ${(tr.retrievalScore ?? tr.confidence).toFixed(2)}${fmt(lat?.retrieval)}`} />
-          <Arrow />
-          <Step ok={tr.nliVerified || tr.verification === "extractive"} label={`4. ${grounding(result.kind, tr)}${fmt(lat && (lat.generation ?? 0) + (lat.nli ?? 0) || undefined)}`} />
-          <button onClick={p.onToggleTelemetry} aria-expanded={p.telemetryOpen} className="ml-auto inline-flex items-center gap-1 text-[11px] text-faint hover:text-fg">
-            Under the Hood {p.telemetryOpen ? <ChevronDown size={12} /> : <ChevronRight size={12} />}
-          </button>
-        </div>
-        {p.telemetryOpen && (
-          <dl className="grid gap-px overflow-hidden rounded-b-xl border-t border-line bg-line text-xs sm:grid-cols-2">
-            <Cell label="1 · Original User Input" value={tr.original} />
-            <Cell label={`2 · Query Rewrite (${tr.rewriteBy ?? "rules"})`} value={tr.rewrite} />
-            <Cell label="3 · RBAC Filter Applied" value={`${tr.rbacFilter}  →  ${tr.searched} von ${tr.total} Chunks durchsuchbar`} mono />
-            <Cell label="4 · Grounding Check Status" value={`${result.kind === "answer" ? (tr.verification === "extractive" ? "Verification: extractive (verbatim chunk text, no NLI)" : `NLI Verified: ${tr.nliVerified ? "TRUE" : "FALSE"}`) : "nicht verifiziert (keine Antwort)"} | Temp: ${tr.temperature.toFixed(1)} | retrieval: ${(tr.retrievalScore ?? tr.topScore ?? 0).toFixed(3)}${tr.lexicalSupport !== undefined ? ` | lexical: ${tr.lexicalSupport.toFixed(2)}` : ""}`} mono />
-            <Cell label="Engine" value={`${tr.engineMode ?? "—"}${tr.answerBy && tr.answerBy !== "none" ? ` · Antwort: ${tr.answerBy}` : ""}`} mono />
-            <Cell label="Latenz (ms)" value={lat ? (["rewrite", "rbac", "retrieval", "generation", "nli"] as const).filter((k) => lat[k] !== undefined).map((k) => `${k} ${lat[k]}`).concat(`Σ ${lat.total}`).join(" · ") : "—"} mono />
-          </dl>
-        )}
-      </div>
-
-      {denied ? (
+  if (result?.kind === "denied")
+    return (
+      <div className="animate-fade-in space-y-4">
+        <QuestionHeader {...p} />
         <article className="rounded-xl border border-bad/30 bg-bad/5 p-6 shadow-card">
           <div className="flex items-start gap-3">
             <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg border border-bad/30 bg-bad/10">
@@ -299,55 +296,141 @@ function ResultView(p: ResultProps) {
             </div>
           </div>
         </article>
-      ) : (
-        <article className={`rounded-xl border bg-surface p-6 shadow-card ${grounded ? "border-line" : "border-warn/30"}`}>
-          <div className="mb-4 flex items-center justify-between">
-            <span className="text-[10px] font-semibold uppercase tracking-[0.12em] text-faint">{grounded ? "Verified Compliance Answer" : search ? "Fundstellen" : "Compliance Answer"}</span>
-            {grounded ? (
-              <span className="flex items-center gap-1.5">
-                {/^(Local|Rule-based)/.test(tr.engineMode ?? "") && <Badge tone="warn"><AlertTriangle size={11} /> Keyword-Modus · geringe Präzision</Badge>}
-                <Badge tone="ok"><Check size={11} /> Grounded · Retrieval {(tr.retrievalScore ?? tr.confidence).toFixed(2)}</Badge>
-              </span>
-            ) : search ? (
-              <Badge><FileText size={11} /> Suchtreffer · nicht verifiziert</Badge>
-            ) : (
-              <Badge tone="warn"><AlertTriangle size={11} /> Keine belastbare Quelle</Badge>
-            )}
-          </div>
-          <p className="text-[15px] leading-7 text-fg">
+      </div>
+    );
+
+  return (
+    <div className="animate-fade-in space-y-4">
+      <QuestionHeader {...p} />
+      <article data-testid="answer-card" data-status={status} className={`rounded-xl border bg-surface p-6 shadow-card ${status === "confirmed" ? "border-ok/30" : "border-line"}`}>
+        <div className="mb-4 flex items-center justify-between gap-2">
+          <span className="text-[10px] font-semibold uppercase tracking-[0.12em] text-faint">{status === "confirmed" ? "Antwort" : "Fundstellen"}</span>
+          <Badge tone={st.tone}>{st.icon} {st.label}</Badge>
+        </div>
+
+        {answer && (
+          <p data-testid="confirmed-answer" className="mb-4 text-[15px] leading-7 text-fg">
             {result.segments.map((s, i) =>
               s.type === "text" ? (
                 <span key={i}>{s.text}</span>
               ) : s.type === "note" ? (
                 <span key={i} className="block pt-2 text-sm italic text-muted">{s.text}</span>
               ) : (
-                <button
-                  key={i}
-                  onClick={() => p.onCite(s.chunkId)}
-                  title="Quelltext anzeigen"
-                  className="mx-0.5 inline-flex items-center rounded-md border border-brand/25 bg-brand/10 px-1.5 align-baseline font-mono text-[11px] leading-5 text-brand-fg transition-colors hover:border-brand/50 hover:bg-brand/20"
-                >
-                  [{citationLabel(result.citations[s.chunkId])}]
+                <button key={i} onClick={() => p.onCite(s.chunkId)} title="Quelltext anzeigen"
+                  className="mx-0.5 inline-flex items-center rounded-md border border-brand/25 bg-brand/10 px-1.5 align-baseline font-mono text-[11px] leading-5 text-brand-fg transition-colors hover:border-brand/50 hover:bg-brand/20">
+                  [{citationLabel(citations[s.chunkId])}]
                 </button>
               )
             )}
           </p>
-          {sources.length > 0 && (
-            <div className="mt-5 flex flex-wrap items-center gap-2 border-t border-line pt-4">
-              <span className="text-[11px] text-faint">Quellen</span>
-              {sources.map((c) => (
-                <button key={c.id} onClick={() => p.onCite(c.id)} className="inline-flex items-center gap-1.5 rounded-md border border-line bg-canvas px-2 py-1 font-mono text-[11px] text-muted hover:border-line-strong hover:text-fg">
-                  <FileText size={11} /> {c.docName} · {c.section.split(" ")[0]}
+        )}
+
+        {answer && hits.length > 0 && (
+          <button onClick={() => setSourcesOpen((o) => !o)} aria-expanded={sourcesOpen} className="mb-2 inline-flex w-full items-center gap-1 border-t border-line pt-4 text-[11px] text-faint hover:text-fg">
+            {sourcesOpen ? <ChevronDown size={12} /> : <ChevronRight size={12} />} Originalstellen ({hits.length})
+          </button>
+        )}
+        {hits.length > 0 ? (
+          showHits && <ol className="space-y-3">
+            {hits.map((h) => (
+              <li key={h.chunkId} data-testid="hit" className="rounded-lg border border-line bg-canvas px-4 py-3">
+                <button onClick={() => p.onCite(h.chunkId)} className="mb-1.5 inline-flex items-center gap-1.5 font-mono text-[11px] text-muted hover:text-fg">
+                  <FileText size={11} /> {h.docName} · {h.section}
                 </button>
-              ))}
+                <p className="text-[14px] leading-6 text-muted">
+                  {h.sentences.map((t, i) =>
+                    i === h.key ? (
+                      <mark key={i} data-testid="key-sentence" className="rounded bg-brand/15 px-0.5 font-medium text-fg">{t}</mark>
+                    ) : (
+                      <span key={i}>{t}</span>
+                    )
+                  ).flatMap((el, i) => (i ? [" ", el] : [el]))}
+                </p>
+              </li>
+            ))}
+          </ol>
+        ) : (
+          !answer && (
+            <p className="text-[15px] leading-7 text-muted">
+              {status === "checking" ? "Noch keine wörtliche Fundstelle – die Prüfung läuft." : result?.segments[0]?.type === "text" ? result.segments[0].text : "Keine Fundstelle im freigegebenen Bestand."}
+            </p>
+          )
+        )}
+
+        {hits.length > 0 && status !== "confirmed" && (
+          <p className="mt-3 text-[11px] text-faint">Wörtliche Auszüge aus freigegebenen Dokumenten · {status === "checking" ? "die Antwort wird noch geprüft" : "keine bestätigte Antwort"}.</p>
+        )}
+        {(status === "unconfirmed" || status === "incomplete") && (
+          <div className="mt-5 flex flex-wrap items-center gap-3 border-t border-line pt-4">
+            <TicketControl {...p} label="Jira/ServiceNow Ticket an CISO-Office erstellen" />
+          </div>
+        )}
+      </article>
+
+      {details && <Details {...p} />}
+    </div>
+  );
+}
+
+function QuestionHeader(p: ResultProps) {
+  const engine = p.result?.trace.engineMode ?? p.fast?.trace.engineMode;
+  return (
+    <div className="rounded-xl border border-line bg-surface p-4">
+      <div className="mb-2 flex items-center justify-between">
+        <span className="font-mono text-[10px] uppercase tracking-[0.12em] text-faint">Isolated Query · #{String(p.nonce).padStart(3, "0")}</span>
+        <div className="flex items-center gap-2">
+          {ROLE_RANK[p.role] >= ROLE_RANK.L2 && engine && <Badge tone={engine.startsWith("Local") ? "neutral" : "brand"} className="max-w-[16rem] truncate">{engine}</Badge>}
+          <Badge><Lock size={10} /> No context carried</Badge>
+          <button onClick={p.onReset} className="inline-flex items-center gap-1 text-[11px] text-faint hover:text-fg">
+            <RotateCcw size={11} /> Neue Anfrage
+          </button>
+        </div>
+      </div>
+      <p className="text-base font-medium text-fg">{p.question}</p>
+    </div>
+  );
+}
+
+/** L2/L3: telemetry of both stages — scores, judge verdict per part, span verifier per sentence. Collapsed by default. */
+function Details(p: ResultProps) {
+  const { result, fast, role } = p;
+  const tr = result?.trace;
+  const lat = tr?.latencyMs;
+  const fmt = (n?: number) => (n === undefined ? "" : ` · ${n < 10 ? n.toFixed(1) : Math.round(n)} ms`);
+  const verdict = (v: unknown) => (v === true ? "JA" : v === false ? "NEIN" : "—");
+  return (
+    <div data-testid="details" className="rounded-xl border border-line bg-surface">
+      <button onClick={p.onToggleTelemetry} aria-expanded={p.telemetryOpen} className="flex w-full items-center gap-1.5 px-3 py-2.5 text-left">
+        <span className="text-[10px] font-semibold uppercase tracking-[0.12em] text-faint">Details · Scores, Judge, Verifier</span>
+        {fast && <span className="font-mono text-[11px] text-faint">· Stufe 1 {fast.trace.latencyMs.total} ms</span>}
+        {lat && <span className="font-mono text-[11px] text-faint">· Stufe 2 {lat.total} ms</span>}
+        <span className="ml-auto text-faint">{p.telemetryOpen ? <ChevronDown size={12} /> : <ChevronRight size={12} />}</span>
+      </button>
+      {p.telemetryOpen && (
+        <div className="space-y-3 border-t border-line px-3 py-3">
+          {tr && (
+            <div className="flex flex-wrap items-center gap-1.5">
+              <Step ok label={`1. Teilfragen${fmt(lat?.rewrite)}`} />
+              <Arrow />
+              <Step ok label={`2. RBAC Filter (${role})${fmt(lat?.rbac)}`} />
+              <Arrow />
+              <Step ok={result.kind === "answer"} label={`3. Retrieval-Score ${(tr.retrievalScore ?? tr.confidence).toFixed(2)}${fmt(lat?.retrieval)}`} />
+              <Arrow />
+              <Step ok={tr.nliVerified || tr.verification === "extractive"} label={`4. ${grounding(result.kind, tr)}${fmt(lat && (lat.generation ?? 0) + (lat.nli ?? 0) || undefined)}`} />
             </div>
           )}
-          {!grounded && (
-            <div className="mt-5 flex flex-wrap items-center gap-3 border-t border-line pt-4">
-              <TicketControl {...p} label="Jira/ServiceNow Ticket an CISO-Office erstellen" />
-            </div>
-          )}
-        </article>
+          <dl className="grid gap-px overflow-hidden rounded-lg border border-line bg-line text-xs sm:grid-cols-2">
+            {fast && (
+              <Cell label="Stufe 1 · Fundstellen (ohne LLM)" mono value={fast.hits.map((h, i) => `#${i + 1} ${h.docName} ${h.section.split(" ")[0]} · ${h.source} · cov ${h.coverage.toFixed(2)}${h.dense !== null ? ` · dense ${h.dense.toFixed(3)}` : ""} · Kernsatz ${h.key + 1}/${h.sentences.length}`).join("\n") || "keine"} />
+            )}
+            {fast && <Cell label="Stufe 1 · Fragetyp je Teilfrage" mono value={fast.trace.parts.map((x) => `${x.kind}${x.arg ? ` (${x.arg})` : ""} · cov ${x.coverage.toFixed(2)}${x.lexicalOk ? " · Boden ok" : ""}${x.densePath ? " · dense" : ""}${x.contradiction ? " · Widerspruch" : ""} — ${x.text}`).join("\n") || "—"} />}
+            {tr && <Cell label="Judge je Teilfrage" mono value={(tr.parts ?? []).map((x) => `${verdict(x.features?.judge)} · cov ${x.coverage.toFixed(2)}${x.reason ? ` · ${x.reason}` : ""} — ${x.text}`).join("\n") || "—"} />}
+            {tr && <Cell label="Verifier je Satz" mono value={(tr.sentences ?? []).map((x) => `${x.verified ? "OK" : "FAIL"} · ${x.source}${x.problems.length ? ` · ${x.problems.join(", ")}` : ""} — ${x.text}`).join("\n") || "keine Antwortsätze"} />}
+            {tr && <Cell label="RBAC Filter" mono value={`${tr.rbacFilter}  →  ${tr.searched} von ${tr.total} Chunks durchsuchbar`} />}
+            {tr && <Cell label="Engine" mono value={`${tr.engineMode ?? "—"}${tr.answerBy && tr.answerBy !== "none" ? ` · Antwort: ${tr.answerBy}` : ""}${tr.retrievalCached ? " · Retrieval aus Stufe 1" : ""}`} />}
+            {lat && <Cell label="Latenz Stufe 2 (ms)" mono value={(["rewrite", "rbac", "retrieval", "generation", "nli"] as const).filter((k) => lat[k] !== undefined).map((k) => `${k} ${lat[k]}`).concat(`Σ ${lat.total}`).join(" · ")} />}
+          </dl>
+        </div>
       )}
     </div>
   );
@@ -412,7 +495,7 @@ function Cell({ label, value, mono }: { label: string; value: string; mono?: boo
   return (
     <div className="bg-canvas px-4 py-3">
       <dt className="mb-1 text-[10px] uppercase tracking-wider text-faint">{label}</dt>
-      <dd className={`leading-5 text-muted ${mono ? "font-mono" : ""}`}>{value}</dd>
+      <dd className={`whitespace-pre-line leading-5 text-muted ${mono ? "font-mono" : ""}`}>{value}</dd>
     </div>
   );
 }

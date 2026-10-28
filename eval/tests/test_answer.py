@@ -253,6 +253,7 @@ class AnswerGate(unittest.TestCase):
         db = rag.read_db()
         idx = rag.lexical_index(db)
         target = next(i for i, c in enumerate(idx.chunks) if c["section"] == "§2 Ausleihe")
+        rag.reset_query_caches()  # the stage-1 retrieval cache keys on corpus + embedding model, not on a patched dense_scores
         return mock.patch.object(pipeline, "dense_scores", side_effect=lambda _db, view, _t: {i: (score if i == target else 0.1) for i in view.allowed})
 
     def test_dense_path_reaches_judge_below_lexical_floor(self) -> None:

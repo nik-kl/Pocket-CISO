@@ -115,6 +115,12 @@ def query(body: QueryBody, authorization: str | None = Header(default=None)) -> 
     return rag.run_query(bearer(authorization), body.question)
 
 
+@app.post("/query-fast")
+def query_fast(body: QueryBody, authorization: str | None = Header(default=None)) -> dict:
+    """Two-stage answers, stage 1: verbatim search hits with a key sentence, no LLM, no audit entry (stage 2 = /query)."""
+    return rag.run_fast(bearer(authorization), body.question)
+
+
 @app.post("/stage-file")
 async def stage_file(request: Request, authorization: str | None = Header(default=None)) -> dict:
     """Pipeline A — multipart (file + author + minRole [+ replaces, title]) OR JSON text."""

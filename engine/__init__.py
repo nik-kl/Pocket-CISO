@@ -12,7 +12,7 @@ from .ingest.chunk import chunk_document
 from .search.normalize import analyze, cistem, fold, INSTRUCTION_RE, Vocab
 from .search.facts import extract_facts, FACTS_VERSION, values_in
 from .search.lexical import DF0_CAP, key_terms, lexical_index
-from .search.dense import CAND_PER_DOC, diversify, fuse, reset_query_caches
+from .search.dense import CAND_PER_DOC, diversify, fuse, reset_query_caches as _reset_dense_caches
 from .staging import approve_diff, same_series, stage_document, stage_text
 from .inbox import start_inbox_watcher, sync_watched_inbox
 from .answer.verify import entities, has_value, value_dim, verify_sentence
@@ -22,4 +22,11 @@ from .answer.gate import (
 )
 from .answer.judge import judge_answerable, JUDGE_SYSTEM
 from .answer.compose import CONTRADICTION_LABEL, display_span
-from .answer.pipeline import run_query
+from .answer.pipeline import reset_retrieval_cache, run_fast, run_query
+from .answer.keysentence import key_sentence, question_kind
+
+
+def reset_query_caches() -> None:
+    """Query-vector, DB and stage-1 retrieval caches (eval: a second pass must not be served from them)."""
+    _reset_dense_caches()
+    reset_retrieval_cache()
