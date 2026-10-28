@@ -634,3 +634,18 @@ class WhoVeto(unittest.TestCase):
         self.assertEqual(verify.judge_veto(q, "who", None, [("Der Hallenkran wird jährlich geprüft.", path)]), "kein Akteur")
         self.assertIsNone(verify.judge_veto(q, "who", None, [("Den Hallenkran gibt die Schichtleitung frei.", path)]))
         self.assertIsNone(verify.judge_veto(q, "who", None, [("Die Freigabe erteilt die Instandhaltungsabteilung.", path)]))
+
+    def test_role_must_stand_with_the_asked_act(self) -> None:
+        q, path = "Wer genehmigt die Nutzung der Turnhalle?", "Hausordnung › Turnhalle"
+        self.assertEqual(verify.judge_veto(q, "who", None, [("Die Hausleitung öffnet die Turnhalle.", path)], acts=[False]), "Akteur ohne die gefragte Handlung")
+        self.assertIsNone(verify.judge_veto(q, "who", None, [("Die Hausleitung öffnet die Turnhalle, die Verwaltung genehmigt die Nutzung.", path)], acts=[True]))
+
+    def test_act_is_measured_in_the_sentence_not_the_section_title(self) -> None:
+        q = "Wer genehmigt die Nutzung der Turnhalle?"
+        for text, kind in (("Die Hausleitung öffnet die Turnhalle am Morgen.", "search"),
+                           ("Die Hausleitung öffnet die Turnhalle, die Verwaltung genehmigt die Nutzung.", "answer")):
+            fresh_db([("Hausordnung.md", "§1 Genehmigung der Nutzung", "L1", text)])
+            lexical._LEX_CACHE = None
+            with stub_llm("JA"):
+                res = rag.run_query(token("L1"), q)
+            self.assertEqual(res["result"]["kind"], kind, text)

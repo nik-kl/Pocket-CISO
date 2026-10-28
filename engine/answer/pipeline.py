@@ -158,12 +158,18 @@ def _retrieve(db: dict[str, Any], idx: "LexIndex", view: "RoleView", q: str) -> 
     return Retrieval(texts, context, injection, parts, dense_all is not None, best_dense, candidate_docs, int((time.perf_counter() - t) * 1000))
 
 
-def _veto(idx: Any, view: Any, p: Part, windows: list[list[tuple[int, int]]]) -> str | None:
-    """Safety checks on a judge JA (verify.judge_veto) over the spans the judge saw, each with its outline path."""
+POINTS_BACK = re.compile(r"\b(?:dar?(?:fur|zu|bei|von|mit|uber|an|auf|um)|hierfur|hierzu|it|them|this|that)\b")  # folded text
+
+
+def _veto(idx: Any, view: Any, p: Part, windows: list[list[tuple[int, int]]], question: str) -> str | None:
+    """Safety checks on a judge JA (verify.judge_veto) over the spans the judge saw, each with its outline path. `acts`: the
+    sentence itself covers the part's key terms (no section title); a part pointing back ("wer ist dafür zuständig") takes
+    the key terms of the whole question, where the act is named."""
     kind, arg = question_kind(p.text, p.value, p.who, p.flag_text)
     refs = [(i, k) for w in windows for i, k in w][:6]
+    qt = key_terms(question, view) if POINTS_BACK.search(fold(p.text)) else p.qt
     return judge_veto(p.text, kind, arg, [(idx.span_text[i][k], f"{doc_title(idx.chunks[i]['docName'])} › {section_title(idx.chunks[i]['section'])}")
-                                          for i, k in refs], view.vocab)
+                                          for i, k in refs], view.vocab, [coverage(qt, idx.span_terms[i][k], frozenset()) >= GATE_COVERAGE for i, k in refs])
 
 
 def run_query(token: str | None, question: str) -> dict[str, Any]:
@@ -190,7 +196,7 @@ def run_query(token: str | None, question: str) -> dict[str, Any]:
         if use_llm and (part.lexical_ok and not part.contradiction or part.dense_ok):
             part.features["judge"] = judge_answerable(part.text + ctx_note, [idx.span_text[i][k] for w in part.windows for i, k in w][:6])
         part.answered = (part.lexical_ok or part.dense_ok) and (part.features or {}).get("judge") is True and not part.contradiction
-        veto = _veto(idx, view, part, part.windows) if part.answered else None
+        veto = _veto(idx, view, part, part.windows, q) if part.answered else None
         if veto:
             part.answered, part.features["veto"] = False, veto
         if not part.answered and part.windows:
@@ -206,7 +212,7 @@ def run_query(token: str | None, question: str) -> dict[str, Any]:
             ws = [w for w in pool if not p.value or window_ok(idx, p, w)]  # role names are left to the judge here
             spans = [idx.span_text[i][k] for w in ws for i, k in w][:6]
             p.pooled = bool(spans)
-            if spans and judge_answerable(f"{p.text} (Gesamtfrage: {q})", spans) is True and not _veto(idx, view, p, ws):
+            if spans and judge_answerable(f"{p.text} (Gesamtfrage: {q})", spans) is True and not _veto(idx, view, p, ws, q):
                 p.windows, p.answered, p.reason = ws, True, ""
                 p.coverage = max(p.coverage, coverage(p.qt, frozenset().union(*(window_terms(idx, w) for w in ws))))
                 p.features = {**(p.features or {}), "pool": True}

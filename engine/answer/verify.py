@@ -150,10 +150,11 @@ EXCEPTION_RE = re.compile(r"\b(?:abweichend\w*|ausnahme\w*|sonderregel\w*|except
 GLOSSARY_LINE = re.compile(r"^[^:|]{2,60}?(?:\s*\([^)]*\))?:\s+(?:der|die|das|ein\w*|the|an?)\b", re.I)  # "Term (Alias): Der …"
 
 
-def span_problem(question: str, kind: str, dim: str | None, span: str, path: str, vocab: Vocab | None = None) -> str | None:
+def span_problem(question: str, kind: str, dim: str | None, span: str, path: str, vocab: Vocab | None = None, acts: bool = True) -> str | None:
     """Why one span cannot carry the answer: an acronym/identifier of the question is missing from span and outline path;
     a glossary definition for a question that asks no definition; a who-question without a role or organisational unit
-    in the span (as for the key sentence); a table row whose asked value sits under a column label unrelated to the
+    in the span (as for the key sentence) or a role in a sentence without the asked act (`acts`: the span covers the
+    part's key terms, computed by the caller); a table row whose asked value sits under a column label unrelated to the
     question (value question; stems and compound parts as in retrieval: "melden" matches "Meldefrist")."""
     if any(fold(a).rstrip("s") not in fold(span + " " + path) for a in IDENT_RE.findall(question)):
         return "Kennung fehlt"
@@ -162,6 +163,8 @@ def span_problem(question: str, kind: str, dim: str | None, span: str, path: str
         return "Definition statt Antwort"
     if kind == "who" and not names_actor(span):
         return "kein Akteur"
+    if kind == "who" and not acts:
+        return "Akteur ohne die gefragte Handlung"
     if kind == "value" and table:
         cells = [c.split(": ", 1) for c in TABLE_LABEL.sub("", span).split(" | ") if ": " in c]
         asked = set(analyze(question, vocab))
@@ -170,12 +173,13 @@ def span_problem(question: str, kind: str, dim: str | None, span: str, path: str
     return None
 
 
-def judge_veto(question: str, kind: str, dim: str | None, spans: list[tuple[str, str]], vocab: Vocab | None = None) -> str | None:
+def judge_veto(question: str, kind: str, dim: str | None, spans: list[tuple[str, str]], vocab: Vocab | None = None,
+               acts: list[bool] | None = None) -> str | None:
     """Reason to overrule the judge's JA, or None. `spans` = (text, outline path). A one-word fragment is no question; an
     exception/deviating rule the question does not ask for is no answer to the rule; otherwise one span must pass span_problem."""
     if len(question.split()) == 1 and "?" not in question:
         return "Fragment"
     if not EXCEPTION_RE.search(fold(question)) and any(EXCEPTION_RE.search(fold(s)) for s, _ in spans):
         return "ungefragte Ausnahme"
-    problems = [span_problem(question, kind, dim, s, p, vocab) for s, p in spans]
+    problems = [span_problem(question, kind, dim, s, p, vocab, True if acts is None else acts[n]) for n, (s, p) in enumerate(spans)]
     return None if not problems or None in problems else problems[0]
