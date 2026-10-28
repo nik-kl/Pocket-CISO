@@ -132,3 +132,41 @@ def has_value(dim: str, text: str) -> bool:
     if dim == "count":
         return bool(vals) or time or bool(COUNT_WORDS.search(f))
     return bool(vals) or time or freq
+
+
+# Safety checks on a judge JA (the LLM confirms spans that answer something else); general wording only, no corpus terms.
+IDENT_RE = re.compile(r"\b[A-ZÄÖÜ]{2,}s?\b|\b[A-Za-z]+\d[\w.]*\b")  # acronyms and identifiers of the question ('PINs', 'TLS1.3')
+EXCEPTION_RE = re.compile(r"\b(?:abweichend\w*|ausnahme\w*|sonderregel\w*|exception\w*|deviat\w*|notwithstanding)\b")
+GLOSSARY_LINE = re.compile(r"^[^:|]{2,60}?(?:\s*\([^)]*\))?:\s+(?:der|die|das|ein\w*|the|an?)\b", re.I)  # "Term (Alias): Der …"
+
+
+def _stems(text: str) -> set[str]:
+    # shortcut: 5-letter prefixes miss prefixed forms ("gemeldet" vs "Meldefrist") and then block; upgrade to the stemmer if that costs answers
+    return {w[:5] for w in re.findall(r"[a-z]{4,}", fold(text))}
+
+
+def span_problem(question: str, kind: str, dim: str | None, span: str, path: str) -> str | None:
+    """Why one span cannot carry the answer: an acronym/identifier of the question is missing from span and outline path;
+    a glossary definition for a question that asks no definition; a table row whose asked value sits under a column
+    label unrelated to the question (value question)."""
+    if any(fold(a).rstrip("s") not in fold(span + " " + path) for a in IDENT_RE.findall(question)):
+        return "Kennung fehlt"
+    table = span.startswith("Tabelle [")
+    if kind != "definition" and not table and GLOSSARY_LINE.search(span):
+        return "Definition statt Antwort"
+    if kind == "value" and table:
+        cells = [c.split(": ", 1) for c in TABLE_LABEL.sub("", span).split(" | ") if ": " in c]
+        if not any(has_value(dim or "value", v) and _stems(question) & _stems(label) for label, v in cells):
+            return "Wert aus anderer Tabellenspalte"
+    return None
+
+
+def judge_veto(question: str, kind: str, dim: str | None, spans: list[tuple[str, str]]) -> str | None:
+    """Reason to overrule the judge's JA, or None. `spans` = (text, outline path). A one-word fragment is no question; an
+    exception/deviating rule the question does not ask for is no answer to the rule; otherwise one span must pass span_problem."""
+    if len(question.split()) == 1 and "?" not in question:
+        return "Fragment"
+    if not EXCEPTION_RE.search(fold(question)) and any(EXCEPTION_RE.search(fold(s)) for s, _ in spans):
+        return "ungefragte Ausnahme"
+    problems = [span_problem(question, kind, dim, s, p) for s, p in spans]
+    return None if not problems or None in problems else problems[0]
