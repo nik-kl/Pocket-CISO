@@ -62,21 +62,24 @@ def compose_sentences(q: str, spans: list[tuple[str, str]], vocab: Vocab, use_ll
     """spans = [(span_id, text)] in answer order. Verbatim by default; the LLM may only combine/rephrase them (≤ 3 sentences),
     and every LLM sentence that fails the verifier is replaced by the verbatim spans it cited."""
     verbatim = [Sentence(display_span(t), [sid], "verbatim") for sid, t in spans]
-    if not use_llm or not spans:
+    # table rows stay verbatim: phrased rows dropped the asked column (the sanction of an IAM row) yet passed the verifier
+    prose = [(sid, t) for sid, t in spans if not TABLE_LABEL.match(t)]
+    if not use_llm or not prose:
         return verbatim, "verbatim"
     if not ANSWER_PHRASING:  # measurement variant: the answer is the verbatim evidence spans
         return verbatim, "verbatim (Formulierung aus)"
     text_of = dict(spans)
-    # the model keeps the 'Spalte: Wert | Spalte: Wert' row form (with '; ' it picked single cells of the wrong column)
-    prompt = "Frage: " + q + "\nTextstellen:\n" + "\n".join(f"[S{k + 1}] {TABLE_LABEL.sub('', t)}" for k, (_, t) in enumerate(spans)) + "\nAntwort:"
+    prompt = "Frage: " + q + "\nTextstellen:\n" + "\n".join(f"[S{k + 1}] {t}" for k, (_, t) in enumerate(prose)) + "\nAntwort:"
     out = OLLAMA.chat(PHRASE_SYSTEM, prompt, timeout=LLM_TIMEOUT, max_tokens=220)
     if not out:
         return verbatim, "verbatim (LLM nicht verfügbar)"
-    ids = [sid for sid, _ in spans]
+    ids = [sid for sid, _ in prose]
     result: list[Sentence] = []
     for s in parse_phrased(out, ids)[:3]:
         used = [sid for sid in s.spans if set(analyze(s.text, vocab)) & set(analyze(text_of[sid], vocab))]
         problems = verify_sentence(s.text, [text_of[sid] for sid in used], vocab)
+        if s.text.rstrip().endswith("?"):
+            problems = problems + ["question echoed"]  # the model repeated the question instead of answering it
         if problems:
             result += [Sentence(display_span(text_of[sid]), [sid], "verbatim", False, problems) for sid in (used or []) if not any(sid in r.spans for r in result)]
             continue
