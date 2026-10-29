@@ -88,9 +88,6 @@ class Heuristics(unittest.TestCase):
         self.assertTrue(rag.VALUE_Q.search(f("How long is the canteen open?")))
         self.assertFalse(rag.VALUE_Q.search(f("Wann darf ich die Kantine nutzen?")))  # "wann" alone asks for a condition
         self.assertTrue(rag.WHO_Q.search(f("Wer kocht in der Kantine?")))
-        self.assertTrue(rag.NORM_Q.search(f("Darf ich Gäste mitbringen?")))
-        self.assertTrue(rag.NORM_Q.search(f("Which badge must visitors wear?")))
-        self.assertFalse(rag.NORM_Q.search(f("Wer kocht in der Kantine?")))
 
     def test_entities_include_role_nouns(self) -> None:
         self.assertEqual(rag.entities("Die Küchenleitung und alle Mitarbeitenden sowie der DSB."), {"Küchenleitung", "Mitarbeitenden", "DSB"})

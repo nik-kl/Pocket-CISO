@@ -5,7 +5,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
-from .verify import PROHIBITION_RE, entities, modal_classes, numeric_terms
+from .verify import entities, numeric_terms
 from ..search.lexical import KeyTerm, QueryTerms, RoleView, coverage
 from ..search.normalize import FREQ_WORDS, INSTRUCTION_RE, R_STOP, _LEX, _edit_distance, cistem, fold, norm
 
@@ -47,8 +47,6 @@ VALUE_Q = re.compile(r"\b(?:wie (?:lange?|viele?\w*|oft|schnell|hoch|gross|fruh)
                      r"nach wie viel\w*|wieviele?|how (?:long|many|much|often|quickly|soon|fast)|within how|what is the (?:maximum|minimum|deadline|sla|interval)|"
                      r"which (?:deadline|interval|sla)|frist|deadline|intervall|interval)\b")
 WHO_Q = re.compile(r"\b(?:wer|wem|wen|who|whom)\b")
-# yes/no questions about permission or obligation are answered by a normative sentence (muss, darf, verboten, …)
-NORM_Q = re.compile(r"^(?:brauche\w*|can|am i|is it|are we|do i|do we)\b|\b(?:darf|durfen|muss|mussen|soll|sollen|may|must|erlaubt|zulassig|gestattet|verboten|untersagt|allowed|permitted|prohibited|forbidden|pflicht\w*|mandatory|required)\b")
 ANAPHOR = re.compile(r"^(?:er|sie|es|dies\w*|dabei|dazu|hierbei|this|these|it|they|he|she)(?![\w-])", re.I)  # not "IT-Bereitschaft"
 # words that always point back to a sentence; "es/it/sie" open policy sentences as dummy subject or address ("Es ist
 # untersagt …", "It is prohibited …", "Sie müssen …") and need no antecedent
@@ -79,7 +77,6 @@ class Part:
     value: bool
     who: bool
     windows: list[list[tuple[int, int]]]
-    norm: bool = False
     lexical_ok: bool = False
     capped_only: bool = False
     pooled: bool = False  # judged against the windows of the answered parts
@@ -233,11 +230,8 @@ def select_windows(idx: "LexIndex", view: RoleView, part: Part, ranked: list[int
     def key(w: list[tuple[int, int]]) -> tuple[float, float, int, int, str]:
         cov = coverage(part.qt, window_terms(idx, w), idx.ctx_terms[w[-1][0]])
         rank = min(rank_of.get(i, len(ranked)) for i, _ in w)
-        text = fold(" ".join(idx.span_text[i][k] for i, k in w))
-        normative = 0.08 if part.norm and (modal_classes(text) or PROHIBITION_RE.search(text)) else 0.0
-        # coverage first (+ small bonuses: better fused rank, normative sentence for yes/no questions), then shorter
-        # window, rank, span id (deterministic)
-        return (-(cov + 0.1 / (1 + rank) + normative), -cov, len(w), rank, w[-1])
+        # coverage first (+ a small bonus for a better fused rank), then shorter window, rank, span id (deterministic)
+        return (-(cov + 0.1 / (1 + rank)), -cov, len(w), rank, w[-1])
 
     scored = []
     for w in cands:

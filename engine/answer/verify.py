@@ -20,7 +20,6 @@ MODAL_CLASSES = {
     "possibility": re.compile(r"\b(?:kann|konnen|can|could)\b"),
 }
 
-PROHIBITION_RE = re.compile(r"\b(?:untersagt\w*|verbot\w*|unzulassig\w*|prohibit\w*|forbidden|never|nie|niemals)\b")
 
 
 def modal_classes(text: str) -> frozenset[str]:

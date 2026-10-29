@@ -13,7 +13,7 @@ from .compose import CONTRADICTION_LABEL, display_span, search_hits
 from .contradictions import find_contradiction
 from .evidence import entry_sentences, evidence_pack, pack_prompt
 from .gate import (
-    DOC_REF, GATE_COVERAGE, GATE_MISSING, NORM_Q, NO_ANSWER, Part, SEARCH_LABEL, UNCONFIRMED_LABEL, VALUE_Q, WHO_Q,
+    DOC_REF, GATE_COVERAGE, GATE_MISSING, NO_ANSWER, Part, SEARCH_LABEL, UNCONFIRMED_LABEL, VALUE_Q, WHO_Q,
     definition_window, dense_window, fact_chunks, fix_function_words, question_parts, select_windows, window_terms,
 )
 from .keysentence import key_sentence, question_kind
@@ -110,7 +110,7 @@ def _retrieve(db: dict[str, Any], idx: "LexIndex", view: "RoleView", q: str) -> 
     for ptext in texts:
         qt = key_terms(ptext, view)
         f = fix_function_words(ptext, view)
-        part = Part(ptext, qt, bool(VALUE_Q.search(f) or qt.unit_cues), bool(WHO_Q.search(f)), [], bool(NORM_Q.search(f)), flag_text=f)
+        part = Part(ptext, qt, bool(VALUE_Q.search(f) or qt.unit_cues), bool(WHO_Q.search(f)), [], flag_text=f)
         if not qt.keys or not view.n:
             part.reason = "keine Suchbegriffe" if view.n else "keine Fundstelle"
             parts.append(part)
