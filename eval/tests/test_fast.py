@@ -8,16 +8,15 @@ from helpers import fresh_db, rag, stub_llm, token
 from engine.search import lexical
 
 
-def pick(question: str, sentences: list[str], cov: list[float] | None = None, section: str = "") -> str:
+def pick(question: str, sentences: list[str], cov: list[float] | None = None) -> str:
     kind, arg = rag.question_kind(question)
-    return sentences[rag.key_sentence(kind, arg, sentences, cov or [1.0] * len(sentences), section)]
+    return sentences[rag.key_sentence(kind, arg, sentences, cov or [1.0] * len(sentences))]
 
 
 class KeySentence(unittest.TestCase):
     def test_question_kinds(self) -> None:
         self.assertEqual(rag.question_kind("Wie oft wird das Boot gewartet?"), ("value", "frequency"))
         self.assertEqual(rag.question_kind("Wer gibt die Schlüssel aus?"), ("who", None))
-        self.assertEqual(rag.question_kind("Was bedeutet SKP?"), ("definition", "SKP"))
         self.assertEqual(rag.question_kind("Dürfen Hunde mit an Bord?"), ("other", None))
         self.assertEqual(rag.question_kind("Wo liegt das Clubhaus?"), ("other", None))
 
@@ -36,12 +35,6 @@ class KeySentence(unittest.TestCase):
         self.assertEqual(pick("Wer gibt die Schlüssel aus?", s, [1.0, 0.5, 0.6]), s[1])
         e = ["Reklamationen werden schriftlich angenommen.", "Zuständig ist der Filialleiter."]
         self.assertEqual(pick("Wer nimmt Reklamationen an?", e, [1.0, 0.4]), e[1])
-
-    def test_definition_takes_the_explaining_sentence(self) -> None:
-        s = ["Vor dem Ablegen ist die SKP durchzuführen.", "SKP bezeichnet die Sicherheitskontrolle vor dem Auslaufen des Bootes."]
-        self.assertEqual(pick("Was bedeutet SKP?", s, [1.0, 1.0]), s[1])
-        row = ["Tabelle [§1]: Kürzel: SKP | Bedeutung: Sicherheitskontrolle vor dem Ablegen"]
-        self.assertEqual(pick("Wofür steht SKP?", row + s[:1], [0.5, 1.0], "§1 Glossar"), row[0])
 
     def test_other_question_takes_the_highest_coverage_then_the_earlier_sentence(self) -> None:
         s = ["Der Hafen liegt am Nordufer.", "Das Clubhaus liegt am Hafen.", "Die Werft liegt am Südufer."]

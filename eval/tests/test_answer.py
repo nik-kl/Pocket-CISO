@@ -40,12 +40,7 @@ class ValueAnswers(unittest.TestCase):
         self.assertFalse(hv("count", "Die Führung beginnt am Eingang."))
 
 class Definitions(unittest.TestCase):
-    """Class a: a span spelling out the asked term answers a definition question (invented examples)."""
-
-    def test_term_of_a_definition_question(self) -> None:
-        for q, term in (("Was heißt ZFA?", "ZFA"), ("What does ZFA stand for?", "ZFA"), ("Wofür steht KTW-2?", "KTW-2"),
-                        ("Was bedeutet „Fundsachenruhe“?", "Fundsachenruhe"), ("Wer leitet die ZFA?", None)):
-            self.assertEqual(rag.definition_term(q), term, q)
+    """Abbreviation definitions spelled out in a span (invented examples)."""
 
     def test_span_spelling_out_the_term(self) -> None:
         self.assertTrue(rag.defines("Fundstücke gehen an die Zentrale Fundsachen-Annahme (ZFA).", "ZFA"))
@@ -90,33 +85,6 @@ class StableOrder(unittest.TestCase):
         self.assertEqual(self.answers(), first)
         self.build(["chk-m5", "chk-n6", "chk-k3", "chk-l4"], [3, 1, 0, 2])  # other list order
         self.assertEqual(self.answers(), first)
-
-
-class DefinitionPreference(unittest.TestCase):
-    """Stage 1: a span that defines AND explains the term beats a passing mention in another document (invented examples)."""
-
-    def run_def(self, docs: list[tuple[str, str, str, str]]) -> dict:
-        fresh_db(docs)
-        lexical._LEX_CACHE = None
-        rag.reset_query_caches()
-        return {"answer": rag.run_fast(token("L2"), "Was bedeutet ZFA?")["fast"]["hits"][0]["content"]}  # stage-1 definition hit
-
-    def test_glossary_row_beats_passing_mention(self) -> None:
-        res = self.run_def([("A Fundordnung.md", "§3 Abläufe", "L2", "Bei Ausfall der Zentralen Fundsachen-Annahme (ZFA) übernimmt der Empfang."),
-                            ("B Glossar.md", "§9 Begriffe", "L2", "Tabelle [§9 Begriffe]: Begriff: ZFA | Bedeutung: Zentrale Fundsachen-Annahme, "
-                             "Annahmestelle für alle im Gebäude gefundenen Gegenstände.")])  # chunker statement of a glossary row
-        self.assertIn("Annahmestelle für alle im Gebäude gefundenen Gegenstände", res["answer"])  # the explanation, not only the long form
-        self.assertNotIn("Empfang", res["answer"])
-
-    def test_defining_sentence_beats_passing_mention(self) -> None:
-        res = self.run_def([("A Fundordnung.md", "§3 Abläufe", "L2", "Bei Ausfall der Zentralen Fundsachen-Annahme (ZFA) übernimmt der Empfang."),
-                            ("B Fundordnung.md", "§1 Zweck", "L2", "Die ZFA ist die zentrale Annahmestelle für Fundsachen im Werk.")])
-        self.assertIn("zentrale Annahmestelle für Fundsachen", res["answer"])
-
-    def test_passing_mention_only_when_nothing_explains(self) -> None:
-        res = self.run_def([("A Fundordnung.md", "§3 Abläufe", "L2", "Bei Ausfall der Zentralen Fundsachen-Annahme (ZFA) übernimmt der Empfang."),
-                            ("B Fundordnung.md", "§4 Zeiten", "L2", "Die ZFA ist bei Betriebsurlaub geschlossen.")])  # no explanation
-        self.assertIn("Zentralen Fundsachen-Annahme (ZFA)", res["answer"])
 
 
 class InjectionAndTypos(unittest.TestCase):

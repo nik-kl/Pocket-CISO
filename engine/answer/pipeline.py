@@ -14,7 +14,7 @@ from .contradictions import find_contradiction
 from .evidence import entry_sentences, evidence_pack, pack_prompt
 from .gate import (
     DOC_REF, GATE_COVERAGE, GATE_MISSING, NO_ANSWER, Part, SEARCH_LABEL, UNCONFIRMED_LABEL, VALUE_Q, WHO_Q,
-    definition_window, dense_window, fact_chunks, fix_function_words, question_parts, select_windows, window_terms,
+    dense_window, fact_chunks, fix_function_words, question_parts, select_windows, window_terms,
 )
 from .keysentence import key_sentence, question_kind
 from .structured import ask, checked
@@ -278,7 +278,7 @@ def _hit(idx: "LexIndex", part: Part, spans: list[tuple[int, int]], kind: str, a
     i = spans[-1][0]
     texts = [idx.span_text[x][k] for x, k in spans]
     cov = [coverage(part.qt, idx.span_terms[x][k]) for x, k in spans]
-    key = key_sentence(kind, arg, texts, cov, idx.chunks[i]["section"])
+    key = key_sentence(kind, arg, texts, cov)
     sentences = [display_span(t) for t in texts]
     c = idx.chunks[i]
     return {"chunkId": c["id"], "docName": c["docName"], "section": c["section"], "sentences": sentences,
@@ -294,7 +294,7 @@ def _chunk_spans(idx: "LexIndex", part: Part, i: int, kind: str, arg: str | None
     if not ok:
         return []
     cov = [coverage(part.qt, idx.span_terms[i][k]) for k in ok]
-    key = ok[key_sentence(kind, arg, [idx.span_text[i][k] for k in ok], cov, idx.chunks[i]["section"])]
+    key = ok[key_sentence(kind, arg, [idx.span_text[i][k] for k in ok], cov)]
     best = max(cov)
     rel = sorted((k for k, cv in zip(ok, cov) if best > 0 and cv >= 0.5 * best), key=lambda k: (-cov[ok.index(k)], k))
     keep = sorted(list(dict.fromkeys([key] + rel))[:3])
@@ -302,17 +302,13 @@ def _chunk_spans(idx: "LexIndex", part: Part, i: int, kind: str, arg: str | None
 
 
 def fast_hits(idx: "LexIndex", view: "RoleView", parts: list[Part], limit: int = FAST_HITS) -> list[dict[str, Any]]:
-    """Stage-1 hits: per part the defining span of a definition question, its selected windows, then further ranked chunks
+    """Stage-1 hits: per part its selected windows, then further ranked chunks
     (same floor as search_hits: lexical floor without capped-only matches, or the dense gate); parts interleaved, ≤ `limit`
     chunks. RBAC-filtered by construction (windows and ranks come from the role view only)."""
     per_part: list[list[dict[str, Any]]] = []
     for p in parts:
         kind, arg = question_kind(p.text, p.value, p.who, p.flag_text)
         cands: list[dict[str, Any]] = []
-        if kind == "definition":
-            w = definition_window(idx, view, p.ranked, arg)
-            if w:
-                cands.append(_hit(idx, p, w, kind, arg, "definition"))
         if (p.lexical_ok and not p.capped_only) or p.dense_ok:
             cands += [_hit(idx, p, w, kind, arg, "window") for w in p.windows]
             for i in p.ranked:
