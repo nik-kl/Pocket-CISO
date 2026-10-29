@@ -137,6 +137,17 @@ class StructuredAnswer(unittest.TestCase):
         right = part("bis wann erfolgt die Rückgabe?", "Nach drei Tagen.", "Die Rückgabe erfolgt spätestens nach drei Tagen")
         self.assertEqual([p["checked"] for p in ask_v2([self.RESERVE, right], question=q)["result"]["trace"]["answerParts"]], ["answered", "answered"])
 
+    def test_shown_span_without_the_phrasing_must_cover_the_sub_question(self) -> None:
+        fresh_db(DOC + [("Fuhrpark.md", "§3 Freigaben", "L2", "Die Werkstatt erteilt fachliche Freigaben ihrer Geräte.")])
+        lexical._LEX_CACHE = None
+        rag.reset_query_caches()
+        q = "Wie werden Dienstwagen reserviert und wer muss Dienstwagen für Auslandsfahrten freigeben?"
+        off = part("wer muss Dienstwagen für Auslandsfahrten freigeben?", "Die Werkstatt muss das freigeben.", "Die Werkstatt erteilt fachliche Freigaben")
+        for n in (1, 2, 3):  # whichever span the Werkstatt sentence got, the distorted phrasing (added "muss") is dropped
+            off["quotes"][0]["span"] = f"S{n}"
+            parts = ask_v2([self.RESERVE, off], question=q)["result"]["trace"]["answerParts"]
+            self.assertNotEqual(parts[1]["checked"], "answered")  # the span alone answers another question
+
     def test_document_named_in_the_question_is_the_only_source(self) -> None:
         fresh_db(DOC + [("Reiseordnung.md", "§1 Dienstwagen", "L2", "Dienstwagen werden über das Sekretariat reserviert.")])
         lexical._LEX_CACHE = None

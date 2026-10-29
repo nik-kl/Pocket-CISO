@@ -228,7 +228,7 @@ def run_query(token: str | None, question: str) -> dict[str, Any]:
     # a document the question names ("laut BIA", "according to the playbook"; generic words aside) is the only source
     named = {w for m in DOC_REF.finditer(fold(asked)) for w in m.group(1).split("-")} - GENERIC_WORDS
     in_named = {n for n, e in enumerate(pack) if named & set(re.findall(r"[a-z0-9]+", fold(doc_title(idx.chunks[e.chunk]["docName"]))))}
-    results = [(mp, *checked(mp, [entry_sentences(idx, e) for e in pack], asked, view.vocab, in_named or None)) for mp in model or []]
+    results = [(mp, *checked(mp, [entry_sentences(idx, e) for e in pack], asked, view, in_named or None)) for mp in model or []]
     lat["generation"] = int((time.perf_counter() - t) * 1000)
     trace["pack"] = [{"span": f"S{n + 1}", "chunkId": idx.chunks[e.chunk]["id"], "docName": idx.chunks[e.chunk]["docName"]} for n, e in enumerate(pack)]
     trace["answerParts"] = [{"question": str(mp.get("question") or ""), "status": mp.get("status"), "type": mp.get("type"), "checked": st, "reason": why,

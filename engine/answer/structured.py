@@ -10,7 +10,9 @@ from typing import Any
 from .verify import answer_problems, has_value, value_dim
 from ..config import LLM_TIMEOUT
 from ..llm import OLLAMA
-from ..search.normalize import Vocab
+from .gate import GATE_COVERAGE
+from ..search.lexical import RoleView, coverage, key_terms
+from ..search.normalize import analyze
 
 STATUSES = ("answered", "partial", "not_found")
 TYPES = ("value", "role", "norm", "definition", "list", "yesno", "other")
@@ -99,7 +101,7 @@ def ask(question: str, context: list[str], pack: str) -> list[dict[str, Any]] | 
     return [p for p in parts if isinstance(p, dict)][:MAX_PARTS] or None
 
 
-def checked(part: dict[str, Any], entries: list[list[str]], asked: str, vocab: Vocab | None = None,
+def checked(part: dict[str, Any], entries: list[list[str]], asked: str, view: RoleView | None = None,
             allowed: set[int] | None = None) -> tuple[str, list[tuple[int, str]], str, str]:
     """Deterministic guarantees on one model part → (status, passages [(pack index, source sentences)], answer, problem).
     The sub-question must be copied from the asked text (`locate`), else the part is "unasked" (dropped: the user did not
@@ -109,10 +111,12 @@ def checked(part: dict[str, Any], entries: list[list[str]], asked: str, vocab: V
     source sentences it points into, within the span it names (one of `allowed`: the document the question names); an
     answered part needs one. The answer must pass answer_problems against them: what it adds — a number, a role, a
     negation they lack — makes the part not_found; what it drops or distorts — their negation, their modality — makes the
-    whole cited spans the answer instead of the phrasing. A leading Ja/Nein/Yes/No is a verdict drawn by the model,
-    never shown."""
+    whole cited spans the answer instead of the phrasing, but only when they cover the sub-question's key terms
+    (coverage ≥ GATE_COVERAGE, as the retrieval floor): without the phrasing, an off-topic span would answer another
+    question. A leading Ja/Nein/Yes/No is a verdict drawn by the model, never shown."""
     status = part.get("status") if part.get("status") in STATUSES else "not_found"
-    if not locate(str(part.get("question") or ""), asked):
+    question = str(part.get("question") or "")
+    if not locate(question, asked):
         return "unasked", [], "", "Teilfrage nicht aus der Frage"
     if status != "answered":
         return "not_found", [], "", "nur teilweise belegt" if status == "partial" else ""
@@ -126,14 +130,17 @@ def checked(part: dict[str, Any], entries: list[list[str]], asked: str, vocab: V
             found.append((n, text))
     if not found:
         return "not_found", [], "", "kein wörtliches Zitat"
-    dim = value_dim(str(part.get("question") or ""))  # a sub-question asking how often / how many / how long / by when
+    dim = value_dim(question)  # a sub-question asking how often / how many / how long / by when
     if dim != "value" and not has_value(dim, " ".join(t for _, t in found)):
         return "not_found", [], "", f"kein Wert der gefragten Art ({dim})"
     answer = VERDICT.sub("", str(part.get("answer") or "")).strip()
+    vocab = view.vocab if view else None
     problems = answer_problems(answer, [t for _, t in found], vocab)
     if any(p.startswith(("Zahl", "Rolle", "Verneinung ohne")) for p in problems):
         return "not_found", [], "", "; ".join(problems)
     if problems:
-        whole = list(dict.fromkeys(n for n, _ in found))
-        return status, [(n, " ".join(entries[n])) for n in whole], "", "Formulierung verworfen: " + "; ".join(problems)
+        whole = [(n, " ".join(entries[n])) for n in dict.fromkeys(n for n, _ in found)]
+        if view and coverage(key_terms(question, view), frozenset(analyze(" ".join(t for _, t in whole), vocab))) < GATE_COVERAGE:
+            return "not_found", [], "", "Formulierung verworfen, Stelle ohne die Begriffe der Teilfrage"
+        return status, whole, "", "Formulierung verworfen: " + "; ".join(problems)
     return status, found, answer[:1].upper() + answer[1:], ""
