@@ -129,6 +129,14 @@ class StructuredAnswer(unittest.TestCase):
             res = ask_v2([p], question="Wie werden Dienstwagen reserviert?")
             self.assertNotEqual(res["result"]["kind"], "answer")  # an unsupported "nicht" / a half answer is no answer
 
+    def test_explicit_value_question_needs_a_value_of_its_kind(self) -> None:
+        q = "Wie werden Dienstwagen reserviert und bis wann erfolgt die Rückgabe?"
+        wrong = part("bis wann erfolgt die Rückgabe?", "Über das Portal.", "Dienstwagen werden über das Buchungsportal reserviert")
+        res = ask_v2([self.RESERVE, wrong], question=q)
+        self.assertEqual(res["result"]["trace"]["answerParts"][1]["reason"], "kein Wert der gefragten Art (deadline)")  # no deadline there
+        right = part("bis wann erfolgt die Rückgabe?", "Nach drei Tagen.", "Die Rückgabe erfolgt spätestens nach drei Tagen")
+        self.assertEqual([p["checked"] for p in ask_v2([self.RESERVE, right], question=q)["result"]["trace"]["answerParts"]], ["answered", "answered"])
+
     def test_document_named_in_the_question_is_the_only_source(self) -> None:
         fresh_db(DOC + [("Reiseordnung.md", "§1 Dienstwagen", "L2", "Dienstwagen werden über das Sekretariat reserviert.")])
         lexical._LEX_CACHE = None

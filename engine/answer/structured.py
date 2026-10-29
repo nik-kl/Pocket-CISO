@@ -7,7 +7,7 @@ import re
 import unicodedata
 from typing import Any
 
-from .verify import answer_problems
+from .verify import answer_problems, has_value, value_dim
 from ..config import LLM_TIMEOUT
 from ..llm import OLLAMA
 from ..search.normalize import Vocab
@@ -103,7 +103,9 @@ def checked(part: dict[str, Any], entries: list[list[str]], asked: str, vocab: V
             allowed: set[int] | None = None) -> tuple[str, list[tuple[int, str]], str, str]:
     """Deterministic guarantees on one model part → (status, passages [(pack index, source sentences)], answer, problem).
     The sub-question must be copied from the asked text (`locate`), else the part is "unasked" (dropped: the user did not
-    ask it). Only "answered" answers: "partial" is an open part like "not_found". A quote counts only as the complete
+    ask it). Only "answered" answers: "partial" is an open part like "not_found". A sub-question that explicitly asks
+    for a frequency, count, duration or deadline (value_dim) needs a value of that kind in its passages (has_value),
+    else it is not_found: the passages then answer another question. A quote counts only as the complete
     source sentences it points into, within the span it names (one of `allowed`: the document the question names); an
     answered part needs one. The answer must pass answer_problems against them: what it adds — a number, a role, a
     negation they lack — makes the part not_found; what it drops or distorts — their negation, their modality — makes the
@@ -124,6 +126,9 @@ def checked(part: dict[str, Any], entries: list[list[str]], asked: str, vocab: V
             found.append((n, text))
     if not found:
         return "not_found", [], "", "kein wörtliches Zitat"
+    dim = value_dim(str(part.get("question") or ""))  # a sub-question asking how often / how many / how long / by when
+    if dim != "value" and not has_value(dim, " ".join(t for _, t in found)):
+        return "not_found", [], "", f"kein Wert der gefragten Art ({dim})"
     answer = VERDICT.sub("", str(part.get("answer") or "")).strip()
     problems = answer_problems(answer, [t for _, t in found], vocab)
     if any(p.startswith(("Zahl", "Rolle", "Verneinung ohne")) for p in problems):
