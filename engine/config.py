@@ -22,14 +22,12 @@ LLM_API_KEY = os.getenv("LLM_API_KEY", "")
 # answering model: 30B MoE on the target box (Mac Mini 32 GB, 18.7 GB with bge-m3); fallback profile LLM_MODEL=qwen2.5:7b
 # (4.8 GB); a missing model falls back to any installed chat model (OllamaClient.llm_model)
 LLM_MODEL = os.getenv("LLM_MODEL", "qwen3:30b-a3b-instruct-2507-q4_K_M")
-# answerability judge and staging conflict pairs; may be a larger model than the phrasing one, falls back to LLM_MODEL
+# staging conflict pairs; may be a larger model than the answering one, falls back to LLM_MODEL
 JUDGE_MODEL = os.getenv("JUDGE_MODEL") or LLM_MODEL
-# measurement variant only: ANSWER_PHRASING=0 answers with the verbatim evidence spans instead of LLM phrasing
-ANSWER_PHRASING = os.getenv("ANSWER_PHRASING", "1") != "0"
 EMBED_MODEL = os.getenv("EMBED_MODEL", "bge-m3")
 LLM_TIMEOUT = float(os.getenv("LLM_TIMEOUT", "14"))
-# chat context and residency: judge/phrasing prompts are < 2k tokens, so 4096 is enough and keeps a 14B model at ~10 GB
-# instead of its 32k default; keep_alive 30m avoids the cold start (qwen3:14b ~16 s) between queries
+# chat context and residency: the structured answer prompt stays below 2k tokens (pack ≤ ~1.4k on dev), so 4096 is enough and
+# keeps the model far below its 32k default; keep_alive 30m avoids the cold start between queries
 LLM_NUM_CTX = int(os.getenv("LLM_NUM_CTX", "4096"))
 LLM_KEEP_ALIVE = os.getenv("LLM_KEEP_ALIVE", "30m")
 EMBED_TIMEOUT = float(os.getenv("EMBED_TIMEOUT", "20"))

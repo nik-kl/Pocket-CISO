@@ -8,7 +8,7 @@ from unittest import mock
 
 from helpers import fresh_db, rag, token
 from engine.answer.evidence import entry_text, evidence_pack, pack_prompt
-from engine.answer.pipeline import retrieve, run_query_v2
+from engine.answer.pipeline import retrieve, run_query
 from engine.answer.structured import locate, passage
 from engine.answer.verify import answer_problems
 from engine.search import lexical
@@ -64,7 +64,7 @@ def ask_v2(reply: object, question: str = "Wie werden Dienstwagen reserviert und
     rag.reset_query_caches()
     out = reply if isinstance(reply, str) or reply is None else json.dumps({"parts": reply}, ensure_ascii=False)
     with mock.patch.object(rag.OLLAMA, "llm_model", return_value="stub"), mock.patch.object(rag.OLLAMA, "chat", return_value=out) as chat:
-        res = run_query_v2(token("L2"), question)
+        res = run_query(token("L2"), question)
     res["sent"] = chat.call_args
     return res
 
@@ -144,7 +144,7 @@ class StructuredAnswer(unittest.TestCase):
         for span in ("S1", "S2"):
             reply = json.dumps({"parts": [part("Wie werden Dienstwagen laut Reiseordnung reserviert?", "", "Dienstwagen werden über das", span=span)]})
             with mock.patch.object(rag.OLLAMA, "llm_model", return_value="stub"), mock.patch.object(rag.OLLAMA, "chat", return_value=reply):
-                res = run_query_v2(token("L2"), "Wie werden Dienstwagen laut Reiseordnung reserviert?")
+                res = run_query(token("L2"), "Wie werden Dienstwagen laut Reiseordnung reserviert?")
             shown = res["answer"] if res["result"]["kind"] == "answer" else ""
             self.assertNotIn("Buchungsportal", shown)  # never quoted from the document the question does not name
 

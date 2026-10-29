@@ -7,6 +7,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import sys
 import tempfile
 import time
@@ -30,6 +31,7 @@ sys.path[:0] = [str(ROOT), str(ROOT / "eval")]
 
 import engine as rag  # noqa: E402
 from eval import make_pdf  # noqa: E402,F401  (re-exported for the PDF tests)
+from engine.search.normalize import split_sentences  # noqa: E402
 
 SECRET = os.environ["POCKET_CISO_SECRET"]
 
@@ -63,9 +65,17 @@ def fresh_db(chunks: list[dict]) -> None:
 
 @contextmanager
 def stub_llm(judge: str | None = "JA"):
-    """Deterministic stand-in for Ollama: the answerability judge replies `judge` (None = no reply), phrasing never
-    replies, so answers stay verbatim."""
+    """Deterministic stand-in for Ollama's structured answer call: "JA" answers the whole question with no phrasing,
+    quoting the sentence of [S1] that shares most words with it; "NEIN" answers not_found; None = no reply."""
     def chat(system: str, user: str, **_: object) -> str | None:
-        return judge if system == rag.JUDGE_SYSTEM else None
+        if judge is None or "[S1] " not in user:
+            return None
+        q = user.split("\n", 1)[0].removeprefix("Frage: ")
+        text = user.split("[S1] ", 1)[1].split("\n")[1]
+        words = set(re.findall(r"\w+", q.lower()))
+        quote = max(split_sentences(text) or [text], key=lambda t: len(words & set(re.findall(r"\w+", t.lower()))))
+        part = {"question": q, "quotes": [{"span": "S1", "text": quote}], "status": "answered" if judge == "JA" else "not_found",
+                "answer": "", "type": "other"}
+        return json.dumps({"parts": [part]}, ensure_ascii=False)
     with mock.patch.object(rag.OLLAMA, "llm_model", return_value="stub"), mock.patch.object(rag.OLLAMA, "chat", side_effect=chat):
         yield

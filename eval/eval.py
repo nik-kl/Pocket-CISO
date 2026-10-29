@@ -592,28 +592,24 @@ def metrics(mode: str, questions: list[dict[str, Any]], raw: dict[str, Any], pas
 
 
 def rejection_reason(part: dict[str, Any], contradiction: bool) -> str:
-    """Why an unanswered question part was not answered (aggregate diagnostics; thresholds mirror engine/answer/gate.py)."""
+    """Why a question part of an unanswered question got no answer (aggregate diagnostics; thresholds mirror engine/answer/gate.py)."""
     sys.path.insert(0, str(ROOT))
     from engine.answer.gate import DENSE_GATE, GATE_COVERAGE, GATE_MISSING
     f = part.get("features") or {}
     dense = " + Dense < %.2f" % DENSE_GATE if f.get("dense") is not None else ""
-    if f.get("judge") is False:
-        return "Judge NEIN" + (" (Dense-Pfad)" if f.get("densePath") else "")
-    if "judge" in f and f["judge"] is None:
-        return "Judge ohne Antwort"
-    if part.get("reason", "").startswith("kein Wert der gefragten Art"):
-        return "Wertfrage ohne Wert der Dimension"
     if contradiction:
         return "Widerspruch (nur Fundstellen)"
     if not f or "coverage" not in f:
         return "keine Fundstelle / keine Suchbegriffe"
+    if f.get("densePath"):
+        return "Dense-Pfad, Modell/Prüfung ohne Antwort"
     if f["coverage"] < GATE_COVERAGE:
         return f"Abdeckungsschwelle (< {GATE_COVERAGE}){dense}"
     if (f.get("missingMax") or 0) > GATE_MISSING:
         return f"missingMax (> {GATE_MISSING}){dense}"
     if part.get("reason") == "kein Wert/keine Rolle in den Fundstellen":
         return "kein Wert / keine Rolle im Fenster"
-    return "ohne LLM: nur Fundstellen" if "judge" not in f else "sonst"
+    return "über der Schwelle, Modell/Prüfung ohne Antwort (siehe v2-Teilfragen)"
 
 
 def diagnostics(m: dict[str, Any]) -> dict[str, Any]:
@@ -631,9 +627,7 @@ def diagnostics(m: dict[str, Any]) -> dict[str, Any]:
             continue
         if not s["trace"].get("parts") and s["kind"] != "answer":
             reasons["Trace ohne Teilfragen (Node-Engine)"] += 1
-        for p in s["trace"].get("parts") or []:
-            if p.get("answered"):
-                continue
+        for p in s["trace"].get("parts") or [] if s["kind"] != "answer" else []:  # v2 answers per model part, not per retrieval part
             reasons[rejection_reason(p, bool(s["trace"].get("contradiction")))] += 1
             hist[min(9, int(float(p.get("coverage") or 0.0) * 10))] += 1
     chunks = m.get("chunks") or []
@@ -650,7 +644,7 @@ def diagnostics_md(ms: list[dict[str, Any]]) -> str:
     for m in ms:
         d = m["diagnostics"]
         imp = d["import"]
-        md += f"\n### {m['mode']}\nAblehnungsgründe (Teilfragen beantwortbarer Fragen, nicht beantwortet): " + \
+        md += f"\n### {m['mode']}\nAblehnungsgründe (Teilfragen unbeantworteter beantwortbarer Fragen): " + \
               (", ".join(f"{k}: {v}" for k, v in d["reasons"].items()) or "keine") + "\n"
         md += "v2-Teilfragen (Modell → Prüfung): " + (", ".join(f"{k}: {v}" for k, v in d.get("v2", {}).items()) or "keine") + "\n"
         md += "Abdeckung der abgelehnten Teilfragen: " + " · ".join(f"{k / 10:.1f}–{(k + 1) / 10:.1f}: {n}" for k, n in enumerate(d["hist"])) + "\n"
