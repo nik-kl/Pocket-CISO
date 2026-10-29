@@ -13,7 +13,7 @@ export POCKET_CISO_ENV=production POCKET_CISO_SECRET='<32+ random chars>' POCKET
 npm run engine                                                              # terminal 1
 npm run build && npm run start                                              # terminal 2 (NODE_ENV=production)
 ```
-First-time setup: `npm install` · `python3 -m venv engine/.venv && engine/.venv/bin/pip install -r engine/requirements.txt` (tests: `requirements-dev.txt`, adds reportlab) · demo inbox: `mkdir -p data/inbox && cp dummy-data/comp_1_policy-samples/docs/* data/inbox/` · optional `ollama pull qwen2.5:7b && ollama pull bge-m3`.
+First-time setup: `npm install` · `python3 -m venv engine/.venv && engine/.venv/bin/pip install -r engine/requirements.txt` (tests: `requirements-dev.txt`, adds reportlab) · demo inbox: `mkdir -p data/inbox && cp dummy-data/comp_1_policy-samples/docs/* data/inbox/` · optional `ollama pull qwen3:30b-a3b-instruct-2507-q4_K_M && ollama pull bge-m3` (fallback profile: `ollama pull qwen2.5:7b`, start with `LLM_MODEL=qwen2.5:7b`).
 **Always `rm -f tsconfig.tsbuildinfo` before `npx tsc --noEmit`.** Static checks: `engine/.venv/bin/python -m compileall -q engine eval`.
 
 ## Environment variables
@@ -28,7 +28,7 @@ First-time setup: `npm install` · `python3 -m venv engine/.venv && engine/.venv
 | `PYTHON_BACKEND_URL` | Node | default `http://127.0.0.1:8000` |
 | `TRUST_PROXY=1` | Node | Trust `X-Forwarded-For` for per-client rate limits. **Only behind a reverse proxy that overwrites the header** (otherwise clients can forge it); without it all callers share one `direct` bucket whose limits are ×10 and whose login limit is the account ceiling (30 per 15 min) |
 | `POCKET_CISO_RATE_LIMIT_MULT` | Node | Multiplier for the gateway rate limits (QA/load tests only) |
-| `OLLAMA_BASE_URL`, `LLM_MODEL` (qwen2.5:7b), `JUDGE_MODEL` (= `LLM_MODEL`), `EMBED_MODEL` (bge-m3), `ANSWER_PHRASING` (1) | Python | Phrasing model, judge model (answerability + staging conflict pairs), embeddings; `ANSWER_PHRASING=0` = verbatim evidence (measurement variant only); changing the embedding model rebuilds `data/vectors.json`; `qwen3*` models get `think: false` |
+| `OLLAMA_BASE_URL`, `LLM_MODEL` (qwen3:30b-a3b-instruct-2507-q4_K_M; fallback profile `qwen2.5:7b`, also used automatically when the 30B is not installed), `JUDGE_MODEL` (= `LLM_MODEL`), `EMBED_MODEL` (bge-m3), `ANSWER_PHRASING` (1) | Python | Phrasing model, judge model (answerability + staging conflict pairs), embeddings; `ANSWER_PHRASING=0` = verbatim evidence (measurement variant only); changing the embedding model rebuilds `data/vectors.json`; `qwen3*` models get `think: false` |
 | `LLM_NUM_CTX` (4096), `LLM_KEEP_ALIVE` (30m) | Python | Chat context size and model residency in Ollama (7B: 4.8 GB) |
 | `CONFLICT_SIM` (0.68), `ALIGN_SIM` (0.60) | Python | Staging conflict / series alignment thresholds (query gate values are constants in `engine/answer/gate.py`, see Pipelines) |
 | `LLM_TIMEOUT` (14 s), `EMBED_TIMEOUT`, `EMBED_TOTAL_BUDGET` (100 s), `CONFLICT_LLM_TIMEOUT` | Python | Timeouts; staging ≤ 100 s embeddings + ≤ 55 s conflicts < gateway 180 s |

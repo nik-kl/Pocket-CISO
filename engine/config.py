@@ -19,7 +19,9 @@ OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").rstrip(
 # "openai" = any OpenAI-compatible server (LM Studio, vLLM, llama.cpp); OLLAMA_BASE_URL then ends in /v1
 LLM_API = os.getenv("LLM_API", "ollama").lower()
 LLM_API_KEY = os.getenv("LLM_API_KEY", "")
-LLM_MODEL = os.getenv("LLM_MODEL", "qwen2.5:7b")  # answer phrasing
+# answering model: 30B MoE on the target box (Mac Mini 32 GB, 18.7 GB with bge-m3); fallback profile LLM_MODEL=qwen2.5:7b
+# (4.8 GB); a missing model falls back to any installed chat model (OllamaClient.llm_model)
+LLM_MODEL = os.getenv("LLM_MODEL", "qwen3:30b-a3b-instruct-2507-q4_K_M")
 # answerability judge and staging conflict pairs; may be a larger model than the phrasing one, falls back to LLM_MODEL
 JUDGE_MODEL = os.getenv("JUDGE_MODEL") or LLM_MODEL
 # measurement variant only: ANSWER_PHRASING=0 answers with the verbatim evidence spans instead of LLM phrasing

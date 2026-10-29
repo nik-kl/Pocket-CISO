@@ -220,7 +220,7 @@ npm run test:engine                      # 73 tests, no Ollama needed
 engine/.venv/bin/python eval/eval.py --label X [--company comp_2] --modes ollama,noollama,node   # dev eval → /tmp/pocket-ciso-rag/results/X
 ```
 
-Model switch only via `LLM_MODEL` (default `qwen2.5:7b`); `LLM_NUM_CTX` (4096) and `LLM_KEEP_ALIVE` (30m) tune Ollama. Latest dev numbers (0 false answers, 92/188 correct with Ollama) are in `docs/ARCHITECTURE_OVERVIEW.md`. Behavioural checks (RBAC matrix, dynamic proof, inbox scenarios, hostile uploads, concurrency) were run against live servers during the QA pass; see *Verification performed* in `ARCHITECTURE_OVERVIEW.md`.
+Model switch only via `LLM_MODEL` (default `qwen3:30b-a3b-instruct-2507-q4_K_M`, 18.7 GB with bge-m3; fallback profile `LLM_MODEL=qwen2.5:7b`, 5.5 GB); `LLM_NUM_CTX` (4096) and `LLM_KEEP_ALIVE` (30m) tune Ollama. Latest dev numbers (0 false answers, 92/188 correct with Ollama) are in `docs/ARCHITECTURE_OVERVIEW.md`. Behavioural checks (RBAC matrix, dynamic proof, inbox scenarios, hostile uploads, concurrency) were run against live servers during the QA pass; see *Verification performed* in `ARCHITECTURE_OVERVIEW.md`.
 
 ## Current limitations and roadmap
 
