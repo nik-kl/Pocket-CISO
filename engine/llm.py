@@ -116,9 +116,9 @@ class OllamaClient:
             self.mark_down()
             return None
 
-    def chat(self, system: str, user: str, *, json_mode: bool = False, timeout: float = LLM_TIMEOUT, max_tokens: int = 256,
-             judge: bool = False) -> str | None:
-        """judge=True: answerability/conflict decisions on JUDGE_MODEL; otherwise phrasing on LLM_MODEL."""
+    def chat(self, system: str, user: str, *, json_mode: bool = False, schema: dict[str, Any] | None = None, timeout: float = LLM_TIMEOUT,
+             max_tokens: int = 256, judge: bool = False) -> str | None:
+        """judge=True: staging conflict decisions on JUDGE_MODEL; otherwise LLM_MODEL. schema = Ollama structured output."""
         model = self.judge_model() if judge else self.llm_model()
         if not model:
             return None
@@ -131,8 +131,8 @@ class OllamaClient:
             "options": {"temperature": 0.0, "seed": 7, "num_predict": max_tokens, "num_ctx": LLM_NUM_CTX},
             "keep_alive": LLM_KEEP_ALIVE,
         }
-        if json_mode:
-            payload["format"] = "json"
+        if json_mode or schema:
+            payload["format"] = schema or "json"
         if model.startswith("qwen3"):  # thinking model: no reasoning trace (3-token judge budget, latency); other models get no think field
             payload["think"] = False
         try:
@@ -146,7 +146,8 @@ class OllamaClient:
             return None  # timeout / bad response: caller falls back to rules, Ollama stays "connected"
 
     def _chat_openai(self, model: str, system: str, user: str, timeout: float, max_tokens: int) -> str | None:
-        # no response_format: servers disagree on json_object support; callers already extract JSON from plain text
+        # no response_format: servers disagree on json_object/json_schema support; callers parse JSON from plain text
+        # (shortcut: the structured answer call is then unconstrained, invalid JSON = not_found; send json_schema once servers agree)
         payload = {"model": model, "stream": False, "temperature": 0.0, "seed": 7, "max_tokens": max_tokens,
                    "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
                    **{k: v for k, v in OPENAI_OPTIONAL.items() if k not in self._dropped}}

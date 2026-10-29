@@ -620,8 +620,13 @@ def diagnostics(m: dict[str, Any]) -> dict[str, Any]:
     """Aggregates only (safe for the holdout): rejection reasons and coverage histogram of the unanswered parts of
     answerable questions, import statistics of the mode's corpus."""
     reasons: Counter = Counter()
+    v2: Counter = Counter()  # structured answer parts (v2): model status → result of the guarantees
     hist = [0] * 10
     for s in m["scored"]:
+        if s["trace"].get("answerBy") == "llm: keine gültige Antwort":
+            v2["keine gültige LLM-Antwort"] += 1
+        for p in s["trace"].get("answerParts") or []:
+            v2[f"{p['status']} → {p['checked']}" + (f" ({p['reason'].split(':')[0]})" if p.get("reason") else "")] += 1
         if s["expect"] != "answer":
             continue
         if not s["trace"].get("parts") and s["kind"] != "answer":
@@ -637,7 +642,7 @@ def diagnostics(m: dict[str, Any]) -> dict[str, Any]:
     imp = {"documents": len(per_doc), "inputs": inputs, "failed": (m.get("import") or {}).get("failed"), "zero_chunk_docs": max(0, inputs - len(per_doc)) if inputs is not None else None,
            "chunks": len(chunks), "per_doc": (per_doc[0], per_doc[len(per_doc) // 2], per_doc[-1]) if per_doc else None,
            "table_share": round(sum(1 for c in chunks if "Tabelle [" in c["content"]) / len(chunks), 3) if chunks else None}
-    return {"reasons": dict(reasons.most_common()), "hist": hist, "import": imp}
+    return {"reasons": dict(reasons.most_common()), "v2": dict(v2.most_common()), "hist": hist, "import": imp}
 
 
 def diagnostics_md(ms: list[dict[str, Any]]) -> str:
@@ -647,6 +652,7 @@ def diagnostics_md(ms: list[dict[str, Any]]) -> str:
         imp = d["import"]
         md += f"\n### {m['mode']}\nAblehnungsgründe (Teilfragen beantwortbarer Fragen, nicht beantwortet): " + \
               (", ".join(f"{k}: {v}" for k, v in d["reasons"].items()) or "keine") + "\n"
+        md += "v2-Teilfragen (Modell → Prüfung): " + (", ".join(f"{k}: {v}" for k, v in d.get("v2", {}).items()) or "keine") + "\n"
         md += "Abdeckung der abgelehnten Teilfragen: " + " · ".join(f"{k / 10:.1f}–{(k + 1) / 10:.1f}: {n}" for k, n in enumerate(d["hist"])) + "\n"
         md += (f"Import: {imp['documents']} Dokumente mit Chunks (Eingabedateien {imp['inputs'] if imp['inputs'] is not None else '?'}, "
                f"0 Chunks: {imp['zero_chunk_docs'] if imp['zero_chunk_docs'] is not None else '?'}, davon Importfehler {imp['failed'] if imp['failed'] is not None else '?'}), {imp['chunks']} Chunks, pro Dokument "

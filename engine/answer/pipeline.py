@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import copy
+import os
 import re
 import threading
 import time
@@ -11,19 +12,21 @@ from typing import Any
 
 from .compose import CONTRADICTION_LABEL, compose_sentences, display_span, related_spans, search_hits
 from .contradictions import find_contradiction
+from .evidence import entry_sentences, evidence_pack, pack_prompt
 from .gate import (
-    GATE_COVERAGE, GATE_MISSING, NORM_Q, NO_ANSWER, Part, SEARCH_LABEL, UNCONFIRMED_LABEL, VALUE_Q,
+    DOC_REF, GATE_COVERAGE, GATE_MISSING, NORM_Q, NO_ANSWER, Part, SEARCH_LABEL, UNCONFIRMED_LABEL, VALUE_Q,
     WH_START, WHO_Q, definition_term, fix_function_words, definition_window, dense_window, fact_chunks, question_parts, select_windows, window_ok, window_terms,
 )
 from .judge import judge_answerable
 from .keysentence import key_sentence, question_kind
+from .structured import ask, checked
 from .verify import has_norm, has_value, judge_veto, value_dim
 from ..config import ApiError, ROLE_RANK
 from ..llm import OLLAMA, engine_label
 from ..search.dense import dense_scores, diversify, fuse
 from ..search.facts import values_in
 from ..search.lexical import coverage, doc_title, key_terms, lexical_index, section_title
-from ..search.normalize import fold
+from ..search.normalize import GENERIC_WORDS, fold
 from ..store import actor_for, append_denial, cached_db, locked_db
 
 
@@ -173,6 +176,8 @@ def _veto(idx: Any, view: Any, p: Part, windows: list[list[tuple[int, int]]], qu
 
 
 def run_query(token: str | None, question: str) -> dict[str, Any]:
+    if ENGINE_V2:
+        return run_query_v2(token, question)
     t_all = time.perf_counter()
     q = _check_question(question)
     lat: dict[str, int] = {}
@@ -349,6 +354,120 @@ def run_query(token: str | None, question: str) -> dict[str, Any]:
     })
     scores = {cid: round(max((p.coverage for p in answered), default=0.0), 3) for cid in cited_chunks}
     return done("answer", segments, {cid: by_id[cid] for cid in cited_chunks}, scores, spans_out)
+
+
+ENGINE_V2 = os.getenv("ENGINE_V2") == "1"  # step-2 measurement only: removed when v2 replaces run_query
+
+
+def run_query_v2(token: str | None, question: str) -> dict[str, Any]:
+    """v2: retrieval → contradiction rule → evidence pack → ONE structured LLM call → deterministic guarantees per part
+    (structured.checked) → answer with disclosed open parts / labelled search hits / fallback."""
+    t_all = time.perf_counter()
+    q = _check_question(question)
+    lat: dict[str, int] = {}
+    db = cached_db()
+    actor = actor_for(db, token)
+    role = actor["role"]
+    t = time.perf_counter()
+    idx = lexical_index(db)
+    view = idx.view(role)  # RBAC pre-filter before any scoring
+    lat["rbac"] = int((time.perf_counter() - t) * 1000)
+    t = time.perf_counter()
+    ret = retrieve(db, idx, view, role, q)
+    parts = ret.parts
+    lat["retrieval"] = int((time.perf_counter() - t) * 1000)
+    use_llm = bool(OLLAMA.llm_model())
+    label = engine_label()
+    best_cov = max((p.coverage for p in parts), default=0.0)
+    score = round(ret.best_dense if ret.dense_on else best_cov, 3)
+    trace: dict[str, Any] = {
+        "original": q, "rewrite": " | ".join(ret.texts) if ret.texts else q, "rbacFilter": f"min_role <= {role}", "searched": view.n, "total": len(idx.chunks),
+        "nliVerified": False, "temperature": 0.0, "confidence": 0.0, "topScore": score, "retrievalScore": score, "lexicalSupport": round(best_cov, 2),
+        "latencyMs": lat, "engineMode": label, "rewriteBy": "rules (Teilfragen)", "answerBy": "none", "injectionRemoved": ret.injection,
+        "candidateDocs": list(dict.fromkeys(ret.candidate_docs)), "retrievalCached": ret.cached, "verification": "none",
+        "parts": [{"text": p.text, "answered": False, "coverage": round(p.coverage, 3), "value": p.value, "who": p.who, "reason": p.reason,
+                   "features": p.features} for p in parts],
+        "denseTop": round(ret.best_dense, 3) if ret.dense_on else None, "contradiction": False, "partial": False,
+    }
+    by_id = {c["id"]: c for c in idx.chunks}
+
+    def done(kind: str, segments: list[dict[str, str]], cited: list[str], spans: dict[str, Any] | None = None, hits: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+        lat["total"] = int((time.perf_counter() - t_all) * 1000)
+        plain = " ".join(s["text"].strip() for s in segments if s["type"] in ("text", "note"))
+        citations = {cid: by_id[cid] for cid in dict.fromkeys(cited)}
+        telemetry = {"rewrittenQuery": trace["rewrite"], "rbacFilter": trace["rbacFilter"], "topScore": trace["topScore"], "nliVerified": trace["nliVerified"],
+                     "latencyMs": lat, "engineMode": label, "rbacDenied": False, "requiredRole": None}
+        result = {"kind": kind, "requiredRole": None, "segments": segments, "citations": citations,
+                  "scores": {cid: round(best_cov, 3) for cid in citations} if kind == "answer" else {}, "spans": spans or {}, "trace": trace}
+        if hits is not None:
+            result["hits"] = hits
+        return {"ok": True, "result": result, "answer": plain, "citations": list(citations.values()), "telemetry": telemetry}
+
+    conflicts = [p for p in parts if p.contradiction]
+    if conflicts:  # possible contradictions are shown as labelled search hits with every value and source, never as an answer
+        trace.update({"answerBy": "search", "contradiction": True,
+                      "contradictionValues": [{"docName": idx.chunks[w[-1][0]]["docName"], "section": idx.chunks[w[-1][0]]["section"],
+                                               "values": {d: sorted(v) for d, v in vals.items()}} for p in conflicts for w, vals in p.contradiction]})
+        segments: list[dict[str, str]] = [{"type": "text", "text": CONTRADICTION_LABEL + ":"}]
+        hits = []
+        for p in conflicts:
+            for w, vals in p.contradiction:
+                c = idx.chunks[w[-1][0]]
+                text = " ".join(display_span(idx.span_text[i][k]) for i, k in w)
+                words = {fold(x): x for x in re.findall(r"[\wÄÖÜäöüß]+", text)}  # 'halbjahrlich' → 'halbjährlich'
+                shown = list(dict.fromkeys(words.get(sf.strip(), sf.strip()) for d, v, sf in values_in(text)
+                                           if round(v, 6) in vals.get(d, set()) or round(v, 6) in vals.get("freq", set())))
+                value = f" (Wert: {', '.join(shown)})" if shown else ""
+                segments += [{"type": "text", "text": f" {c['docName']} {c['section'].split(' ')[0]}: {text}{value} "}, {"type": "cite", "chunkId": c["id"]}]
+                hits.append({"chunkId": c["id"], "docName": c["docName"], "section": c["section"], "content": text, "values": shown})
+        return done("search", segments, [h["chunkId"] for h in hits], hits=hits)
+
+    t = time.perf_counter()
+    pack = evidence_pack(idx, parts) if use_llm and any(p.lexical_ok or p.dense_ok for p in parts) else []
+    model = ask(" ".join(ret.texts), ret.context, pack_prompt(idx, pack)) if pack else None
+    asked = " ".join(ret.texts + ret.context)  # the cleaned question: instruction sentences are never a sub-question
+    # a document the question names ("laut BIA", "according to the playbook"; generic words aside) is the only source
+    named = {w for m in DOC_REF.finditer(fold(asked)) for w in m.group(1).split("-")} - GENERIC_WORDS
+    in_named = {n for n, e in enumerate(pack) if named & set(re.findall(r"[a-z0-9]+", fold(doc_title(idx.chunks[e.chunk]["docName"]))))}
+    results = [(mp, *checked(mp, [entry_sentences(idx, e) for e in pack], asked, view.vocab, in_named or None)) for mp in model or []]
+    lat["generation"] = int((time.perf_counter() - t) * 1000)
+    trace["pack"] = [{"span": f"S{n + 1}", "chunkId": idx.chunks[e.chunk]["id"], "docName": idx.chunks[e.chunk]["docName"]} for n, e in enumerate(pack)]
+    trace["answerParts"] = [{"question": str(mp.get("question") or ""), "status": mp.get("status"), "type": mp.get("type"), "checked": st, "reason": why,
+                             "modelAnswer": str(mp.get("answer") or "")}
+                            for mp, st, _, _, why in results]
+    if pack and model is None:
+        trace["answerBy"] = "llm: keine gültige Antwort"
+    answered = [r for r in results if r[1] == "answered"]
+    if not answered:
+        hidden = _restricted_match(db, role, q)
+        if hidden:
+            with locked_db() as dbw:
+                append_denial(dbw, actor["email"], role, "RBAC_DENIED", hidden["docName"], f"Retrieval erfordert {hidden['minRole']}")
+        trace["candidateDocs"] = trace["candidateDocs"] if view.n else []
+        hits = search_hits(idx, parts)
+        if not hits:
+            return done("fallback", [{"type": "text", "text": NO_ANSWER}], [])
+        trace["answerBy"] = "search"
+        segments = [{"type": "text", "text": (UNCONFIRMED_LABEL if use_llm else SEARCH_LABEL) + ":"}]
+        for h in hits:
+            segments += [{"type": "text", "text": f" {h['docName']} {h['section'].split(' ')[0]}: {h['content']} "}, {"type": "cite", "chunkId": h["chunkId"]}]
+        return done("search", segments, [h["chunkId"] for h in hits], hits=hits)
+
+    segments, spans_out = [], {}
+    for mp, _, quotes, answer, _ in answered:
+        if answer and not any(answer.rstrip(".").lower() in t.lower() for _, t in quotes):  # the quote alone says it
+            segments.append({"type": "text", "text": (" " if segments else "") + answer + " "})
+        for n, text in quotes:  # the source sentences, verbatim (table rows as "Spalte: Wert; …")
+            cid = idx.chunks[pack[n].chunk]["id"]
+            sid = f"{cid}:q{len(spans_out)}"
+            spans_out[sid] = {"chunkId": cid, "text": text.replace(" | ", "; ")}
+            segments += [{"type": "text", "text": spans_out[sid]["text"] + " "}, {"type": "cite", "chunkId": cid, "spanId": sid}]
+    for mp, status, _, _, _ in results:
+        if status == "not_found":
+            segments.append({"type": "note", "text": f"Zu „{mp.get('question') or q}“ wurde keine Aussage als Antwort bestätigt."})
+    trace.update({"nliVerified": True, "verification": "quote+verifier", "answerBy": "llm-structured", "confidence": round(best_cov, 2),
+                  "partial": any(r[1] == "not_found" for r in results)})
+    return done("answer", segments, [s["chunkId"] for s in segments if s["type"] == "cite"], spans_out)
 
 
 # ── stage 1: search hits with a key sentence, no LLM ──

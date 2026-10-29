@@ -93,6 +93,32 @@ def verify_sentence(text: str, spans: list[str], vocab: Vocab) -> list[str]:
     return problems
 
 
+def answer_problems(answer: str, quotes: list[str], vocab: Vocab | None = None) -> list[str]:
+    """Empty list = what the answer asserts stands in its quotes: every number with its unit and every identifier; the
+    negation polarity of the best-matching quotes (all quotes when no term is shared, e.g. across languages) — a negation
+    they lack ("ohne Beleg") or one they have and the answer drops ("fehlt"); no modality they lack; every named role."""
+    if not answer:
+        return []
+    st = set(analyze(answer, vocab))
+    src = [set(analyze(q, vocab)) for q in quotes]
+    problems = []
+    missing = numeric_terms(st) - numeric_terms(set().union(*src))
+    if missing:
+        problems.append("Zahl/Einheit: " + ", ".join(sorted(missing)))
+    top = max(len(st & s) for s in src)
+    best = [q for q, s in zip(quotes, src) if len(st & s) == top]
+    neg = [bool(NEG_RE.search(fold(q))) for q in best]
+    if NEG_RE.search(fold(answer)) and not all(neg):
+        problems.append("Verneinung ohne Beleg")
+    elif not NEG_RE.search(fold(answer)) and any(neg):
+        problems.append("Verneinung fehlt")
+    if any(not modal_classes(answer) <= modal_classes(q) for q in best):
+        problems.append("Modalität")
+    src_f = fold(" ".join(quotes))
+    problems += [f"Rolle/Stelle: {e}" for e in sorted(entities(answer)) if fold(e) not in src_f]
+    return problems
+
+
 # ── value questions: the answer must carry a value of the asked dimension ──
 # A value question ("wie oft", "how many", "bis wann", …) answered by a sentence of the right section without the value is a
 # wrong answer even when the value sentence sat in the same window. Dimension from the question wording (generic

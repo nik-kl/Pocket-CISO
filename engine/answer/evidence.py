@@ -29,8 +29,12 @@ def _anchors(idx: "LexIndex", part: Part) -> list[tuple[int, int]]:
     return out
 
 
+def entry_sentences(idx: "LexIndex", e: Entry) -> list[str]:
+    return [TABLE_LABEL.sub("", idx.span_text[e.chunk][k]) for k in range(e.lo, e.hi + 1)]
+
+
 def entry_text(idx: "LexIndex", e: Entry) -> str:
-    return " ".join(TABLE_LABEL.sub("", idx.span_text[e.chunk][k]) for k in range(e.lo, e.hi + 1))
+    return " ".join(entry_sentences(idx, e))
 
 
 def entry_path(idx: "LexIndex", e: Entry) -> str:
