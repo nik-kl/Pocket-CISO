@@ -150,7 +150,7 @@ def _retrieve(db: dict[str, Any], idx: "LexIndex", view: "RoleView", q: str) -> 
         # dense path only below the lexical floor: a second judge call after a NEIN on the lexical window gave the 7B judge a
         # second chance to say JA and produced 2 false answers on the dev set (I-1, R-10) → never retried
         if dense and not part.lexical_ok:
-            dw = dense_window(idx, view, part, dense)
+            dw = dense_window(idx, part, dense)
             if dw:
                 part.dense_ok, part.windows = True, [dw[0]]
                 part.features["densePath"] = round(dw[1], 4)

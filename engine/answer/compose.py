@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from .gate import ANAPHOR, Part
+from .gate import Part
 from ..search.lexical import coverage
 from ..search.normalize import TABLE_LABEL
 
@@ -15,18 +15,13 @@ def display_span(text: str) -> str:
 
 
 def related_spans(idx: "LexIndex", part: Part, w: list[tuple[int, int]]) -> list[tuple[int, int]]:
-    """Spans of a window shown to the user: the answering (last) span, a preceding span only when it contributes a key term
-    that the answering span and its section/document title lack, and the antecedent of an anaphoric next span — no
-    neighbouring sentence without relation to the question."""
+    """Spans of a window shown to the user: the answering (last) span and a preceding span only when it contributes a key
+    term that the answering span and its section/document title lack — no neighbouring sentence without relation to
+    the question."""
     li, lk = w[-1]
     known = idx.span_terms[li][lk] | idx.ctx_terms[li]
-    keep = []
-    for n, (i, k) in enumerate(w):
-        nxt = w[n + 1] if n + 1 < len(w) else None
-        adds = any(any(a <= idx.span_terms[i][k] for a in kt.alts) and not any(a <= known for a in kt.alts) for kt in part.qt.keys)
-        if nxt is None or adds or ANAPHOR.match(idx.span_text[nxt[0]][nxt[1]]):
-            keep.append((i, k))
-    return keep
+    return [(i, k) for i, k in w[:-1] if any(any(a <= idx.span_terms[i][k] for a in kt.alts) and not any(a <= known for a in kt.alts)
+                                             for kt in part.qt.keys)] + [w[-1]]
 
 
 CONTRADICTION_LABEL = "Mögliche Widersprüche – nicht als Antwort bestätigt"
